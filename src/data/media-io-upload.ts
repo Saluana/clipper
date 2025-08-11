@@ -5,7 +5,7 @@ import {
     createLogger,
     noopMetrics,
     type Metrics,
-} from '@clipper/common';
+} from '../common';
 import type { ResolveResult as SharedResolveResult } from './media-io';
 
 type ResolveJob = {

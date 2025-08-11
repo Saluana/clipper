@@ -1,5 +1,5 @@
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
-import { readEnv } from '@clipper/common';
+import { readEnv } from '../common/index';
 
 export const storageKeys = {
     source: (jobId: string, ext: string) =>

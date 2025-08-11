@@ -2,8 +2,8 @@ import { createDb } from './db/connection';
 import { jobs } from './db/schema';
 import { lte, isNotNull, and, eq, desc } from 'drizzle-orm';
 import type { StorageRepo } from './storage';
-import type { Logger } from '@clipper/common';
-import { createLogger, noopMetrics, type Metrics } from '@clipper/common';
+import type { Logger } from '../common';
+import { createLogger, noopMetrics, type Metrics } from '../common';
 
 export type CleanupOptions = {
     now?: Date;

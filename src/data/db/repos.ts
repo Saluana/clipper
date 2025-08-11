@@ -2,7 +2,7 @@ import { desc, eq } from 'drizzle-orm';
 import { createDb } from './connection';
 import { jobEvents, jobs } from './schema';
 import type { JobStatus } from '@clipper/contracts';
-import { createLogger, noopMetrics, type Metrics } from '@clipper/common';
+import { createLogger, noopMetrics, type Metrics } from '../../common/index';
 import type {
     JobEvent as RepoJobEvent,
     JobRow,

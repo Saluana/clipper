@@ -4,7 +4,7 @@ import {
     createLogger,
     noopMetrics,
     type Metrics,
-} from '@clipper/common';
+} from '../common/index';
 import type { ResolveResult as SharedResolveResult } from './media-io';
 import { readdir } from 'node:fs/promises';
 import { lookup } from 'node:dns/promises';
