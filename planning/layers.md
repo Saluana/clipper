@@ -152,7 +152,6 @@
 
 Not built
 
-FFmpeg Service (Clipper)
 ASR Service (Groq Whisper)
 Minimal UI
 
