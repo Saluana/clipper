@@ -1,0 +1,4 @@
+# Resolve import aliases at runtime for Bun
+# Matches tsconfig paths: "@clipper/*" -> "src/*"
+[alias]
+"@clipper/*" = "./src/*"
