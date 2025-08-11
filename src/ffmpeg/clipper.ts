@@ -39,6 +39,16 @@ interface AttemptResult {
     stderrSnippet?: string;
 }
 
+/**
+ * BunClipper implements the Clipper interface using a two-phase strategy:
+ * 1. Attempt a fast stream copy (no re-encode) for speed when keyframes align.
+ * 2. On failure, fallback to a re-encode ensuring playable, accurate output.
+ *
+ * Progress semantics:
+ * - Each attempt produces its own progress stream.
+ * - For a successful copy attempt, the progress stream usually completes quickly.
+ * - If fallback is required, only the fallback attempt's progress is exposed.
+ */
 export class BunClipper implements Clipper {
     constructor(private readonly opts: { scratchDir?: string } = {}) {}
 

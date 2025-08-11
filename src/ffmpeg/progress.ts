@@ -1,6 +1,12 @@
 /**
- * Parse ffmpeg -progress output into percentage values.
- * We expect lines like: key=value, focusing on out_time_ms.
+ * Consumes an ffmpeg `-progress pipe:1` output stream and yields integer percentage progress values.
+ *
+ * Contract:
+ * - Input: raw ReadableStream<Uint8Array> from ffmpeg stdout configured with `-progress pipe:1`.
+ * - Emits: monotonically increasing integers 0..100 (holding at 99 until process exit) then a final 100.
+ * - Zero / invalid total duration → emits 100 immediately.
+ *
+ * Parsing focuses on `out_time_ms` lines; other lines are ignored.
  */
 export async function* parseFfmpegProgress(
     stream: ReadableStream<Uint8Array>,

@@ -64,17 +64,17 @@ This document breaks down the work required to implement the FFmpeg Service (Cli
         -   [x] Add a `finally` block to ensure temporary files are cleaned up.
     -   **Requirements**: 3.1, 3.2, 3.3, 3.4, 3.5
 
--   [ ] **6. Add to Barrel File**
+-   [x] **6. Add to Barrel File**
 
     -   **File**: `src/ffmpeg/index.ts`
-    -   [ ] Export all public interfaces and the `BunClipper` class.
+    -   [x] Export all public interfaces and the `BunClipper` class.
 
--   [ ] **7. (Optional but Recommended) Integration Testing**
+-   [x] **7. (Optional but Recommended) Integration Testing**
 
-    -   [ ] Create `src/ffmpeg/ffmpeg.integration.test.ts`.
-    -   [ ] Add a test case for a successful stream copy.
-    -   [ ] Add a test to verify progress reporting.
+    -   [x] Create `src/ffmpeg/ffmpeg.integration.test.ts`.
+    -   [x] Add a test case for a successful stream copy.
+    -   [x] Add a test to verify progress reporting.
 
--   [ ] **8. Documentation**
-    -   [ ] Add JSDoc comments to all public functions and interfaces.
-    -   [ ] Update the main `README.md` or other relevant docs if necessary to mention that `ffmpeg` is now a required dependency.
+-   [x] **8. Documentation**
+    -   [x] Add JSDoc comments to all public functions and interfaces.
+    -   [x] Update the main `README.md` or other relevant docs if necessary to mention that `ffmpeg` is now a required dependency.
