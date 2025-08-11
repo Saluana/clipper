@@ -150,6 +150,12 @@
 7. **3** (optional) YouTube resolver gated by env
 8. **12/13** Docs + tiny UI
 
+Not built
+
+FFmpeg Service (Clipper)
+ASR Service (Groq Whisper)
+Minimal UI
+
 ---
 
 ## Clear Interfaces (keep seams loose)
