@@ -8,60 +8,60 @@ This document breaks down the work required to implement the FFmpeg Service (Cli
 
 ### ✅ Task Checklist
 
--   [ ] **1. Create Project Structure**
+-   [x] **1. Create Project Structure**
 
-    -   [ ] Create the main directory: `src/ffmpeg`.
-    -   [ ] Create the following empty files:
+    -   [x] Create the main directory: `src/ffmpeg`.
+    -   [x] Create the following files:
         -   `src/ffmpeg/index.ts`
         -   `src/ffmpeg/types.ts`
         -   `src/ffmpeg/clipper.ts`
         -   `src/ffmpeg/progress.ts`
 
--   [ ] **2. Implement Core Types**
+-   [x] **2. Implement Core Types**
 
     -   **File**: `src/ffmpeg/types.ts`
-    -   [ ] Define and export the `ClipResult`, `ClipArgs`, and `Clipper` interfaces as specified in the design document.
+    -   [x] Define and export the `ClipResult`, `ClipArgs`, and `Clipper` interfaces as specified in the design document.
     -   **Requirements**: 1.1, 2.1
 
--   [ ] **3. Implement Progress Parser**
+-   [x] **3. Implement Progress Parser**
 
     -   **File**: `src/ffmpeg/progress.ts`
-    -   [ ] Implement the `parseFfmpegProgress` async generator function.
-    -   [ ] It should accept a `ReadableStream` and `totalDurationSec`.
-    -   [ ] It should correctly parse `out_time_ms=` from the stream and yield a percentage.
-    -   [ ] Ensure it yields `100` upon stream completion.
+    -   [x] Implement the `parseFfmpegProgress` async generator function.
+    -   [x] It accepts a `ReadableStream` and `totalDurationSec`.
+    -   [x] It parses `out_time_ms=` lines and yields monotonic percentage values.
+    -   [x] It yields `100` upon completion.
     -   **Requirements**: 2.1, 2.2, 2.3
 
--   [ ] **4. Implement the Clipper Service**
+-   [x] **4. Implement the Clipper Service**
 
     -   **File**: `src/ffmpeg/clipper.ts`
-    -   [ ] Create the `BunClipper` class implementing the `Clipper` interface.
-    -   [ ] Implement the `clip` method.
+    -   [x] Create the `BunClipper` class implementing the `Clipper` interface.
+    -   [x] Implement the `clip` method.
     -   [ ] **4.1. Stream-Copy Logic**:
-        -   [ ] Use `Bun.spawn` to execute the `ffmpeg` stream-copy command.
-        -   [ ] Pipe the process's progress stream to the `parseFfmpegProgress` utility.
-        -   [ ] Check the exit code. If successful, return the local path and progress stream.
+    -   [x] Use `Bun.spawn` to execute the `ffmpeg` stream-copy command.
+    -   [x] Pipe the process's progress stream to the `parseFfmpegProgress` utility.
+    -   [x] Check the exit code. If successful, return the local path and progress stream.
     -   [ ] **4.2. Re-encode Fallback Logic**:
-        -   [ ] If the stream-copy process fails (non-zero exit code), log the error and trigger the re-encode command.
-        -   [ ] Execute the `ffmpeg` re-encode command using `Bun.spawn`.
-        -   [ ] Pipe its progress stream to the parser.
-        -   [ ] If this process also fails, throw a `ServiceError`.
+    -   [x] If the stream-copy process fails (non-zero exit code), log the error and trigger the re-encode command.
+    -   [x] Execute the `ffmpeg` re-encode command using `Bun.spawn`.
+    -   [x] Pipe its progress stream to the parser.
+    -   [x] If this process also fails, throw a `ServiceError`.
     -   [ ] **4.3. File Management**:
-        -   [ ] Ensure the output directory inside `SCRATCH_DIR` is created before spawning FFmpeg.
+    -   [x] Ensure the output directory inside `SCRATCH_DIR` is created before spawning FFmpeg.
     -   **Requirements**: 1.1, 1.2, 1.3, 1.4, 1.5
 
--   [ ] **5. Integrate Clipper into Worker**
+-   [x] **5. Integrate Clipper into Worker**
 
     -   **File**: `src/worker/index.ts`
-    -   [ ] Import and instantiate `BunClipper`.
-    -   [ ] In the `queue.consume` handler, after resolving the source file:
-        -   [ ] Call `clipper.clip()`.
-        -   [ ] Use a `for await...of` loop to consume the `progress$` stream.
-        -   [ ] Inside the loop, call `jobs.updateProgress()` and `events.add()`.
-        -   [ ] On successful completion, upload the resulting clip using `StorageRepo`.
-        -   [ ] Update the job status to `done` and set `resultVideoKey`.
-        -   [ ] Implement `try...catch` around the clipping logic to handle `ServiceError` and mark the job as `failed`.
-        -   [ ] Add a `finally` block to ensure temporary files are cleaned up.
+    -   [x] Import and instantiate `BunClipper`.
+    -   [x] In the `queue.consume` handler, after resolving the source file:
+        -   [x] Call `clipper.clip()`.
+        -   [x] Use a `for await...of` loop to consume the `progress$` stream.
+        -   [x] Inside the loop, call `jobs.updateProgress()` and `events.add()`.
+        -   [x] On successful completion, upload the resulting clip using `StorageRepo`.
+        -   [x] Update the job status to `done` and set `resultVideoKey`.
+        -   [x] Implement `try...catch` around the clipping logic to handle `ServiceError` and mark the job as `failed`.
+        -   [x] Add a `finally` block to ensure temporary files are cleaned up.
     -   **Requirements**: 3.1, 3.2, 3.3, 3.4, 3.5
 
 -   [ ] **6. Add to Barrel File**
