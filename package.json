@@ -1,16 +1,28 @@
 {
-  "name": "clipper",
-  "module": "index.ts",
-  "type": "module",
-  "private": true,
-  "devDependencies": {
-    "@types/bun": "latest"
-  },
-  "peerDependencies": {
-    "typescript": "^5"
-  },
-  "dependencies": {
-    "zod": "^4.0.17",
-    "zod-to-openapi": "^0.2.1"
-  }
+    "name": "clipper",
+    "module": "index.ts",
+    "type": "module",
+    "private": true,
+    "scripts": {
+        "test": "bunx vitest run",
+        "db:generate": "bunx drizzle-kit generate --config=drizzle.config.ts",
+        "db:migrate": "bunx drizzle-kit migrate --config=drizzle.config.ts",
+        "db:push": "bunx drizzle-kit push --config=drizzle.config.ts"
+    },
+    "devDependencies": {
+        "@types/bun": "latest"
+    },
+    "peerDependencies": {
+        "typescript": "^5"
+    },
+    "dependencies": {
+        "@supabase/supabase-js": "^2.54.0",
+        "@types/pg": "^8.15.5",
+        "dotenv": "^17.2.1",
+        "drizzle-kit": "^0.31.4",
+        "drizzle-orm": "^0.44.4",
+        "pg": "^8.16.3",
+        "zod": "^4.0.17",
+        "zod-to-openapi": "^0.2.1"
+    }
 }
