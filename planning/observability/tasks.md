@@ -28,10 +28,10 @@ artifact_id: 8f5b7a3c-9d8a-4c1f-b2f9-3e6d2c1a7b90
 
 ## 4. Worker Stage Timings
 
--   [ ] 4.1 Implement withStage wrapper (Req 4)
--   [ ] 4.2 Instrument stages: resolve, clip, upload, asr (Req 4)
--   [ ] 4.3 Stage failure counter (Req 4)
--   [ ] 4.4 Unit tests simulate stage error classification (Req 4)
+-   [x] 4.1 Implement withStage wrapper (Req 4)
+-   [x] 4.2 Instrument stages: resolve, clip, upload, asr (Req 4)
+-   [x] 4.3 Stage failure counter (Req 4)
+-   [x] 4.4 Unit tests simulate stage error classification (Req 4)
 
 ## 5. External Dependency Wrappers
 

@@ -18,6 +18,7 @@ import { PgBossQueueAdapter } from '@clipper/queue';
 import { BunClipper } from '@clipper/ffmpeg';
 import { AsrFacade } from '@clipper/asr/facade';
 import { InMemoryMetrics } from '@clipper/common/metrics';
+import { withStage } from './stage';
 export * from './asr.ts';
 
 const log = createLogger((readEnv('LOG_LEVEL') as any) || 'info').with({
@@ -85,26 +86,22 @@ async function main() {
                 log.info('job processing start', { jobId });
             }
 
-            // Resolve source
-            let resolveRes: {
-                localPath: string;
-                cleanup: () => Promise<void>;
-                meta?: any;
-            };
-            if (job.sourceType === 'upload') {
-                resolveRes = await resolveUploadSource({
-                    id: job.id,
-                    sourceType: 'upload',
-                    sourceKey: job.sourceKey!,
-                } as any);
-            } else {
-                // Let underlying error surface for clearer diagnostics
-                resolveRes = await resolveYouTubeSource({
-                    id: job.id,
-                    sourceType: 'youtube',
-                    sourceUrl: job.sourceUrl!,
-                } as any);
-            }
+            // Resolve source (stage: resolve)
+            let resolveRes = await withStage(metrics, 'resolve', async () => {
+                if (job.sourceType === 'upload') {
+                    return await resolveUploadSource({
+                        id: job.id,
+                        sourceType: 'upload',
+                        sourceKey: job.sourceKey!,
+                    } as any);
+                } else {
+                    return await resolveYouTubeSource({
+                        id: job.id,
+                        sourceType: 'youtube',
+                        sourceUrl: job.sourceUrl!,
+                    } as any);
+                }
+            });
             cleanup = resolveRes.cleanup;
             await events.add({
                 jobId,
@@ -115,12 +112,17 @@ async function main() {
 
             // Perform clip
             const clipStart = Date.now();
-            const { localPath: clipPath, progress$ } = await clipper.clip({
-                input: resolveRes.localPath,
-                startSec: job.startSec,
-                endSec: job.endSec,
-                jobId,
-            });
+            const { localPath: clipPath, progress$ } = await withStage(
+                metrics,
+                'clip',
+                async () =>
+                    await clipper.clip({
+                        input: resolveRes.localPath,
+                        startSec: job.startSec,
+                        endSec: job.endSec,
+                        jobId,
+                    })
+            );
             outputLocal = clipPath;
             let lastPersist = 0;
             let lastPct = -1;
@@ -194,7 +196,9 @@ async function main() {
                     }
                 }
             };
-            await uploadWithRetry();
+            await withStage(metrics, 'upload', async () => {
+                await uploadWithRetry();
+            });
             metrics.observe('clip.upload_ms', Date.now() - clipStart);
             await events.add({
                 jobId,
@@ -208,31 +212,33 @@ async function main() {
                 job.withSubtitles &&
                 (job.subtitleLang === 'auto' || !job.subtitleLang)
             ) {
-                try {
-                    const asrRes = await asrFacade.request({
-                        localPath: clipPath,
-                        clipJobId: job.id,
-                        sourceType: 'internal',
-                        languageHint: job.subtitleLang ?? 'auto',
-                    });
-                    await events.add({
-                        jobId,
-                        ts: nowIso(),
-                        type: 'asr:requested',
-                        data: {
-                            asrJobId: asrRes.asrJobId,
-                            status: asrRes.status,
-                        },
-                    });
-                } catch (e) {
-                    // don't fail the clip if ASR enqueue fails
-                    await events.add({
-                        jobId,
-                        ts: nowIso(),
-                        type: 'asr:error',
-                        data: { err: String(e) },
-                    });
-                }
+                await withStage(metrics, 'asr', async () => {
+                    try {
+                        const asrRes = await asrFacade.request({
+                            localPath: clipPath,
+                            clipJobId: job.id,
+                            sourceType: 'internal',
+                            languageHint: job.subtitleLang ?? 'auto',
+                        });
+                        await events.add({
+                            jobId,
+                            ts: nowIso(),
+                            type: 'asr:requested',
+                            data: {
+                                asrJobId: asrRes.asrJobId,
+                                status: asrRes.status,
+                            },
+                        });
+                    } catch (e) {
+                        await events.add({
+                            jobId,
+                            ts: nowIso(),
+                            type: 'asr:error',
+                            data: { err: String(e) },
+                        });
+                        // swallow so primary pipeline continues
+                    }
+                });
             }
 
             await finish('done', { progress: 100, resultVideoKey: key });
