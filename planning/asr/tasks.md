@@ -49,11 +49,11 @@ Mappings: Req numbers refer to ASR requirements document.
 ## 5. Queue Integration
 
 -   [ ] Queue topic (Req: 1,3)
-    -   [ ] Add ASR queue name constant (e.g., 'asr') in `src/queue/types.ts`
-    -   [ ] Extend pgboss adapter subscribe for ASR job handler
+    -   [x] Add ASR queue name constant (e.g., 'asr') in `src/queue/types.ts`
+    -   [x] Extend pgboss adapter subscribe for ASR job handler
 -   [ ] Message shape & validation (Req: 1)
-    -   [ ] Define zod schema for ASR queue payload
-    -   [ ] Tests for invalid payload rejection
+    -   [x] Define zod schema for ASR queue payload
+    -   [x] Tests for invalid payload rejection
 
 ## 6. Worker Implementation
 

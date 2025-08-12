@@ -6,12 +6,19 @@ export const storageKeys = {
         `sources/${jobId}/source.${ext.replace(/^\./, '')}`,
     resultVideo: (jobId: string) => `results/${jobId}/clip.mp4`,
     resultSrt: (jobId: string) => `results/${jobId}/clip.srt`,
+    transcriptSrt: (ownerId: string) =>
+        `results/${ownerId}/transcript/clip.srt`,
+    transcriptText: (ownerId: string) =>
+        `results/${ownerId}/transcript/clip.txt`,
+    transcriptJson: (ownerId: string) =>
+        `results/${ownerId}/transcript/clip.json`,
 };
 
 export interface StorageRepo {
     upload(localPath: string, key: string, contentType?: string): Promise<void>;
     sign(key: string, ttlSec?: number): Promise<string>;
     remove(key: string): Promise<void>;
+    download(key: string, toPath?: string): Promise<string>; // returns local path
 }
 
 export type SupabaseStorageOptions = {
@@ -90,6 +97,16 @@ class SupabaseStorageRepo implements StorageRepo {
             .from(this.bucket)
             .remove([key]);
         if (error) throw new Error(`STORAGE_REMOVE_FAILED: ${error.message}`);
+    }
+
+    async download(key: string, toPath?: string): Promise<string> {
+        const url = await this.sign(key, 60);
+        const res = await fetch(url);
+        if (!res.ok) throw new Error(`STORAGE_DOWNLOAD_FAILED: ${res.status}`);
+        const ab = await res.arrayBuffer();
+        const out = toPath ?? `/tmp/${key.split('/').pop() || 'asset.bin'}`;
+        await Bun.write(out, new Uint8Array(ab));
+        return out;
     }
 }
 

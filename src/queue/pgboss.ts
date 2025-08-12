@@ -1,6 +1,7 @@
 import PgBoss from 'pg-boss';
 import { readEnv, readIntEnv } from '@clipper/common';
 import type { QueueAdapter, QueueMessage, QueuePriority } from './types';
+import { QUEUE_TOPIC_CLIPS } from './types';
 
 const priorityMap: Record<QueuePriority, number> = {
     fast: 10,
@@ -31,7 +32,8 @@ export class PgBossQueueAdapter implements QueueAdapter {
             maxAttempts?: number;
         }
     ) {
-        this.topic = opts.queueName ?? readEnv('QUEUE_NAME') ?? 'clips';
+        this.topic =
+            opts.queueName ?? readEnv('QUEUE_NAME') ?? QUEUE_TOPIC_CLIPS;
         this.dlqTopic = `${this.topic}.dlq`;
     }
 
@@ -140,6 +142,73 @@ export class PgBossQueueAdapter implements QueueAdapter {
                 // Throw inside handler to trigger retry; returning resolves completions
             }
         );
+    }
+
+    // Optional multi-topic methods (for subsystems like ASR)
+    async publishTo(
+        topic: string,
+        msg: object,
+        opts?: { timeoutSec?: number }
+    ) {
+        if (!this.boss) await this.start();
+        const expireInSeconds = Math.max(
+            1,
+            Math.floor(
+                opts?.timeoutSec ??
+                    Number(
+                        readIntEnv(
+                            'QUEUE_VISIBILITY_SEC',
+                            this.opts.visibilityTimeoutSec ?? 90
+                        )
+                    )
+            )
+        );
+        const retryLimit = Number(
+            readIntEnv('QUEUE_MAX_ATTEMPTS', this.opts.maxAttempts ?? 3)
+        );
+        const dlq = `${topic}.dlq`;
+        try {
+            await this.boss!.createQueue(topic, {
+                name: topic,
+                expireInSeconds,
+                retryLimit,
+                deadLetter: dlq,
+            });
+        } catch {}
+        try {
+            await this.boss!.createQueue(dlq, {
+                name: dlq,
+                expireInSeconds: expireInSeconds * 2,
+                retryLimit: 0,
+            });
+        } catch {}
+        await this.boss!.send(topic, msg, {
+            expireInSeconds,
+            retryLimit,
+            retryBackoff: true,
+            deadLetter: dlq,
+        });
+        this.metrics.publishes++;
+    }
+
+    async consumeFrom(topic: string, handler: (msg: any) => Promise<void>) {
+        if (!this.boss) await this.start();
+        const batchSize = Number(
+            readIntEnv('QUEUE_CONCURRENCY', this.opts.concurrency ?? 4)
+        );
+        await this.boss!.work<any>(topic, { batchSize }, async (jobs) => {
+            for (const job of jobs) {
+                this.metrics.claims++;
+                try {
+                    await handler(job.data as any);
+                    this.metrics.completes++;
+                } catch (err) {
+                    this.metrics.retries++;
+                    this.metrics.errors++;
+                    throw err;
+                }
+            }
+        });
     }
 
     async shutdown(): Promise<void> {

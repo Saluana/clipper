@@ -5,6 +5,8 @@ import type {
     AsrJobsRepository,
 } from '@clipper/data';
 import type { QueueAdapter } from '@clipper/queue';
+import { QUEUE_TOPIC_ASR } from '@clipper/queue';
+import { AsrQueuePayloadSchema } from '@clipper/queue/asr';
 
 export interface AsrFacadeDeps {
     asrJobs: AsrJobsRepository;
@@ -70,10 +72,21 @@ export class AsrFacade {
         // Fire-and-forget enqueue (Task 5 will add dedicated ASR queue/topic)
         if (this.deps.queue) {
             try {
-                await this.deps.queue.publish({
-                    jobId: id,
-                    priority: 'normal',
-                });
+                const payload = {
+                    asrJobId: id,
+                    clipJobId: req.clipJobId,
+                    languageHint: req.languageHint,
+                };
+                const parsed = AsrQueuePayloadSchema.parse(payload);
+                if (this.deps.queue.publishTo) {
+                    await this.deps.queue.publishTo(QUEUE_TOPIC_ASR, parsed);
+                } else {
+                    // fallback: publish to default topic if multi-topic not supported
+                    await this.deps.queue.publish({
+                        jobId: id,
+                        priority: 'normal',
+                    });
+                }
             } catch (e) {
                 // Non-fatal here; job remains queued for a future publisher
             }

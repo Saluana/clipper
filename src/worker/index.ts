@@ -17,6 +17,7 @@ import {
 import { PgBossQueueAdapter } from '@clipper/queue';
 import { BunClipper } from '@clipper/ffmpeg';
 import { AsrFacade } from '@clipper/asr/facade';
+export * from './asr.ts';
 
 const log = createLogger((readEnv('LOG_LEVEL') as any) || 'info').with({
     mod: 'worker',
