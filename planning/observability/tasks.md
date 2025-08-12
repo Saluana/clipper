@@ -8,9 +8,9 @@ artifact_id: 8f5b7a3c-9d8a-4c1f-b2f9-3e6d2c1a7b90
 
 ## 1. Metric Registry & Core Instruments
 
--   [ ] 1.1 Implement MetricsRegistry (counters, histograms fixed buckets, gauges) (Req 1)
--   [ ] 1.2 Add route normalization helper (/:id replacement) (Req 1)
--   [ ] 1.3 Unit tests: registry reuse, label limit enforcement (Req 1)
+-   [x] 1.1 Implement MetricsRegistry (counters, histograms fixed buckets, gauges) (Req 1)
+-   [x] 1.2 Add route normalization helper (/:id replacement) (Req 1)
+-   [x] 1.3 Unit tests: registry reuse, label limit enforcement (Req 1)
 
 ## 2. HTTP Instrumentation
 
