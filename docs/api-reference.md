@@ -1,19 +1,26 @@
-# API Reference
+# Clipper API Reference
 
-Base URL: `https://{host}`
-All responses include a `correlationId` when successful or inside the `error` envelope.
-If API key auth is enabled (ENABLE_API_KEYS=true) you must send one of:
+Base URL: `http://localhost:3000` (override with `PORT`).
+If `ENABLE_API_KEYS=true`, include either `Authorization: Bearer <key>` or `x-api-key: <key>`.
+Send an optional `x-request-id` to correlate logs; returned as `correlationId`.
 
--   `Authorization: Bearer <token>`
--   `X-API-Key: <token>`
+---
 
-Error envelope (non-2xx):
+## Conventions
 
-```json
-{ "error": { "code": "STRING", "message": "STRING", "correlationId": "UUID" } }
+-   Timecodes: `HH:MM:SS` or `HH:MM:SS.mmm` (milliseconds optional).
+-   All responses: JSON.
+-   Errors: unified envelope.
+
+### Error Envelope
+
+```
+{
+  "error": { "code": "STRING", "message": "Text", "correlationId": "id" }
+}
 ```
 
-Common error codes: VALIDATION_FAILED, NOT_FOUND, GONE, NOT_READY, UNAUTHORIZED, RATE_LIMITED, INTERNAL.
+Common codes: `VALIDATION_FAILED`, `NOT_FOUND`, `NOT_READY`, `GONE`, `UNAUTHORIZED`, `RATE_LIMITED`, `INTERNAL`, plus worker surface codes like `YTDLP_*`, `INPUT_TOO_LARGE`, `STORAGE_UPLOAD_FAILED:*`, `CLIP_TIMEOUT`.
 
 ---
 
@@ -21,76 +28,39 @@ Common error codes: VALIDATION_FAILED, NOT_FOUND, GONE, NOT_READY, UNAUTHORIZED,
 
 POST `/api/jobs`
 
-Request body:
+Create a clipping job from an uploaded source object or a YouTube URL.
 
-```json
+Request Body:
+
+```
 {
-    "sourceType": "upload", // or "youtube"
-    "uploadKey": "sources/{jobId}/source.mp4", // required when sourceType=upload
-    "youtubeUrl": "https://www.youtube.com/watch?v=...", // required when sourceType=youtube
-    "start": "HH:MM:SS(.ms)",
-    "end": "HH:MM:SS(.ms)",
-    "withSubtitles": true,
-    "burnSubtitles": false,
-    "subtitleLang": "auto" // optional
+  "sourceType": "upload" | "youtube",
+  "uploadKey": "sources/<id>/source.mp4",      // required when sourceType=upload
+  "youtubeUrl": "https://www.youtube.com/...", // required when sourceType=youtube
+  "start": "HH:MM:SS[.mmm]",                   // inclusive start
+  "end":   "HH:MM:SS[.mmm]",                   // exclusive end (> start)
+  "withSubtitles": false,                       // request ASR transcription
+  "burnSubtitles": false,                       // burn subtitles (if withSubtitles)
+  "subtitleLang": "auto" | "en" | <langCode>   // optional
 }
 ```
 
-Notes:
+Constraints:
 
--   Duration must not exceed `MAX_CLIP_SECONDS` (default 120).
--   Expiration is set to now + `RETENTION_HOURS` (default 72) in job.expiresAt.
+-   `end - start <= MAX_CLIP_SECONDS` (env, default 120)
+-   YouTube URL must pass allowlist + SSRF checks
+-   File / source size & duration must satisfy `MAX_INPUT_MB`, `MAX_CLIP_INPUT_DURATION_SEC`
 
-Successful response (201 style 200):
+200 Response:
 
-```json
+```
 {
-    "correlationId": "...",
-    "job": {
-        "id": "...",
-        "status": "queued",
-        "progress": 0,
-        "expiresAt": "2025-..."
-    }
+  "correlationId": "...",
+  "job": { "id": "uuid", "status": "queued", "progress": 0, "expiresAt": "ISO" }
 }
 ```
 
-Curl example (upload source):
-
-```bash
-curl -X POST "$BASE/api/jobs" \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $API_TOKEN" \
-  -d '{
-    "sourceType":"upload",
-    "uploadKey":"sources/123/source.mp4",
-    "start":"00:00:00",
-    "end":"00:00:05",
-    "withSubtitles":true,
-    "burnSubtitles":false,
-    "subtitleLang":"auto"
-  }'
-```
-
-Curl example (YouTube source):
-
-```bash
-curl -X POST "$BASE/api/jobs" \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $API_TOKEN" \
-  -d '{
-    "sourceType":"youtube",
-    "youtubeUrl":"https://www.youtube.com/watch?v=abcdef",
-    "start":"00:00:05",
-    "end":"00:00:20",
-    "withSubtitles":false,
-    "burnSubtitles":false
-  }'
-```
-
-Rate limiting:
-
--   If configured, exceeding limit returns 429 with code RATE_LIMITED.
+Errors: 400 `VALIDATION_FAILED` or `CLIP_TOO_LONG`; 401 `UNAUTHORIZED`; 429 `RATE_LIMITED`.
 
 ---
 
@@ -98,106 +68,145 @@ Rate limiting:
 
 GET `/api/jobs/{id}`
 
-Example:
+200 Response:
 
-```bash
-curl -H "Authorization: Bearer $API_TOKEN" "$BASE/api/jobs/$JOB_ID"
 ```
-
-Success response:
-
-```json
 {
-    "correlationId": "...",
-    "job": {
-        "id": "...",
-        "status": "queued|processing|done|failed",
-        "progress": 0,
-        "resultVideoKey": "results/.../clip.mp4",
-        "resultSrtKey": "results/.../clip.srt",
-        "expiresAt": "2025-..."
-    },
-    "events": [{ "ts": "2025-...", "type": "created", "data": {} }]
+  "correlationId": "...",
+  "job": {
+    "id": "uuid",
+    "status": "queued" | "processing" | "done" | "failed",
+    "progress": 0-100,
+    "resultVideoKey": "results/<id>/clip.mp4"?,
+    "resultSrtKey": "results/<id>/clip.srt"?,
+    "expiresAt": "ISO"?
+  },
+  "events": [
+    { "ts": "ISO", "type": "created" },
+    { "ts": "ISO", "type": "processing" },
+    { "ts": "ISO", "type": "source:ready", "data": { "durationSec": 900.1 } },
+    { "ts": "ISO", "type": "progress", "data": { "pct": 42, "stage": "clip" } },
+    { "ts": "ISO", "type": "uploaded", "data": { "key": "results/<id>/clip.mp4" } },
+    { "ts": "ISO", "type": "asr:requested", "data": { "asrJobId": "..." } },
+    { "ts": "ISO", "type": "asr:error", "data": { "err": "..." } },
+    { "ts": "ISO", "type": "done" | "failed" }
+  ]
 }
 ```
 
-Special cases:
-
--   404 NOT_FOUND if job missing.
--   410 GONE if expired.
+Errors: 404 `NOT_FOUND`; 410 `GONE` (expired).
 
 ---
 
-## Get Job Result (Signed URLs)
+## Get Job Result
 
 GET `/api/jobs/{id}/result`
 
-Returns signed URLs when job is done.
+200 Response (only when job done):
 
-```bash
-curl -H "Authorization: Bearer $API_TOKEN" "$BASE/api/jobs/$JOB_ID/result"
 ```
-
-Success (status=done):
-
-```json
 {
-    "correlationId": "...",
-    "result": {
-        "id": "...",
-        "video": {
-            "key": "results/.../clip.mp4",
-            "url": "https://...signed..."
-        },
-        "srt": { "key": "results/.../clip.srt", "url": "https://...signed..." }
-    }
+  "correlationId": "...",
+  "result": {
+    "id": "uuid",
+    "video": { "key": "results/<id>/clip.mp4", "url": "signedUrl" },
+    "srt": { "key": "results/<id>/clip.srt", "url": "signedUrl" }?
+  }
 }
 ```
 
-Errors:
-
--   404 NOT_FOUND if job missing or not ready (code NOT_READY when still processing).
--   410 GONE if expired.
--   500 STORAGE_UNAVAILABLE if signing disabled.
+Errors: 404 `NOT_READY` (not done yet); 404 `NOT_FOUND`; 410 `GONE`; 500 `STORAGE_UNAVAILABLE`.
 
 ---
 
-## Health & Metrics
+## Health
 
-GET `/healthz` basic readiness.
-GET `/metrics` returns JSON snapshot of internal counters/histograms.
-GET `/metrics/queue` exposes queue depth/health snapshot.
+GET `/healthz`
 
----
-
-## Error Examples
-
-Validation failure:
-
-```json
-{
-    "error": {
-        "code": "VALIDATION_FAILED",
-        "message": "...",
-        "correlationId": "..."
-    }
-}
 ```
-
-Rate limited:
-
-```json
-{
-    "error": {
-        "code": "RATE_LIMITED",
-        "message": "Rate limit exceeded",
-        "correlationId": "..."
-    }
-}
+{ "ok": true, "queue": { ... }, "correlationId": "..." }
 ```
 
 ---
 
-## Versioning
+## Metrics
 
-Current API unversioned; breaking changes will introduce `/v1/` prefix.
+GET `/metrics` -> in‑memory metrics snapshot.
+GET `/metrics/queue` -> queue depth & timings.
+
+---
+
+## Events (Types)
+
+`created`, `processing`, `source:ready`, `progress`, `uploaded`, `asr:requested`, `asr:error`, `failed`, `done`.
+
+---
+
+## Lifecycle
+
+```
+queued -> processing -> (done | failed)
+```
+
+Heartbeats update `lastHeartbeatAt` internally.
+
+---
+
+## Storage Keys
+
+```
+results/{jobId}/clip.mp4
+results/{jobId}/clip.subbed.mp4 (future)
+results/{jobId}/clip.srt (ASR)
+```
+
+---
+
+## Worker Pass-through Error Codes
+
+`YTDLP_NOT_FOUND`, `YTDLP_TIMEOUT`, `YTDLP_DISABLED`, `YTDLP_FAILED:<n>`, `INPUT_TOO_LARGE`, `FFPROBE_FAILED`, `STORAGE_UPLOAD_FAILED:<msg>`, `CLIP_TIMEOUT`, `BAD_REQUEST` (ffmpeg failures).
+
+---
+
+## Core Environment Variables
+
+| Var                                                                | Description                   |
+| ------------------------------------------------------------------ | ----------------------------- | ---- | ---- | ----- |
+| PORT                                                               | API port (3000)               |
+| DATABASE_URL                                                       | Postgres (Drizzle + pg-boss)  |
+| SCRATCH_DIR                                                        | Temp space for sources/clips  |
+| SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY / SUPABASE_STORAGE_BUCKET | Storage config                |
+| ENABLE_YTDLP                                                       | Enable YouTube resolver       |
+| MAX_INPUT_MB                                                       | Max source size (MB)          |
+| MAX_CLIP_INPUT_DURATION_SEC                                        | Max source duration (s)       |
+| MAX_CLIP_SECONDS                                                   | Max requested clip length (s) |
+| SIGNED_URL_TTL_SEC                                                 | Signed URL lifetime           |
+| LOG_LEVEL                                                          | debug                         | info | warn | error |
+| ENABLE_API_KEYS                                                    | Require API keys              |
+| RATE_LIMIT_WINDOW_SEC / RATE_LIMIT_MAX                             | Rate limiting                 |
+| STORAGE_UPLOAD_ATTEMPTS                                            | Upload retry attempts         |
+| YTDLP_FORMAT / YTDLP_SECTIONS                                      | yt-dlp override/sections      |
+
+---
+
+## Curl Examples
+
+Create YouTube job:
+
+```
+curl -X POST http://localhost:3000/api/jobs \
+ -H 'Content-Type: application/json' \
+ -d '{"sourceType":"youtube","youtubeUrl":"https://www.youtube.com/watch?v=VIDEO","start":"00:01:00","end":"00:01:25","withSubtitles":false}'
+```
+
+Poll status:
+
+```
+curl http://localhost:3000/api/jobs/<jobId>
+```
+
+Fetch result:
+
+```
+curl http://localhost:3000/api/jobs/<jobId>/result
+```
