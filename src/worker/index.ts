@@ -17,12 +17,14 @@ import {
 import { PgBossQueueAdapter } from '@clipper/queue';
 import { BunClipper } from '@clipper/ffmpeg';
 import { AsrFacade } from '@clipper/asr/facade';
+import { InMemoryMetrics } from '@clipper/common/metrics';
 export * from './asr.ts';
 
 const log = createLogger((readEnv('LOG_LEVEL') as any) || 'info').with({
     mod: 'worker',
 });
 
+const metrics = new InMemoryMetrics();
 const jobs = new DrizzleJobsRepo(createDb());
 const events = new DrizzleJobEventsRepo(createDb());
 const queue = new PgBossQueueAdapter({
@@ -79,6 +81,7 @@ async function main() {
             if (job.status !== 'processing') {
                 await jobs.update(jobId, { status: 'processing', progress: 0 });
                 await events.add({ jobId, ts: nowIso(), type: 'processing' });
+                log.info('job processing start', { jobId });
             }
 
             // Resolve source
@@ -113,6 +116,7 @@ async function main() {
             });
 
             // Perform clip
+            const clipStart = Date.now();
             const { localPath: clipPath, progress$ } = await clipper.clip({
                 input: resolveRes.localPath,
                 startSec: job.startSec,
@@ -193,6 +197,7 @@ async function main() {
                 }
             };
             await uploadWithRetry();
+            metrics.observe('clip.upload_ms', Date.now() - clipStart);
             await events.add({
                 jobId,
                 ts: nowIso(),
@@ -233,11 +238,13 @@ async function main() {
             }
 
             await finish('done', { progress: 100, resultVideoKey: key });
+            metrics.observe('clip.total_ms', Date.now() - startedAt);
             const ms = Date.now() - startedAt;
             log.info('job completed', { jobId, ms });
         } catch (e) {
             const err = fromException(e, jobId);
             log.error('job failed', { jobId, err });
+            metrics.inc('clip.failures');
             try {
                 await jobs.update(jobId, {
                     status: 'failed',

@@ -1,4 +1,4 @@
-import { describe, test, expect } from 'bun:test';
+import { describe, test, expect } from 'vitest';
 import { AsrQueuePayloadSchema } from '@clipper/queue/asr';
 import { PgBossQueueAdapter } from '@clipper/queue';
 import { QUEUE_TOPIC_ASR } from '@clipper/queue';

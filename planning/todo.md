@@ -35,8 +35,8 @@ Only incomplete planned items from layers doc; excludes new/optional stretch fea
 
 ## 6. Observability (instrument after ASR path exists)
 
--   [ ] /metrics endpoint: job duration histogram, queue depth, ffmpeg fallback counter, ASR latency & status counts, storage upload latency
--   [ ] Add jobId/asrJobId correlation fields consistently in logs
+-   [x] /metrics endpoint: job duration histogram, queue depth, ffmpeg fallback counter, ASR latency & status counts, storage upload latency
+-   [x] Add jobId/asrJobId correlation fields consistently in logs
 
 ## 7. Cleanup (after ASR artifacts introduced)
 

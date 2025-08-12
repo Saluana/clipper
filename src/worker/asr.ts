@@ -11,6 +11,7 @@ import {
     GroqWhisperProvider,
     ProviderHttpError,
 } from '@clipper/asr';
+import { InMemoryMetrics } from '@clipper/common/metrics';
 import { QUEUE_TOPIC_ASR } from '@clipper/queue';
 import {
     AsrQueuePayloadSchema,
@@ -37,6 +38,7 @@ const log = createLogger((readEnv('LOG_LEVEL') as any) || 'info').with({
 });
 
 export async function startAsrWorker(deps: AsrWorkerDeps) {
+    const metrics = new InMemoryMetrics();
     const asrJobs = deps?.asrJobs ?? new DrizzleAsrJobsRepo(createDb());
     const clipJobs = deps?.clipJobs ?? new DrizzleJobsRepo(createDb());
     const artifacts =
@@ -168,6 +170,8 @@ export async function startAsrWorker(deps: AsrWorkerDeps) {
                 durationSec: Math.round(res.durationSec),
                 completedAt: new Date().toISOString(),
             });
+            metrics.observe('asr.duration_ms', Date.now() - startedAt);
+            metrics.inc('asr.completed');
 
             // Update originating clip job with transcript key if available
             if (clipJobId) {
@@ -222,6 +226,7 @@ export async function startAsrWorker(deps: AsrWorkerDeps) {
         } catch (e) {
             const err = fromException(e, asrJobId);
             log.error('asr job failed', { asrJobId, err });
+            metrics.inc('asr.failures');
             try {
                 await asrJobs.patch(asrJobId, {
                     status: 'failed',

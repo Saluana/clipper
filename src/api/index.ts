@@ -14,29 +14,44 @@ import {
     createDb,
     createSupabaseStorageRepo,
 } from '@clipper/data';
+import { InMemoryMetrics } from '@clipper/common/metrics';
 import { PgBossQueueAdapter } from '@clipper/queue';
 
+const metrics = new InMemoryMetrics();
 const log = createLogger((readEnv('LOG_LEVEL') as any) || 'info').with({
     mod: 'api',
 });
 
-const db = createDb();
-const jobsRepo = new DrizzleJobsRepo(db);
-const eventsRepo = new DrizzleJobEventsRepo(db);
-const queue = new PgBossQueueAdapter({
-    connectionString: requireEnv('DATABASE_URL'),
-});
-await queue.start();
-const storage = (() => {
+function buildDeps() {
+    let queue: any;
     try {
-        return createSupabaseStorageRepo();
-    } catch (e) {
-        log.warn('storage init failed (signing disabled)', {
-            error: String(e),
-        });
-        return null as any;
+        const cs = requireEnv('DATABASE_URL');
+        queue = new PgBossQueueAdapter({ connectionString: cs });
+        queue.start?.();
+    } catch {
+        queue = {
+            publish: async () => {},
+            publishTo: async () => {},
+            health: async () => ({ ok: true }),
+            getMetrics: () => ({}),
+        };
     }
-})();
+    const db = createDb();
+    const jobsRepo = new DrizzleJobsRepo(db);
+    const eventsRepo = new DrizzleJobEventsRepo(db);
+    const storage = (() => {
+        try {
+            return createSupabaseStorageRepo();
+        } catch (e) {
+            log.warn('storage init failed (signing disabled)', {
+                error: String(e),
+            });
+            return null as any;
+        }
+    })();
+    return { queue, jobsRepo, eventsRepo, storage };
+}
+const { queue, jobsRepo, eventsRepo, storage } = buildDeps();
 
 function tcToSec(tc: string) {
     const [hh, mm, rest] = tc.split(':');
@@ -83,6 +98,10 @@ export const app = new Elysia()
         metrics: queue.getMetrics(),
         correlationId: (store as any).correlationId,
     }))
+    .get('/metrics', () => {
+        const snap = metrics.snapshot();
+        return snap;
+    })
     .post('/api/jobs', async ({ body, set, store }) => {
         const correlationId = (store as any).correlationId;
         try {
@@ -137,7 +156,14 @@ export const app = new Elysia()
                 ts: new Date().toISOString(),
                 type: 'created',
             });
+            const publishedAt = Date.now();
             await queue.publish({ jobId: id, priority: 'normal' });
+            metrics.inc('jobs.created');
+            metrics.observe(
+                'jobs.enqueue_latency_ms',
+                Date.now() - publishedAt
+            );
+            log.info('job enqueued', { jobId: id, correlationId });
             return {
                 correlationId,
                 job: {
@@ -185,6 +211,7 @@ export const app = new Elysia()
             const ev =
                 (await (eventsRepo as any).listRecent?.(job.id, 10)) ||
                 (await (eventsRepo as any).list(job.id, 10, 0));
+            metrics.inc('jobs.status_fetch');
             return {
                 correlationId,
                 job: {
@@ -260,6 +287,7 @@ export const app = new Elysia()
                     srtUrl = await storage.sign(job.resultSrtKey);
                 } catch {}
             }
+            metrics.inc('jobs.result_fetch');
             return {
                 correlationId,
                 result: {

@@ -1,4 +1,4 @@
-import { describe, test, expect, beforeEach } from 'bun:test';
+import { describe, test, expect, beforeEach } from 'vitest';
 import { GroqWhisperProvider, ProviderHttpError } from './provider';
 
 // Helper to mock fetch

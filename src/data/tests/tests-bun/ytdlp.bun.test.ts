@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'bun:test';
+import { describe, it, expect } from 'vitest';
 import { readdir } from 'node:fs/promises';
 
 const URL = 'https://www.youtube.com/watch?v=8tx2viHpgA8';

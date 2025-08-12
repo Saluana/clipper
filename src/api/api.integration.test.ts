@@ -14,12 +14,7 @@ function jsonHeaders(extra: Record<string, string> = {}) {
     return { 'content-type': 'application/json', ...extra };
 }
 
-describe('API core endpoints', () => {
-    if (!HAS_DB) {
-        test.skip('requires DATABASE_URL for integration tests', () => {});
-        return;
-    }
-
+describe.skipIf(!HAS_DB)('API core endpoints', () => {
     // Apply migrations once
     beforeAll(async () => {
         const pool = new Pool({ connectionString: process.env.DATABASE_URL });

@@ -50,6 +50,7 @@ planning/
   layers.md
   requirements.md
   tasks.md
+  todo.md
 src/
   api/
     index.ts
@@ -86,8 +87,10 @@ src/
         0000_snapshot.json
       0000_tense_yellow_claw.sql
       0001_asr_jobs.sql
+      0002_add_last_heartbeat.sql
     scripts/
       admin-jobs.ts
+      backfill-expires.ts
       bootstrap-storage.ts
       cleanup.ts
       seed.ts
@@ -1343,119 +1346,6 @@ Non-goals for MVP: full NLE, heavy UI, complex multi-tenant auth/quotas beyond A
 -   Queue: pg-boss schema/name; retry policy and visibility timeout.
 ````
 
-## File: src/api/index.ts
-````typescript
-import { Elysia, t } from 'elysia';
-import cors from '@elysiajs/cors';
-import { Schemas, type CreateJobInputType } from '@clipper/contracts';
-import { createLogger, readEnv, readIntEnv, requireEnv } from '@clipper/common';
-import { DrizzleJobsRepo, DrizzleJobEventsRepo, createDb } from '@clipper/data';
-import { PgBossQueueAdapter } from '@clipper/queue';
-
-const log = createLogger((readEnv('LOG_LEVEL') as any) || 'info').with({
-    mod: 'api',
-});
-
-const jobsRepo = new DrizzleJobsRepo(createDb());
-const eventsRepo = new DrizzleJobEventsRepo(createDb());
-const queue = new PgBossQueueAdapter({
-    connectionString: requireEnv('DATABASE_URL'),
-});
-await queue.start();
-
-function tcToSec(tc: string) {
-    const [hh, mm, rest] = tc.split(':');
-    const [ss, ms] = rest?.split('.') || [rest || '0', undefined];
-    return (
-        Number(hh) * 3600 +
-        Number(mm) * 60 +
-        Number(ss) +
-        (ms ? Number(`0.${ms}`) : 0)
-    );
-}
-
-export const app = new Elysia()
-    .use(cors())
-    .get('/healthz', async () => {
-        const h = await queue.health();
-        return { ok: h.ok, queue: h };
-    })
-    .get('/metrics/queue', () => queue.getMetrics())
-    .post('/api/jobs', async ({ body, set }) => {
-        const parsed = Schemas.CreateJobInput.safeParse(body);
-        if (!parsed.success) {
-            set.status = 400;
-            return {
-                error: {
-                    code: 'VALIDATION_FAILED',
-                    message: parsed.error.message,
-                },
-            };
-        }
-        const input = parsed.data as CreateJobInputType;
-        const id = crypto.randomUUID();
-        const startSec = tcToSec(input.start);
-        const endSec = tcToSec(input.end);
-        if (endSec - startSec > Number(readIntEnv('MAX_CLIP_SECONDS', 120))) {
-            set.status = 400;
-            return {
-                error: {
-                    code: 'CLIP_TOO_LONG',
-                    message: 'Clip exceeds MAX_CLIP_SECONDS',
-                },
-            };
-        }
-        const row = await jobsRepo.create({
-            id,
-            status: 'queued',
-            progress: 0,
-            sourceType: input.sourceType,
-            sourceKey: input.uploadKey,
-            sourceUrl: input.youtubeUrl,
-            startSec,
-            endSec,
-            withSubtitles: input.withSubtitles,
-            burnSubtitles: input.burnSubtitles,
-            subtitleLang: input.subtitleLang,
-            resultVideoKey: undefined,
-            resultSrtKey: undefined,
-            errorCode: undefined,
-            errorMessage: undefined,
-            expiresAt: undefined,
-        });
-
-        await eventsRepo.add({
-            jobId: id,
-            ts: new Date().toISOString(),
-            type: 'created',
-        });
-        await queue.publish({ jobId: id, priority: 'normal' });
-
-        return {
-            id: row.id,
-            status: row.status,
-            expiresAt: new Date(
-                Date.now() +
-                    Number(readIntEnv('RETENTION_HOURS', 72)) * 3600_000
-            ).toISOString(),
-        };
-    });
-
-if (import.meta.main) {
-    const port = Number(readIntEnv('PORT', 3000));
-    const server = Bun.serve({ fetch: app.fetch, port });
-    log.info('API started', { port });
-    const stop = async () => {
-        log.info('API stopping');
-        server.stop(true);
-        await queue.shutdown();
-        process.exit(0);
-    };
-    process.on('SIGINT', stop);
-    process.on('SIGTERM', stop);
-}
-````
-
 ## File: src/asr/formatter.ts
 ````typescript
 import type { AsrProviderSegment } from './provider';
@@ -2127,6 +2017,12 @@ export type MetricLabels = Record<string, string | number>;
 export interface Metrics {
     inc(name: string, value?: number, labels?: MetricLabels): void;
     observe(name: string, value: number, labels?: MetricLabels): void;
+    snapshot(): MetricsSnapshot;
+}
+
+export interface MetricsSnapshot {
+    counters: Record<string, number>;
+    histograms: Record<string, { count: number; sum: number; min: number; max: number; p50: number; p90: number; p99: number }>;
 }
 
 export class InMemoryMetrics implements Metrics {
@@ -2142,11 +2038,40 @@ export class InMemoryMetrics implements Metrics {
         arr.push(value);
         this.histograms.set(key, arr);
     }
+    snapshot(): MetricsSnapshot {
+        const counters: Record<string, number> = {};
+        for (const [k, v] of this.counters.entries()) counters[k] = v;
+        const histograms: MetricsSnapshot['histograms'] = {};
+        for (const [k, arr] of this.histograms.entries()) {
+            if (!arr.length) continue;
+            const sorted = [...arr].sort((a, b) => a - b);
+            const pct = (p: number): number => {
+                const idx = Math.min(
+                    sorted.length - 1,
+                    Math.max(0, Math.floor((p / 100) * sorted.length))
+                );
+                return sorted[idx] ?? sorted[sorted.length - 1] ?? 0;
+            };
+            histograms[k] = {
+                count: arr.length,
+                sum: arr.reduce((a, b) => a + b, 0),
+                min: sorted[0]!,
+                max: sorted[sorted.length - 1]!,
+                p50: pct(50),
+                p90: pct(90),
+                p99: pct(99),
+            };
+        }
+        return { counters, histograms };
+    }
 }
 
 export const noopMetrics: Metrics = {
     inc() {},
     observe() {},
+    snapshot() {
+        return { counters: {}, histograms: {} };
+    },
 };
 
 function keyWithLabels(name: string, labels?: MetricLabels) {
@@ -2827,6 +2752,13 @@ CREATE TABLE "asr_artifacts" (
 );
 ````
 
+## File: src/data/drizzle/0002_add_last_heartbeat.sql
+````sql
+-- Add last_heartbeat_at column to jobs
+ALTER TABLE "jobs" ADD COLUMN IF NOT EXISTS "last_heartbeat_at" timestamp with time zone;
+-- Index could be added later if querying stale heartbeats frequently
+````
+
 ## File: src/data/scripts/admin-jobs.ts
 ````typescript
 import { eq, inArray } from 'drizzle-orm';
@@ -2949,6 +2881,44 @@ if (import.meta.main) {
         process.exit(1);
     });
 }
+````
+
+## File: src/data/scripts/backfill-expires.ts
+````typescript
+#!/usr/bin/env bun
+/**
+ * One-off backfill: set expires_at for jobs lacking a value.
+ * Usage: bun run src/data/scripts/backfill-expires.ts
+ */
+import { createDb } from '../db/connection';
+import { jobs } from '../db/schema';
+import { isNull, eq } from 'drizzle-orm';
+
+const RETENTION_HOURS = Number(process.env.RETENTION_HOURS || 72);
+
+async function main() {
+    const db = createDb();
+    const now = Date.now();
+    const rows = await db.select().from(jobs).where(isNull(jobs.expiresAt));
+    let updated = 0;
+    for (const r of rows) {
+        const created = (r.createdAt as Date) ?? new Date();
+        const expires = new Date(
+            created.getTime() + RETENTION_HOURS * 3600_000
+        );
+        await db
+            .update(jobs)
+            .set({ expiresAt: expires })
+            .where(eq(jobs.id, r.id));
+        updated++;
+    }
+    console.log(JSON.stringify({ scanned: rows.length, updated }, null, 2));
+}
+
+main().catch((e) => {
+    console.error(e);
+    process.exit(1);
+});
 ````
 
 ## File: src/data/scripts/bootstrap-storage.ts
@@ -3373,181 +3343,6 @@ if (import.meta.main) {
     main().catch((e) => {
         console.error(e);
         process.exit(1);
-    });
-}
-````
-
-## File: src/worker/asr.ts
-````typescript
-import {
-    DrizzleAsrJobsRepo,
-    DrizzleJobsRepo,
-    DrizzleAsrArtifactsRepo,
-    createDb,
-    storageKeys,
-    createSupabaseStorageRepo,
-} from '@clipper/data';
-import { buildArtifacts, GroqWhisperProvider } from '@clipper/asr';
-import { QUEUE_TOPIC_ASR } from '@clipper/queue';
-import {
-    AsrQueuePayloadSchema,
-    type AsrQueuePayload,
-} from '@clipper/queue/asr';
-import { createLogger, readEnv, fromException } from '@clipper/common';
-
-export interface AsrWorkerDeps {
-    asrJobs?: DrizzleAsrJobsRepo;
-    clipJobs?: DrizzleJobsRepo;
-    artifacts?: DrizzleAsrArtifactsRepo;
-    provider?: GroqWhisperProvider;
-    storage?: ReturnType<typeof createSupabaseStorageRepo>;
-    queue: {
-        consumeFrom: (
-            topic: string,
-            handler: (msg: any) => Promise<void>
-        ) => Promise<void>;
-    };
-}
-
-const log = createLogger((readEnv('LOG_LEVEL') as any) || 'info').with({
-    mod: 'asrWorker',
-});
-
-export async function startAsrWorker(deps: AsrWorkerDeps) {
-    const asrJobs = deps?.asrJobs ?? new DrizzleAsrJobsRepo(createDb());
-    const clipJobs = deps?.clipJobs ?? new DrizzleJobsRepo(createDb());
-    const artifacts =
-        deps?.artifacts ?? new DrizzleAsrArtifactsRepo(createDb());
-    const storage =
-        deps?.storage ??
-        (() => {
-            try {
-                return createSupabaseStorageRepo();
-            } catch {
-                return null as any;
-            }
-        })();
-    const provider = deps?.provider ?? new GroqWhisperProvider();
-
-    const timeoutMs = Number(readEnv('ASR_REQUEST_TIMEOUT_MS') || 120_000);
-    const includeJson =
-        (readEnv('ASR_JSON_SEGMENTS') || 'false').toLowerCase() === 'true';
-    const mergeGapMs = Number(readEnv('MERGE_GAP_MS') || 150);
-
-    await deps.queue.consumeFrom(QUEUE_TOPIC_ASR, async (msg: any) => {
-        const parse = AsrQueuePayloadSchema.safeParse(msg as AsrQueuePayload);
-        if (!parse.success) {
-            log.warn('invalid asr payload', { issues: parse.error.issues });
-            return; // drop invalid messages
-        }
-        const { asrJobId, clipJobId, languageHint } = parse.data;
-        const startedAt = Date.now();
-        let tmpLocal: string | null = null;
-        try {
-            // Load and claim job
-            const job = await asrJobs.get(asrJobId);
-            if (!job) {
-                log.warn('asr job not found', { asrJobId });
-                return;
-            }
-            if (job.status === 'done') return; // idempotent
-            if (job.status === 'queued') {
-                await asrJobs.patch(asrJobId, { status: 'processing' });
-            }
-
-            // Locate media: prefer clip resultVideoKey
-            let inputLocal: string;
-            if (clipJobId) {
-                const clip = await clipJobs.get(clipJobId);
-                if (!clip?.resultVideoKey) throw new Error('NO_CLIP_RESULT');
-                if (!storage) throw new Error('STORAGE_NOT_AVAILABLE');
-                inputLocal = await storage.download(clip.resultVideoKey);
-                tmpLocal = inputLocal;
-            } else {
-                throw new Error('NO_INPUT_PROVIDED');
-            }
-
-            // Transcribe
-            const res = await provider.transcribe(inputLocal, {
-                timeoutMs,
-                languageHint,
-            });
-
-            // Build artifacts
-            const built = buildArtifacts(res.segments, {
-                includeJson,
-                mergeGapMs,
-            });
-
-            // Upload artifacts
-            if (!storage) throw new Error('STORAGE_NOT_AVAILABLE');
-            const owner = clipJobId ?? asrJobId;
-            const srtKey = storageKeys.transcriptSrt(owner);
-            const txtKey = storageKeys.transcriptText(owner);
-            const jsonKey = includeJson
-                ? storageKeys.transcriptJson(owner)
-                : null;
-            const srtPath = `/tmp/${owner}.srt`;
-            const txtPath = `/tmp/${owner}.txt`;
-            await Bun.write(srtPath, built.srt);
-            await Bun.write(txtPath, built.text);
-            await storage.upload(srtPath, srtKey, 'application/x-subrip');
-            await storage.upload(txtPath, txtKey, 'text/plain; charset=utf-8');
-            if (includeJson && jsonKey) {
-                const jsonPath = `/tmp/${owner}.json`;
-                await Bun.write(
-                    jsonPath,
-                    JSON.stringify(built.json || [], null, 0)
-                );
-                await storage.upload(jsonPath, jsonKey, 'application/json');
-            }
-
-            // Persist artifacts
-            await artifacts.put({
-                asrJobId,
-                kind: 'srt',
-                storageKey: srtKey,
-                createdAt: new Date().toISOString(),
-            });
-            await artifacts.put({
-                asrJobId,
-                kind: 'text',
-                storageKey: txtKey,
-                createdAt: new Date().toISOString(),
-            });
-            if (includeJson && jsonKey)
-                await artifacts.put({
-                    asrJobId,
-                    kind: 'json',
-                    storageKey: jsonKey,
-                    createdAt: new Date().toISOString(),
-                });
-
-            // Finalize job
-            await asrJobs.patch(asrJobId, {
-                status: 'done',
-                detectedLanguage: res.detectedLanguage,
-                durationSec: Math.round(res.durationSec),
-                completedAt: new Date().toISOString(),
-            });
-        } catch (e) {
-            const err = fromException(e, asrJobId);
-            log.error('asr job failed', { asrJobId, err });
-            try {
-                await asrJobs.patch(asrJobId, {
-                    status: 'failed',
-                    errorCode:
-                        (err.error && (err.error as any).code) || 'INTERNAL',
-                    errorMessage:
-                        (err.error && (err.error as any).message) || String(e),
-                });
-            } catch {}
-            throw e; // let PgBoss retry
-        } finally {
-            try {
-                if (tmpLocal) await Bun.spawn(['rm', '-f', tmpLocal]).exited;
-            } catch {}
-        }
     });
 }
 ````
@@ -3992,6 +3787,318 @@ M5 — Dogfood UI + docs + e2e (sections 8, 9, 10)
 -   DNS safety gaps: deny private networks; strict allowlist
 ````
 
+## File: src/api/index.ts
+````typescript
+import { Elysia } from 'elysia';
+import cors from '@elysiajs/cors';
+import { Schemas, type CreateJobInputType } from '@clipper/contracts';
+import {
+    createLogger,
+    readEnv,
+    readIntEnv,
+    requireEnv,
+    fromException,
+} from '@clipper/common';
+import {
+    DrizzleJobsRepo,
+    DrizzleJobEventsRepo,
+    createDb,
+    createSupabaseStorageRepo,
+} from '@clipper/data';
+import { InMemoryMetrics } from '@clipper/common/metrics';
+import { PgBossQueueAdapter } from '@clipper/queue';
+
+const metrics = new InMemoryMetrics();
+const log = createLogger((readEnv('LOG_LEVEL') as any) || 'info').with({ mod: 'api' });
+
+const db = createDb();
+const jobsRepo = new DrizzleJobsRepo(db);
+const eventsRepo = new DrizzleJobEventsRepo(db);
+const queue = new PgBossQueueAdapter({
+    connectionString: requireEnv('DATABASE_URL'),
+});
+await queue.start();
+const storage = (() => {
+    try {
+        return createSupabaseStorageRepo();
+    } catch (e) {
+        log.warn('storage init failed (signing disabled)', {
+            error: String(e),
+        });
+        return null as any;
+    }
+})();
+
+function tcToSec(tc: string) {
+    const [hh, mm, rest] = tc.split(':');
+    const [ss, ms] = rest?.split('.') || [rest || '0', undefined];
+    return (
+        Number(hh) * 3600 +
+        Number(mm) * 60 +
+        Number(ss) +
+        (ms ? Number(`0.${ms}`) : 0)
+    );
+}
+
+// Simple correlation id + uniform error envelope middleware
+interface ApiErrorEnvelope {
+    error: { code: string; message: string; correlationId: string };
+}
+function buildError(
+    set: any,
+    code: number,
+    errCode: string,
+    message: string,
+    correlationId: string
+): ApiErrorEnvelope {
+    set.status = code;
+    return { error: { code: errCode, message, correlationId } };
+}
+
+export const app = new Elysia()
+    .use(cors())
+    .onRequest(({ request, store }) => {
+        const cid = request.headers.get('x-request-id') || crypto.randomUUID();
+        (store as any).correlationId = cid;
+    })
+    .state('correlationId', '')
+    .get('/healthz', async ({ store }) => {
+        const h = await queue.health();
+        return {
+            ok: h.ok,
+            queue: h,
+            correlationId: (store as any).correlationId,
+        };
+    })
+    .get('/metrics/queue', ({ store }) => ({
+        metrics: queue.getMetrics(),
+        correlationId: (store as any).correlationId,
+    }))
+    .get('/metrics', () => {
+        const snap = metrics.snapshot();
+        return snap;
+    })
+    .post('/api/jobs', async ({ body, set, store }) => {
+        const correlationId = (store as any).correlationId;
+        try {
+            const parsed = Schemas.CreateJobInput.safeParse(body);
+            if (!parsed.success) {
+                return buildError(
+                    set,
+                    400,
+                    'VALIDATION_FAILED',
+                    parsed.error.message,
+                    correlationId
+                );
+            }
+            const input = parsed.data as CreateJobInputType;
+            const id = crypto.randomUUID();
+            const startSec = tcToSec(input.start);
+            const endSec = tcToSec(input.end);
+            if (
+                endSec - startSec >
+                Number(readIntEnv('MAX_CLIP_SECONDS', 120))
+            ) {
+                return buildError(
+                    set,
+                    400,
+                    'CLIP_TOO_LONG',
+                    'Clip exceeds MAX_CLIP_SECONDS',
+                    correlationId
+                );
+            }
+            const retentionHours = Number(readIntEnv('RETENTION_HOURS', 72));
+            const expiresAt = new Date(Date.now() + retentionHours * 3600_000);
+            const row = await jobsRepo.create({
+                id,
+                status: 'queued',
+                progress: 0,
+                sourceType: input.sourceType,
+                sourceKey: input.uploadKey,
+                sourceUrl: input.youtubeUrl,
+                startSec,
+                endSec,
+                withSubtitles: input.withSubtitles,
+                burnSubtitles: input.burnSubtitles,
+                subtitleLang: input.subtitleLang,
+                resultVideoKey: undefined,
+                resultSrtKey: undefined,
+                errorCode: undefined,
+                errorMessage: undefined,
+                expiresAt: expiresAt.toISOString(),
+            });
+            await eventsRepo.add({
+                jobId: id,
+                ts: new Date().toISOString(),
+                type: 'created',
+            });
+            const publishedAt = Date.now();
+            await queue.publish({ jobId: id, priority: 'normal' });
+            metrics.inc('jobs.created');
+            metrics.observe('jobs.enqueue_latency_ms', Date.now() - publishedAt);
+            log.info('job enqueued', { jobId: id, correlationId });
+            return {
+                correlationId,
+                job: {
+                    id: row.id,
+                    status: row.status,
+                    progress: row.progress,
+                    expiresAt: expiresAt.toISOString(),
+                },
+            };
+        } catch (e) {
+            const err = fromException(e, correlationId);
+            return buildError(
+                set,
+                500,
+                err.error.code,
+                err.error.message,
+                correlationId
+            );
+        }
+    })
+    .get('/api/jobs/:id', async ({ params, set, store }) => {
+        const correlationId = (store as any).correlationId;
+        const { id } = params as any;
+        try {
+            const job = await jobsRepo.get(id);
+            if (!job) {
+                return buildError(
+                    set,
+                    404,
+                    'NOT_FOUND',
+                    'Job not found',
+                    correlationId
+                );
+            }
+            if (job.expiresAt && new Date(job.expiresAt) < new Date()) {
+                return buildError(
+                    set,
+                    410,
+                    'GONE',
+                    'Job expired',
+                    correlationId
+                );
+            }
+            // recent events (last 10)
+            const ev =
+                (await (eventsRepo as any).listRecent?.(job.id, 10)) ||
+                (await (eventsRepo as any).list(job.id, 10, 0));
+            metrics.inc('jobs.status_fetch');
+            return {
+                correlationId,
+                job: {
+                    id: job.id,
+                    status: job.status,
+                    progress: job.progress,
+                    resultVideoKey: job.resultVideoKey ?? undefined,
+                    resultSrtKey: job.resultSrtKey ?? undefined,
+                    expiresAt: job.expiresAt ?? undefined,
+                },
+                events: ev.map((e: any) => ({
+                    ts: e.ts,
+                    type: e.type,
+                    data: e.data,
+                })),
+            };
+        } catch (e) {
+            const err = fromException(e, correlationId);
+            return buildError(
+                set,
+                500,
+                err.error.code,
+                err.error.message,
+                correlationId
+            );
+        }
+    })
+    .get('/api/jobs/:id/result', async ({ params, set, store }) => {
+        const correlationId = (store as any).correlationId;
+        const { id } = params as any;
+        try {
+            const job = await jobsRepo.get(id);
+            if (!job) {
+                return buildError(
+                    set,
+                    404,
+                    'NOT_FOUND',
+                    'Job not found',
+                    correlationId
+                );
+            }
+            if (job.expiresAt && new Date(job.expiresAt) < new Date()) {
+                return buildError(
+                    set,
+                    410,
+                    'GONE',
+                    'Job expired',
+                    correlationId
+                );
+            }
+            if (!job.resultVideoKey || job.status !== 'done') {
+                return buildError(
+                    set,
+                    404,
+                    'NOT_READY',
+                    'Result not available yet',
+                    correlationId
+                );
+            }
+            if (!storage) {
+                return buildError(
+                    set,
+                    500,
+                    'STORAGE_UNAVAILABLE',
+                    'Storage not configured',
+                    correlationId
+                );
+            }
+            const videoUrl = await storage.sign(job.resultVideoKey);
+            let srtUrl: string | undefined;
+            if (job.resultSrtKey) {
+                try {
+                    srtUrl = await storage.sign(job.resultSrtKey);
+                } catch {}
+            }
+            metrics.inc('jobs.result_fetch');
+            return {
+                correlationId,
+                result: {
+                    id: job.id,
+                    video: { key: job.resultVideoKey, url: videoUrl },
+                    srt:
+                        job.resultSrtKey && srtUrl
+                            ? { key: job.resultSrtKey, url: srtUrl }
+                            : undefined,
+                },
+            };
+        } catch (e) {
+            const err = fromException(e, correlationId);
+            return buildError(
+                set,
+                500,
+                err.error.code,
+                err.error.message,
+                correlationId
+            );
+        }
+    });
+
+if (import.meta.main) {
+    const port = Number(readIntEnv('PORT', 3000));
+    const server = Bun.serve({ fetch: app.fetch, port });
+    log.info('API started', { port });
+    const stop = async () => {
+        log.info('API stopping');
+        server.stop(true);
+        await queue.shutdown();
+        process.exit(0);
+    };
+    process.on('SIGINT', stop);
+    process.on('SIGTERM', stop);
+}
+````
+
 ## File: src/asr/facade.ts
 ````typescript
 import { createHash } from 'crypto';
@@ -4148,155 +4255,6 @@ export function createDb(url = readEnv('DATABASE_URL')): DB {
     const pool = new Pool({ connectionString: url });
     return drizzle(pool, { schema });
 }
-````
-
-## File: src/data/db/schema.ts
-````typescript
-import {
-    pgEnum,
-    pgTable,
-    text,
-    timestamp,
-    uuid,
-    integer,
-    boolean,
-    jsonb,
-    index,
-    primaryKey,
-} from 'drizzle-orm/pg-core';
-
-// Enums
-export const jobStatus = pgEnum('job_status', [
-    'queued',
-    'processing',
-    'done',
-    'failed',
-]);
-export const sourceType = pgEnum('source_type', ['upload', 'youtube']);
-export const asrJobStatus = pgEnum('asr_job_status', [
-    'queued',
-    'processing',
-    'done',
-    'failed',
-]);
-
-// jobs table
-export const jobs = pgTable(
-    'jobs',
-    {
-        id: uuid('id').primaryKey(),
-        status: jobStatus('status').notNull().default('queued'),
-        progress: integer('progress').notNull().default(0),
-        sourceType: sourceType('source_type').notNull(),
-        sourceKey: text('source_key'),
-        sourceUrl: text('source_url'),
-        startSec: integer('start_sec').notNull(),
-        endSec: integer('end_sec').notNull(),
-        withSubtitles: boolean('with_subtitles').notNull().default(false),
-        burnSubtitles: boolean('burn_subtitles').notNull().default(false),
-        subtitleLang: text('subtitle_lang'),
-        resultVideoKey: text('result_video_key'),
-        resultSrtKey: text('result_srt_key'),
-        errorCode: text('error_code'),
-        errorMessage: text('error_message'),
-        createdAt: timestamp('created_at', { withTimezone: true })
-            .notNull()
-            .defaultNow(),
-        updatedAt: timestamp('updated_at', { withTimezone: true })
-            .notNull()
-            .defaultNow(),
-        expiresAt: timestamp('expires_at', { withTimezone: true }),
-    },
-    (t) => [
-        index('idx_jobs_status_created_at').on(t.status, t.createdAt),
-        index('idx_jobs_expires_at').on(t.expiresAt),
-    ]
-);
-
-// job_events table
-export const jobEvents = pgTable(
-    'job_events',
-    {
-        jobId: uuid('job_id')
-            .notNull()
-            .references(() => jobs.id, { onDelete: 'cascade' }),
-        ts: timestamp('ts', { withTimezone: true }).notNull().defaultNow(),
-        type: text('type').notNull(),
-        data: jsonb('data'),
-    },
-    (t) => [index('idx_job_events_job_id_ts').on(t.jobId, t.ts)]
-);
-
-// api_keys table (optional)
-export const apiKeys = pgTable('api_keys', {
-    id: uuid('id').primaryKey(),
-    name: text('name').notNull(),
-    keyHash: text('key_hash').notNull(),
-    revoked: boolean('revoked').notNull().default(false),
-    createdAt: timestamp('created_at', { withTimezone: true })
-        .notNull()
-        .defaultNow(),
-    lastUsedAt: timestamp('last_used_at', { withTimezone: true }),
-});
-
-// ASR tables
-export const asrJobs = pgTable(
-    'asr_jobs',
-    {
-        id: uuid('id').primaryKey(),
-        clipJobId: uuid('clip_job_id').references(() => jobs.id),
-        sourceType: text('source_type').notNull(), // upload | youtube | internal
-        sourceKey: text('source_key'),
-        mediaHash: text('media_hash').notNull(),
-        modelVersion: text('model_version').notNull(),
-        languageHint: text('language_hint'),
-        detectedLanguage: text('detected_language'),
-        durationSec: integer('duration_sec'),
-        status: asrJobStatus('status').notNull().default('queued'),
-        errorCode: text('error_code'),
-        errorMessage: text('error_message'),
-        createdAt: timestamp('created_at', { withTimezone: true })
-            .notNull()
-            .defaultNow(),
-        updatedAt: timestamp('updated_at', { withTimezone: true })
-            .notNull()
-            .defaultNow(),
-        completedAt: timestamp('completed_at', { withTimezone: true }),
-        expiresAt: timestamp('expires_at', { withTimezone: true }),
-    },
-    (t) => [
-        index('idx_asr_jobs_status_created_at').on(t.status, t.createdAt),
-        index('idx_asr_jobs_expires_at').on(t.expiresAt),
-        // Unique partial index handled via raw SQL migration (media_hash, model_version) where status='done'
-    ]
-);
-
-export const asrArtifacts = pgTable(
-    'asr_artifacts',
-    {
-        asrJobId: uuid('asr_job_id')
-            .notNull()
-            .references(() => asrJobs.id, { onDelete: 'cascade' }),
-        kind: text('kind').notNull(), // srt | text | json
-        storageKey: text('storage_key').notNull(),
-        sizeBytes: integer('size_bytes'),
-        createdAt: timestamp('created_at', { withTimezone: true })
-            .notNull()
-            .defaultNow(),
-    },
-    (t) => [primaryKey({ columns: [t.asrJobId, t.kind] })]
-);
-
-export type Job = typeof jobs.$inferSelect;
-export type NewJob = typeof jobs.$inferInsert;
-export type JobEvent = typeof jobEvents.$inferSelect;
-export type NewJobEvent = typeof jobEvents.$inferInsert;
-export type ApiKey = typeof apiKeys.$inferSelect;
-export type NewApiKey = typeof apiKeys.$inferInsert;
-export type AsrJob = typeof asrJobs.$inferSelect;
-export type NewAsrJob = typeof asrJobs.$inferInsert;
-export type AsrArtifact = typeof asrArtifacts.$inferSelect;
-export type NewAsrArtifact = typeof asrArtifacts.$inferInsert;
 ````
 
 ## File: src/data/drizzle/meta/_journal.json
@@ -4800,169 +4758,6 @@ export async function resolveYouTubeSource(
     });
 
     return { localPath, cleanup, meta };
-}
-````
-
-## File: src/data/repo.ts
-````typescript
-import type { JobStatus } from '@clipper/contracts';
-
-export interface JobRow {
-    id: string;
-    status: JobStatus;
-    progress: number;
-    sourceType: 'upload' | 'youtube';
-    sourceKey?: string;
-    sourceUrl?: string;
-    startSec: number;
-    endSec: number;
-    withSubtitles: boolean;
-    burnSubtitles: boolean;
-    subtitleLang?: string;
-    resultVideoKey?: string;
-    resultSrtKey?: string;
-    errorCode?: string;
-    errorMessage?: string;
-    createdAt: string;
-    updatedAt: string;
-    expiresAt?: string;
-}
-
-export interface JobEvent {
-    jobId: string;
-    ts: string;
-    type: string;
-    data?: Record<string, unknown>;
-}
-
-export interface JobsRepository {
-    create(row: Omit<JobRow, 'createdAt' | 'updatedAt'>): Promise<JobRow>;
-    get(id: string): Promise<JobRow | null>;
-    update(id: string, patch: Partial<JobRow>): Promise<JobRow>;
-    listByStatus(
-        status: JobStatus,
-        limit?: number,
-        offset?: number
-    ): Promise<JobRow[]>;
-    transition(
-        id: string,
-        next: JobStatus,
-        event?: { type?: string; data?: Record<string, unknown> }
-    ): Promise<JobRow>;
-}
-
-export interface JobEventsRepository {
-    add(evt: JobEvent): Promise<void>;
-    list(jobId: string, limit?: number, offset?: number): Promise<JobEvent[]>;
-}
-
-// --- ASR (Automatic Speech Recognition) domain types ---
-export type AsrJobStatus = 'queued' | 'processing' | 'done' | 'failed';
-
-export interface AsrJobRow {
-    id: string;
-    clipJobId?: string;
-    sourceType: string; // upload | youtube | internal
-    sourceKey?: string;
-    mediaHash: string;
-    modelVersion: string;
-    languageHint?: string;
-    detectedLanguage?: string;
-    durationSec?: number;
-    status: AsrJobStatus;
-    errorCode?: string;
-    errorMessage?: string;
-    createdAt: string;
-    updatedAt: string;
-    completedAt?: string;
-    expiresAt?: string;
-}
-
-export interface AsrArtifactRow {
-    asrJobId: string;
-    kind: 'srt' | 'text' | 'json';
-    storageKey: string;
-    sizeBytes?: number;
-    createdAt: string;
-}
-
-export interface AsrJobsRepository {
-    create(
-        row: Omit<AsrJobRow, 'createdAt' | 'updatedAt' | 'status'> &
-            Partial<Pick<AsrJobRow, 'status'>>
-    ): Promise<AsrJobRow>;
-    get(id: string): Promise<AsrJobRow | null>;
-    getReusable(
-        mediaHash: string,
-        modelVersion: string
-    ): Promise<(AsrJobRow & { artifacts: AsrArtifactRow[] }) | null>;
-    patch(id: string, patch: Partial<AsrJobRow>): Promise<AsrJobRow>;
-}
-
-export interface AsrArtifactsRepository {
-    put(artifact: AsrArtifactRow): Promise<void>;
-    list(asrJobId: string): Promise<AsrArtifactRow[]>;
-}
-
-// Minimal in-memory impl to wire API/worker until DB is added
-export class InMemoryJobsRepo implements JobsRepository {
-    private map = new Map<string, JobRow>();
-    async create(
-        row: Omit<JobRow, 'createdAt' | 'updatedAt'>
-    ): Promise<JobRow> {
-        const now = new Date().toISOString();
-        const rec: JobRow = { ...row, createdAt: now, updatedAt: now };
-        this.map.set(rec.id, rec);
-        return rec;
-    }
-    async get(id: string) {
-        return this.map.get(id) ?? null;
-    }
-    async update(id: string, patch: Partial<JobRow>): Promise<JobRow> {
-        const cur = this.map.get(id);
-        if (!cur) throw new Error('NOT_FOUND');
-        const next = {
-            ...cur,
-            ...patch,
-            updatedAt: new Date().toISOString(),
-        } as JobRow;
-        this.map.set(id, next);
-        return next;
-    }
-    async listByStatus(
-        status: JobStatus,
-        limit = 50,
-        offset = 0
-    ): Promise<JobRow[]> {
-        return Array.from(this.map.values())
-            .filter((r) => r.status === status)
-            .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
-            .slice(offset, offset + limit);
-    }
-    async transition(
-        id: string,
-        next: JobStatus,
-        event?: { type?: string; data?: Record<string, unknown> }
-    ): Promise<JobRow> {
-        const cur = await this.get(id);
-        if (!cur) throw new Error('NOT_FOUND');
-        const updated = await this.update(id, { status: next });
-        // no-op event store here; handled by InMemoryJobEventsRepo
-        return updated;
-    }
-}
-
-export class InMemoryJobEventsRepo implements JobEventsRepository {
-    private events: JobEvent[] = [];
-    async add(evt: JobEvent): Promise<void> {
-        this.events.push(evt);
-    }
-    async list(jobId: string, limit = 100, offset = 0): Promise<JobEvent[]> {
-        return this.events
-            .filter((e) => e.jobId === jobId)
-            .sort((a, b) => a.ts.localeCompare(b.ts))
-            .slice(offset, offset + limit);
-    }
 }
 ````
 
@@ -5513,132 +5308,250 @@ export const QUEUE_TOPIC_CLIPS = 'clips';
 export const QUEUE_TOPIC_ASR = 'asr';
 ````
 
-## File: README.md
-````markdown
-# clipper
+## File: src/worker/asr.ts
+````typescript
+import {
+    DrizzleAsrJobsRepo,
+    DrizzleJobsRepo,
+    DrizzleAsrArtifactsRepo,
+    createDb,
+    storageKeys,
+    createSupabaseStorageRepo,
+} from '@clipper/data';
+import { buildArtifacts, GroqWhisperProvider, ProviderHttpError } from '@clipper/asr';
+import { InMemoryMetrics } from '@clipper/common/metrics';
+import { QUEUE_TOPIC_ASR } from '@clipper/queue';
+import {
+    AsrQueuePayloadSchema,
+    type AsrQueuePayload,
+} from '@clipper/queue/asr';
+import { createLogger, readEnv, fromException } from '@clipper/common';
 
-High‑performance media clipping pipeline (upload → clip (FFmpeg) → store → status/result API) built on Bun, Postgres (Drizzle), pg-boss, and Supabase Storage.
+export interface AsrWorkerDeps {
+    asrJobs?: DrizzleAsrJobsRepo;
+    clipJobs?: DrizzleJobsRepo;
+    artifacts?: DrizzleAsrArtifactsRepo;
+    provider?: GroqWhisperProvider;
+    storage?: ReturnType<typeof createSupabaseStorageRepo>;
+    queue: {
+        consumeFrom: (
+            topic: string,
+            handler: (msg: any) => Promise<void>
+        ) => Promise<void>;
+    };
+}
 
-## ✨ Features (Current Layer Status)
+const log = createLogger((readEnv('LOG_LEVEL') as any) || 'info').with({
+    mod: 'asrWorker',
+});
 
-| Layer              | Status      | Notes                                                  |
-| ------------------ | ----------- | ------------------------------------------------------ |
-| 0 Foundations      | ✅          | Types, schemas, logger, errors, time utils             |
-| 1 Data Layer       | ✅          | Drizzle schema + repos                                 |
-| 2 Queue Layer      | ✅          | pg-boss adapter + DLQ consumer skeleton                |
-| 3 Media IO         | ✅          | Upload + YouTube (gated) resolvers with SSRF guard     |
-| 4 FFmpeg Clipper   | ✅          | Stream-copy + fallback re-encode with progress         |
-| 5 ASR (Whisper)    | ⏳          | Planned                                                |
-| 6 Worker Runtime   | ✅ (basic)  | Integrated clipper & progress persistence              |
-| 7 API              | 🚧          | Create job present; status/result endpoints upcoming   |
-| 8 Storage Delivery | Partial     | Upload result video wired; signed result retrieval TBD |
-| 9 Cleanup          | ✅          | TTL cleanup script                                     |
-| 10 Observability   | Minimal     | Basic logging; metrics TODO                            |
-| 11 Security        | Minimal     | Redaction + SSRF allowlist; rate limiting TBD          |
-| 12 Docs / SDK      | In Progress | This README + more docs being added                    |
-| 13 UI              | Planned     | Simple demo page                                       |
+export async function startAsrWorker(deps: AsrWorkerDeps) {
+    const metrics = new InMemoryMetrics();
+    const asrJobs = deps?.asrJobs ?? new DrizzleAsrJobsRepo(createDb());
+    const clipJobs = deps?.clipJobs ?? new DrizzleJobsRepo(createDb());
+    const artifacts =
+        deps?.artifacts ?? new DrizzleAsrArtifactsRepo(createDb());
+    const storage =
+        deps?.storage ??
+        (() => {
+            try {
+                return createSupabaseStorageRepo();
+            } catch {
+                return null as any;
+            }
+        })();
+    const provider = deps?.provider ?? new GroqWhisperProvider();
 
-## 🧩 Architecture (High Level Flow)
+    const timeoutMs = Number(readEnv('ASR_REQUEST_TIMEOUT_MS') || 120_000);
+    const includeJson =
+        (readEnv('ASR_JSON_SEGMENTS') || 'false').toLowerCase() === 'true';
+    const mergeGapMs = Number(readEnv('MERGE_GAP_MS') || 150);
 
-1. Client submits job (upload source key or YouTube URL + time range).
-2. API persists job (status=queued) → enqueues message.
-3. Worker consumes job → resolves source locally → runs FFmpeg clipper (progress streamed) → uploads result → marks done.
-4. Client polls /jobs/:id (status + progress) and later fetches signed result URL.
+    await deps.queue.consumeFrom(QUEUE_TOPIC_ASR, async (msg: any) => {
+        const parse = AsrQueuePayloadSchema.safeParse(msg as AsrQueuePayload);
+        if (!parse.success) {
+            log.warn('invalid asr payload', { issues: parse.error.issues });
+            return; // drop invalid messages
+        }
+        const { asrJobId, clipJobId, languageHint } = parse.data;
+        const startedAt = Date.now();
+        let tmpLocal: string | null = null;
+        try {
+            // Load and claim job
+            const job = await asrJobs.get(asrJobId);
+            if (!job) {
+                log.warn('asr job not found', { asrJobId });
+                return;
+            }
+            if (job.status === 'done') return; // idempotent
+            if (job.status === 'queued') {
+                await asrJobs.patch(asrJobId, { status: 'processing' });
+            }
 
-## ⚙️ Requirements
+            // Locate media: prefer clip resultVideoKey
+            let inputLocal: string;
+            if (clipJobId) {
+                const clip = await clipJobs.get(clipJobId);
+                if (!clip?.resultVideoKey) throw new Error('NO_CLIP_RESULT');
+                if (!storage) throw new Error('STORAGE_NOT_AVAILABLE');
+                inputLocal = await storage.download(clip.resultVideoKey);
+                tmpLocal = inputLocal;
+            } else {
+                throw new Error('NO_INPUT_PROVIDED');
+            }
 
-You need these installed locally:
+            // Transcribe
+            let res;
+            try {
+                res = await provider.transcribe(inputLocal, {
+                    timeoutMs,
+                    languageHint,
+                });
+            } catch (err: any) {
+                // Map provider errors to internal codes
+                if (err?.name === 'AbortError') throw new Error('TIMEOUT');
+                if (err instanceof ProviderHttpError) {
+                    if (err.status === 0) throw new Error('UPSTREAM_FAILURE');
+                    if (err.status >= 500) throw new Error('UPSTREAM_FAILURE');
+                    if (err.status === 400)
+                        throw new Error('VALIDATION_FAILED');
+                    // treat others as upstream
+                    throw new Error('UPSTREAM_FAILURE');
+                }
+                throw err;
+            }
 
--   Bun >= 1.2.x
--   ffmpeg & ffprobe in PATH
--   Postgres (or Supabase) reachable via `DATABASE_URL`
+            // Build artifacts
+            const built = buildArtifacts(res.segments, {
+                includeJson,
+                mergeGapMs,
+            });
 
-Optional:
+            // Upload artifacts
+            if (!storage) throw new Error('STORAGE_NOT_AVAILABLE');
+            const owner = clipJobId ?? asrJobId;
+            const srtKey = storageKeys.transcriptSrt(owner);
+            const txtKey = storageKeys.transcriptText(owner);
+            const jsonKey = includeJson
+                ? storageKeys.transcriptJson(owner)
+                : null;
+            const srtPath = `/tmp/${owner}.srt`;
+            const txtPath = `/tmp/${owner}.txt`;
+            await Bun.write(srtPath, built.srt);
+            await Bun.write(txtPath, built.text);
+            await storage.upload(srtPath, srtKey, 'application/x-subrip');
+            await storage.upload(txtPath, txtKey, 'text/plain; charset=utf-8');
+            if (includeJson && jsonKey) {
+                const jsonPath = `/tmp/${owner}.json`;
+                await Bun.write(
+                    jsonPath,
+                    JSON.stringify(built.json || [], null, 0)
+                );
+                await storage.upload(jsonPath, jsonKey, 'application/json');
+            }
 
--   yt-dlp (if enabling YouTube resolver via `ENABLE_YTDLP=true`)
+            // Persist artifacts
+            await artifacts.put({
+                asrJobId,
+                kind: 'srt',
+                storageKey: srtKey,
+                createdAt: new Date().toISOString(),
+            });
+            await artifacts.put({
+                asrJobId,
+                kind: 'text',
+                storageKey: txtKey,
+                createdAt: new Date().toISOString(),
+            });
+            if (includeJson && jsonKey)
+                await artifacts.put({
+                    asrJobId,
+                    kind: 'json',
+                    storageKey: jsonKey,
+                    createdAt: new Date().toISOString(),
+                });
 
-## 🚀 Quick Start
+            // Finalize job
+            await asrJobs.patch(asrJobId, {
+                status: 'done',
+                detectedLanguage: res.detectedLanguage,
+                durationSec: Math.round(res.durationSec),
+                completedAt: new Date().toISOString(),
+            });
+            metrics.observe('asr.duration_ms', Date.now() - startedAt);
+            metrics.inc('asr.completed');
 
-```bash
-# 1. Install deps
-bun install
+            // Update originating clip job with transcript key if available
+            if (clipJobId) {
+                try {
+                    await clipJobs.update(clipJobId, {
+                        resultSrtKey: srtKey,
+                    } as any);
+                } catch {}
+            }
 
-# 2. Copy & edit environment
-cp .env.example .env
-# Fill in DATABASE_URL, SUPABASE_* values, etc.
-
-# 3. Run migrations (drizzle-kit configured)
-# (Add migration command here when generated) – schema currently bootstrap via SQL file.
-
-# 4. Start API (once endpoints added) & worker in separate terminals
-bun run src/api/index.ts &
-bun run src/worker/index.ts
-```
-
-## 🔑 Key Environment Variables
-
-| Var                                      | Purpose                                         | debug | info | warn  | error |
-| ---------------------------------------- | ----------------------------------------------- | ----- | ---- | ----- | ----- |
-| DATABASE_URL                             | Postgres / pg-boss + Drizzle                    |
-| SCRATCH_DIR                              | Local fast storage for source + clip temp files |
-| SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY | Storage access                                  |
-| SUPABASE_STORAGE_BUCKET                  | Bucket with sources/results prefixes            |
-| ENABLE_YTDLP                             | Enable YouTube resolver                         |
-| MAX_CLIP_INPUT_DURATION_SEC              | Guardrail on input length                       |
-| MAX_INPUT_MB                             | Guardrail on input file size                    |
-| SIGNED_URL_TTL_SEC                       | TTL for signed result URLs                      |
-| LOG_LEVEL                                | debug                                           | info  | warn | error |
-
-See `.env.example` for the complete list.
-
-## 🎬 FFmpeg Clipper
-
-Fast path attempts `-ss -to -c copy -movflags +faststart`. If container/keyframe layout prevents accurate copy or copy fails, it falls back to `libx264 + aac (veryfast)` ensuring a valid playable MP4. Progress is parsed from `-progress pipe:1` output and persisted to the DB in the worker with lightweight debouncing.
-
-## 📦 Storage Layout
-
-```
-sources/{jobId}/source.ext
-results/{jobId}/clip.mp4
-results/{jobId}/clip.srt (future)
-```
-
-## 🧪 Testing
-
-Unit & integration tests (vitest):
-
-```bash
-bunx vitest
-```
-
-FFmpeg integration tests polyfill Bun globals when run under vitest’s Node environment. Ensure ffmpeg/ffprobe exist for those tests.
-
-## 🛠 Development Tips
-
--   Use `LOG_LEVEL=debug` while iterating on worker features.
--   Clip accuracy: if users report off-by drift in copy mode, fallback re-encode path guarantees frame-accurate boundaries.
--   Add new job lifecycle events via `events.add({ type, data })` for richer status endpoints.
-
-## 🔒 Security Notes
-
--   SSRF guard + allowlist enforced for YouTube URLs.
--   Secrets redacted in logs (see `redact.ts`).
--   Future: API keys, rate limits.
-
-## 📘 Next Work
-
-1. Expose GET /api/jobs/:id + /api/jobs/:id/result
-2. Signed URL issuance for results
-3. Basic metrics (progress histograms, queue depth)
-4. Whisper ASR integration
-
-## 📝 License
-
-Currently unspecified (internal / WIP). Add an OSS license before public release.
-
----
-
-Generated with ❤️ using Bun.
+            // Burn-in subtitles if the originating clip requested it
+            if (clipJobId && includeJson) {
+                try {
+                    const clip = await clipJobs.get(clipJobId);
+                    if (clip?.burnSubtitles && clip?.resultVideoKey) {
+                        const burnedKey =
+                            storageKeys.resultVideoBurned(clipJobId);
+                        const clipLocal = await storage.download(
+                            clip.resultVideoKey
+                        );
+                        const srtLocal = await storage.download(srtKey);
+                        // Simple ffmpeg burn-in (assumes ffmpeg installed in env)
+                        const burnedPath = `/tmp/${clipJobId}.subbed.mp4`;
+                        const ff = Bun.spawn([
+                            'ffmpeg',
+                            '-y',
+                            '-i',
+                            clipLocal,
+                            '-vf',
+                            `subtitles=${srtLocal}:force_style='Fontsize=18'`,
+                            '-c:a',
+                            'copy',
+                            burnedPath,
+                        ]);
+                        await ff.exited;
+                        await storage.upload(
+                            burnedPath,
+                            burnedKey,
+                            'video/mp4'
+                        );
+                        await clipJobs.update(clipJobId, {
+                            resultVideoKey: burnedKey,
+                        } as any);
+                    }
+                } catch (e) {
+                    log.warn('burn-in failed (non-fatal)', {
+                        asrJobId,
+                        e: String(e),
+                    });
+                }
+            }
+        } catch (e) {
+            const err = fromException(e, asrJobId);
+            log.error('asr job failed', { asrJobId, err });
+            metrics.inc('asr.failures');
+            try {
+                await asrJobs.patch(asrJobId, {
+                    status: 'failed',
+                    errorCode:
+                        (err.error && (err.error as any).code) || 'INTERNAL',
+                    errorMessage:
+                        (err.error && (err.error as any).message) || String(e),
+                });
+            } catch {}
+            throw e; // let PgBoss retry
+        } finally {
+            try {
+                if (tmpLocal) await Bun.spawn(['rm', '-f', tmpLocal]).exited;
+            } catch {}
+        }
+    });
+}
 ````
 
 ## File: planning/ffmpeg/tasks.md
@@ -5723,6 +5636,467 @@ This document breaks down the work required to implement the FFmpeg Service (Cli
 -   [x] **8. Documentation**
     -   [x] Add JSDoc comments to all public functions and interfaces.
     -   [x] Update the main `README.md` or other relevant docs if necessary to mention that `ffmpeg` is now a required dependency.
+````
+
+## File: src/data/db/schema.ts
+````typescript
+import {
+    pgEnum,
+    pgTable,
+    text,
+    timestamp,
+    uuid,
+    integer,
+    boolean,
+    jsonb,
+    index,
+    primaryKey,
+} from 'drizzle-orm/pg-core';
+
+// Enums
+export const jobStatus = pgEnum('job_status', [
+    'queued',
+    'processing',
+    'done',
+    'failed',
+]);
+export const sourceType = pgEnum('source_type', ['upload', 'youtube']);
+export const asrJobStatus = pgEnum('asr_job_status', [
+    'queued',
+    'processing',
+    'done',
+    'failed',
+]);
+
+// jobs table
+export const jobs = pgTable(
+    'jobs',
+    {
+        id: uuid('id').primaryKey(),
+        status: jobStatus('status').notNull().default('queued'),
+        progress: integer('progress').notNull().default(0),
+        sourceType: sourceType('source_type').notNull(),
+        sourceKey: text('source_key'),
+        sourceUrl: text('source_url'),
+        startSec: integer('start_sec').notNull(),
+        endSec: integer('end_sec').notNull(),
+        withSubtitles: boolean('with_subtitles').notNull().default(false),
+        burnSubtitles: boolean('burn_subtitles').notNull().default(false),
+        subtitleLang: text('subtitle_lang'),
+        resultVideoKey: text('result_video_key'),
+        resultSrtKey: text('result_srt_key'),
+        errorCode: text('error_code'),
+        errorMessage: text('error_message'),
+        createdAt: timestamp('created_at', { withTimezone: true })
+            .notNull()
+            .defaultNow(),
+        updatedAt: timestamp('updated_at', { withTimezone: true })
+            .notNull()
+            .defaultNow(),
+        expiresAt: timestamp('expires_at', { withTimezone: true }),
+        lastHeartbeatAt: timestamp('last_heartbeat_at', { withTimezone: true }),
+    },
+    (t) => [
+        index('idx_jobs_status_created_at').on(t.status, t.createdAt),
+        index('idx_jobs_expires_at').on(t.expiresAt),
+    ]
+);
+
+// job_events table
+export const jobEvents = pgTable(
+    'job_events',
+    {
+        jobId: uuid('job_id')
+            .notNull()
+            .references(() => jobs.id, { onDelete: 'cascade' }),
+        ts: timestamp('ts', { withTimezone: true }).notNull().defaultNow(),
+        type: text('type').notNull(),
+        data: jsonb('data'),
+    },
+    (t) => [index('idx_job_events_job_id_ts').on(t.jobId, t.ts)]
+);
+
+// api_keys table (optional)
+export const apiKeys = pgTable('api_keys', {
+    id: uuid('id').primaryKey(),
+    name: text('name').notNull(),
+    keyHash: text('key_hash').notNull(),
+    revoked: boolean('revoked').notNull().default(false),
+    createdAt: timestamp('created_at', { withTimezone: true })
+        .notNull()
+        .defaultNow(),
+    lastUsedAt: timestamp('last_used_at', { withTimezone: true }),
+});
+
+// ASR tables
+export const asrJobs = pgTable(
+    'asr_jobs',
+    {
+        id: uuid('id').primaryKey(),
+        clipJobId: uuid('clip_job_id').references(() => jobs.id),
+        sourceType: text('source_type').notNull(), // upload | youtube | internal
+        sourceKey: text('source_key'),
+        mediaHash: text('media_hash').notNull(),
+        modelVersion: text('model_version').notNull(),
+        languageHint: text('language_hint'),
+        detectedLanguage: text('detected_language'),
+        durationSec: integer('duration_sec'),
+        status: asrJobStatus('status').notNull().default('queued'),
+        errorCode: text('error_code'),
+        errorMessage: text('error_message'),
+        createdAt: timestamp('created_at', { withTimezone: true })
+            .notNull()
+            .defaultNow(),
+        updatedAt: timestamp('updated_at', { withTimezone: true })
+            .notNull()
+            .defaultNow(),
+        completedAt: timestamp('completed_at', { withTimezone: true }),
+        expiresAt: timestamp('expires_at', { withTimezone: true }),
+    },
+    (t) => [
+        index('idx_asr_jobs_status_created_at').on(t.status, t.createdAt),
+        index('idx_asr_jobs_expires_at').on(t.expiresAt),
+        // Unique partial index handled via raw SQL migration (media_hash, model_version) where status='done'
+    ]
+);
+
+export const asrArtifacts = pgTable(
+    'asr_artifacts',
+    {
+        asrJobId: uuid('asr_job_id')
+            .notNull()
+            .references(() => asrJobs.id, { onDelete: 'cascade' }),
+        kind: text('kind').notNull(), // srt | text | json
+        storageKey: text('storage_key').notNull(),
+        sizeBytes: integer('size_bytes'),
+        createdAt: timestamp('created_at', { withTimezone: true })
+            .notNull()
+            .defaultNow(),
+    },
+    (t) => [primaryKey({ columns: [t.asrJobId, t.kind] })]
+);
+
+export type Job = typeof jobs.$inferSelect;
+export type NewJob = typeof jobs.$inferInsert;
+export type JobEvent = typeof jobEvents.$inferSelect;
+export type NewJobEvent = typeof jobEvents.$inferInsert;
+export type ApiKey = typeof apiKeys.$inferSelect;
+export type NewApiKey = typeof apiKeys.$inferInsert;
+export type AsrJob = typeof asrJobs.$inferSelect;
+export type NewAsrJob = typeof asrJobs.$inferInsert;
+export type AsrArtifact = typeof asrArtifacts.$inferSelect;
+export type NewAsrArtifact = typeof asrArtifacts.$inferInsert;
+````
+
+## File: package.json
+````json
+{
+    "name": "clipper",
+    "module": "index.ts",
+    "type": "module",
+    "private": true,
+    "scripts": {
+        "test": "bunx vitest run",
+        "db:generate": "bunx drizzle-kit generate --config=drizzle.config.ts",
+        "db:migrate": "bunx drizzle-kit migrate --config=drizzle.config.ts",
+        "db:push": "bunx drizzle-kit push --config=drizzle.config.ts"
+    },
+    "devDependencies": {
+        "@types/bun": "latest"
+    },
+    "peerDependencies": {
+        "typescript": "^5"
+    },
+    "dependencies": {
+        "@elysiajs/cors": "^1.3.3",
+        "@supabase/supabase-js": "^2.54.0",
+        "@types/pg": "^8.15.5",
+        "dotenv": "^17.2.1",
+        "drizzle-kit": "^0.31.4",
+        "drizzle-orm": "^0.44.4",
+        "elysia": "^1.3.8",
+        "pg": "^8.16.3",
+        "pg-boss": "^10.3.2",
+        "zod": "^4.0.17",
+        "zod-to-openapi": "^0.2.1"
+    }
+}
+````
+
+## File: README.md
+````markdown
+# clipper
+
+High‑performance media clipping pipeline (upload → clip (FFmpeg) → store → status/result API) built on Bun, Postgres (Drizzle), pg-boss, and Supabase Storage.
+
+## ✨ Features (Current Layer Status)
+
+| Layer              | Status      | Notes                                                  |
+| ------------------ | ----------- | ------------------------------------------------------ |
+| 0 Foundations      | ✅          | Types, schemas, logger, errors, time utils             |
+| 1 Data Layer       | ✅          | Drizzle schema + repos                                 |
+| 2 Queue Layer      | ✅          | pg-boss adapter + DLQ consumer skeleton                |
+| 3 Media IO         | ✅          | Upload + YouTube (gated) resolvers with SSRF guard     |
+| 4 FFmpeg Clipper   | ✅          | Stream-copy + fallback re-encode with progress         |
+| 5 ASR (Whisper)    | ⏳          | Planned                                                |
+| 6 Worker Runtime   | ✅ (basic)  | Integrated clipper & progress persistence              |
+| 7 API              | 🚧          | Create job present; status/result endpoints upcoming   |
+| 8 Storage Delivery | Partial     | Upload result video wired; signed result retrieval TBD |
+| 9 Cleanup          | ✅          | TTL cleanup script                                     |
+| 10 Observability   | Minimal     | Basic logging; metrics TODO                            |
+| 11 Security        | Minimal     | Redaction + SSRF allowlist; rate limiting TBD          |
+| 12 Docs / SDK      | In Progress | This README + more docs being added                    |
+| 13 UI              | Planned     | Simple demo page                                       |
+
+## 🧩 Architecture (High Level Flow)
+
+1. Client submits job (upload source key or YouTube URL + time range).
+2. API persists job (status=queued) → enqueues message.
+3. Worker consumes job → resolves source locally → runs FFmpeg clipper (progress streamed) → uploads result → marks done.
+4. Client polls /jobs/:id (status + progress) and later fetches signed result URL.
+
+## ⚙️ Requirements
+
+You need these installed locally:
+
+-   Bun >= 1.2.x
+-   ffmpeg & ffprobe in PATH
+-   Postgres (or Supabase) reachable via `DATABASE_URL`
+
+Optional:
+
+-   yt-dlp (if enabling YouTube resolver via `ENABLE_YTDLP=true`)
+
+## 🚀 Quick Start
+
+```bash
+# 1. Install deps
+bun install
+
+# 2. Copy & edit environment
+cp .env.example .env
+# Fill in DATABASE_URL, SUPABASE_* values, etc.
+
+# 3. Run migrations (drizzle-kit)
+bun run db:migrate
+
+# (If first time and DB empty you can also generate):
+# bun run db:generate (then inspect) before migrate
+
+# 4. Start API (once endpoints added) & worker in separate terminals
+bun run src/api/index.ts &
+bun run src/worker/index.ts
+```
+
+## 🔑 Key Environment Variables
+
+| Var                                      | Purpose                                         | debug | info | warn  | error |
+| ---------------------------------------- | ----------------------------------------------- | ----- | ---- | ----- | ----- |
+| DATABASE_URL                             | Postgres / pg-boss + Drizzle                    |
+| SCRATCH_DIR                              | Local fast storage for source + clip temp files |
+| SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY | Storage access                                  |
+| SUPABASE_STORAGE_BUCKET                  | Bucket with sources/results prefixes            |
+| ENABLE_YTDLP                             | Enable YouTube resolver                         |
+| MAX_CLIP_INPUT_DURATION_SEC              | Guardrail on input length                       |
+| MAX_INPUT_MB                             | Guardrail on input file size                    |
+| SIGNED_URL_TTL_SEC                       | TTL for signed result URLs                      |
+| LOG_LEVEL                                | debug                                           | info  | warn | error |
+
+See `.env.example` for the complete list.
+
+## 🎬 FFmpeg Clipper
+
+Fast path attempts `-ss -to -c copy -movflags +faststart`. If container/keyframe layout prevents accurate copy or copy fails, it falls back to `libx264 + aac (veryfast)` ensuring a valid playable MP4. Progress is parsed from `-progress pipe:1` output and persisted to the DB in the worker with lightweight debouncing.
+
+## 📦 Storage Layout
+
+```
+sources/{jobId}/source.ext
+results/{jobId}/clip.mp4
+results/{jobId}/clip.srt (future)
+```
+
+## 🧪 Testing
+
+Unit & integration tests (vitest):
+
+```bash
+bunx vitest
+```
+
+FFmpeg integration tests polyfill Bun globals when run under vitest’s Node environment. Ensure ffmpeg/ffprobe exist for those tests.
+
+## 🛠 Development Tips
+
+-   Use `LOG_LEVEL=debug` while iterating on worker features.
+-   Clip accuracy: if users report off-by drift in copy mode, fallback re-encode path guarantees frame-accurate boundaries.
+-   Add new job lifecycle events via `events.add({ type, data })` for richer status endpoints.
+
+## 🔒 Security Notes
+
+-   SSRF guard + allowlist enforced for YouTube URLs.
+-   Secrets redacted in logs (see `redact.ts`).
+-   Future: API keys, rate limits.
+
+## 📘 Next Work
+
+1. Expose GET /api/jobs/:id + /api/jobs/:id/result
+2. Signed URL issuance for results
+3. Basic metrics (progress histograms, queue depth)
+4. Whisper ASR integration
+
+## 📝 License
+
+Currently unspecified (internal / WIP). Add an OSS license before public release.
+
+---
+
+Generated with ❤️ using Bun.
+````
+
+## File: planning/asr/tasks.md
+````markdown
+# ASR Service Tasks
+
+artifact_id: 39d0ca49-8c65-44c0-8f8e-5fd9b3180c3c
+
+Mappings: Req numbers refer to ASR requirements document.
+
+## 1. Database & Schema
+
+-   [x] Add Drizzle schema additions (Req: 1,2,3,4,8,9,10,11)
+    -   [x] Create tables: asr_jobs, asr_artifacts
+    -   [x] Add unique index (media_hash, model_version) where status='done'
+    -   [x] Generate migration SQL
+    -   [x] Update drizzle meta snapshot (journal updated; snapshot auto-updated next migrate)
+-   [x] Repository interfaces (Req: 1,3,5,8,9,10)
+    -   [x] Implement AsrJobsRepository in `src/data/db/repos.ts`
+    -   [x] Implement AsrArtifactsRepository
+    -   [x] Add getReusable(mediaHash, modelVersion)
+    -   [x] Unit tests with DB (integration test asr.repos.integration.test.ts)
+
+## 2. Provider Abstraction
+
+-   [x] Define provider interfaces/types (Req: 5,6)
+    -   [x] Add `src/asr/provider.ts` with AsrProvider, segment/result types
+    -   [x] Add error class ProviderHttpError
+-   [x] GroqWhisperProvider (Req: 6,7)
+    -   [x] Implement multipart POST per docs with timeout & abort
+    -   [x] Map verbose_json to segments
+    -   [x] Retry wrapper (exponential backoff, max 3) for 5xx/429/network
+    -   [x] Unit tests (mock fetch)
+
+## 3. Formatting & Artifacts
+
+-   [x] TranscriptFormatter (Req: 5)
+    -   [x] Implement merge & SRT generation logic
+    -   [x] Implement plain text and optional JSON builder
+    -   [x] Unit tests for gap merge, timestamp rounding, control char stripping
+-   [x] Artifact builder integration (Req: 5,10)
+    -   [x] Function buildArtifacts returning { srt, text, json? }
+
+## 4. Facade & Caching
+
+-   [ ] ASR Facade (Req: 1,5,10)
+    -   [x] Implement request() computing mediaHash (SHA256 stream)
+    -   [x] Reuse existing completed job via getReusable
+    -   [x] Create new asr_job row; enqueue message
+    -   [x] Update worker clipping pipeline to call facade when subtitleLang=auto
+    -   [x] Tests: reuse path vs new path
+
+## 5. Queue Integration
+
+-   [ ] Queue topic (Req: 1,3)
+    -   [x] Add ASR queue name constant (e.g., 'asr') in `src/queue/types.ts`
+    -   [x] Extend pgboss adapter subscribe for ASR job handler
+-   [ ] Message shape & validation (Req: 1)
+    -   [x] Define zod schema for ASR queue payload
+    -   [x] Tests for invalid payload rejection
+
+## 6. Worker Implementation
+
+-   [ ] ASR Worker logic (Req: 1,5,6,7,8,9,10)
+    -   [ ] Claim job; transition queued->processing
+    -   [ ] Call provider with timeout
+    -   [ ] Format artifacts
+    -   [ ] Upload artifacts (StorageRepo)
+    -   [ ] Insert asr_artifacts rows
+    -   [ ] Patch job done (durationSec, detectedLanguage, completedAt)
+    -   [ ] Emit metrics/events
+    -   [ ] Error path: patch failed (errorCode, errorMessage), events, metrics
+    -   [ ] Tests with mock provider success/failure
+
+## 7. External API (Future Flag)
+
+-   [ ] Endpoints (Req: 2,3,4)
+    -   [ ] POST /v1/asr/jobs (flag ENABLE_ASR_API)
+    -   [ ] GET /v1/asr/jobs/:id
+    -   [ ] GET /v1/asr/jobs/:id/results
+    -   [ ] OpenAPI schemas additions
+    -   [ ] Integration tests
+
+## 8. Metrics & Observability
+
+-   [ ] Metrics (Req: 7,8)
+    -   [ ] Register counters/histograms
+    -   [ ] Instrument provider call duration & retries
+    -   [ ] Add inflight gauge updates
+-   [ ] Logging & events (Req: 9)
+    -   [ ] Add job_events for ASR transitions
+    -   [ ] Redact secrets in error logs
+
+## 9. Cleanup
+
+-   [ ] Extend cleanup logic (Req: 11)
+    -   [ ] Include transcript prefixes in deletion
+    -   [ ] Expire asr_jobs rows (status done/failed) past retention
+    -   [ ] Tests for cleanup idempotency
+
+## 10. Configuration & Env
+
+-   [ ] Document new env vars (Req: 6,7)
+    -   [ ] Update README and sample .env (without real keys)
+    -   [ ] Add config parsing for ASR_REQUEST_TIMEOUT_MS, ASR_MAX_DURATION_SEC, ASR_JSON_SEGMENTS, ASR_CONCURRENCY, MERGE_GAP_MS
+    -   [ ] Tests for config defaults
+
+## 11. Performance & Reliability
+
+-   [ ] Benchmark test (Req: 7)
+    -   [ ] Measure formatting time for synthetic 500/1000 segment arrays
+-   [ ] Retry/backoff test (Req: 6)
+    -   [ ] Simulate 500, 429 with Retry-After
+
+## 12. Security Review
+
+-   [ ] Redaction verification (Req: 9)
+    -   [ ] Ensure GROQ_API_KEY never appears in logs
+    -   [ ] Test redaction against provider error payloads
+
+## 13. Documentation
+
+-   [ ] Update planning docs cross-links (Req: 1-11)
+    -   [ ] Link main requirements subtitle section to ASR doc
+-   [ ] Add usage notes for internal vs external ASR jobs
+
+## 14. Future Hooks (Deferred)
+
+-   [ ] Speaker diarization placeholder (deferred)
+-   [ ] Real-time streaming pathway (deferred)
+
+---
+
+Milestones:
+M1 – Schema + Provider + Formatter (Sections 1-3)
+M2 – Facade + Queue + Worker (Sections 4-6)
+M3 – External API + Metrics + Cleanup (Sections 7-9)
+M4 – Perf, Security, Docs (Sections 10-13)
+
+Risks & Mitigations:
+
+-   Provider rate limits: implement exponential backoff + metrics.
+-   Large segment counts: merge algorithm reduces fragmentation.
+-   Hash collisions extremely unlikely; still rely on SHA256.
+-   Timeout edge: ensure proper abort to release connection.
 ````
 
 ## File: planning/layers.md
@@ -5957,6 +6331,76 @@ interface Storage {
 -   Handles 100+ concurrent stream-copy jobs on a single node without errors.
 -   Clean error envelopes; retries + idempotency verified.
 -   Docs published; minimal UI demo works end-to-end.
+````
+
+## File: planning/todo.md
+````markdown
+# Project Completion TODO (Focused & Prioritized)
+
+Only incomplete planned items from layers doc; excludes new/optional stretch features. Order chosen by dependency + fastest user value.
+
+## 1. Schema & Groundwork (must precede dependent code)
+
+-   [x] Drizzle migration scripts committed + README command (db:migrate documented)
+-   [x] Migration: unique partial index (media_hash, model_version) WHERE status='done' (in 0001_asr_jobs.sql)
+-   [x] Add last_heartbeat_at column (0002_add_last_heartbeat.sql)
+-   [x] Backfill expiresAt for existing rows (script backfill-expires.ts)
+
+## 2. Core API Completion (unblocks external consumption)
+
+-   [x] GET /api/jobs/:id (status, progress, result keys, recent events)
+-   [x] GET /api/jobs/:id/result (signed clip URL; 404 missing, 410 expired)
+-   [x] Consistent error envelope (code,message,correlationId)
+
+## 3. Storage & Delivery (required by result endpoint reliability)
+
+-   [x] Signed URL integration in result endpoint
+-   [x] Retry transient storage upload failures (limited backoff)
+
+## 4. Reliability Hardening (stabilize before ASR load)
+
+-   [x] Worker heartbeat writes (last_heartbeat_at updates)
+-   [x] Global clip timeout enforcement
+
+## 5. ASR Pipeline (major missing functional layer)
+
+-   [x] ASR queue consumer: extract audio (-vn -ac 1 -ar 16k), call provider, build SRT/text/(json), upload, insert asr_artifacts, update asr_jobs
+-   [x] Provider error mapping (TIMEOUT, UPSTREAM_FAILURE, VALIDATION_FAILED)
+-   [x] Update originating clip job.resultSrtKey on ASR completion
+-   [x] Persist resultSrtKey when ASR finishes
+-   [x] Burn-in subtitles when job.burnSubtitles=true
+
+## 6. Observability (instrument after ASR path exists)
+
+-   [x] /metrics endpoint: job duration histogram, queue depth, ffmpeg fallback counter, ASR latency & status counts, storage upload latency
+-   [x] Add jobId/asrJobId correlation fields consistently in logs
+
+## 7. Cleanup (after ASR artifacts introduced)
+
+-   [ ] Extend cleanup to remove expired ASR jobs + transcript artifacts
+
+## 8. Security & Abuse Controls
+
+-   [ ] API key auth (lookup hash)
+-   [ ] Basic rate limiting for job creation (per key/IP)
+-   [ ] Document existing SSRF allowlist behavior
+
+## 9. Docs
+
+-   [ ] API reference markdown (create/status/result) with curl examples
+-   [ ] Brief metrics reference (names + purpose)
+
+## 10. Tests (add alongside each feature)
+
+-   [ ] API tests: create -> status -> result flow
+-   [ ] ASR worker integration test (mock provider) verifying SRT artifact + job update
+-   [ ] Cleanup test including ASR artifact deletion
+-   [ ] Security tests: auth required (if enabled), rate limit enforcement
+-   [ ] Metrics endpoint test (basic scrape contains expected metric names)
+
+---
+
+Execution guidance: Finish 1–4 first, ship; then implement 5 with feature flag, immediately add 6 & 7, follow with 8–10.
 ````
 
 ## File: src/data/db/repos.ts
@@ -6308,6 +6752,9 @@ function toJobRow(j: any): JobRow {
         createdAt: j.createdAt.toISOString(),
         updatedAt: j.updatedAt.toISOString(),
         expiresAt: j.expiresAt ? j.expiresAt.toISOString() : undefined,
+        lastHeartbeatAt: j.lastHeartbeatAt
+            ? j.lastHeartbeatAt.toISOString()
+            : undefined,
     };
 }
 
@@ -6316,6 +6763,7 @@ function toJobsPatch(patch: Partial<JobRow>) {
     for (const [k, v] of Object.entries(patch)) {
         if (v === undefined) continue;
         if (k === 'expiresAt' && v) out[k] = new Date(v as string);
+        else if (k === 'lastHeartbeatAt' && v) out[k] = new Date(v as string);
         else out[k] = v as any;
     }
     return out;
@@ -6363,6 +6811,179 @@ function toAsrArtifactRow(a: any): AsrArtifactRow {
 }
 ````
 
+## File: src/data/repo.ts
+````typescript
+import type { JobStatus } from '@clipper/contracts';
+import { desc, eq } from 'drizzle-orm';
+
+export interface JobRow {
+    id: string;
+    status: JobStatus;
+    progress: number;
+    sourceType: 'upload' | 'youtube';
+    sourceKey?: string;
+    sourceUrl?: string;
+    startSec: number;
+    endSec: number;
+    withSubtitles: boolean;
+    burnSubtitles: boolean;
+    subtitleLang?: string;
+    resultVideoKey?: string;
+    resultSrtKey?: string;
+    errorCode?: string;
+    errorMessage?: string;
+    createdAt: string;
+    updatedAt: string;
+    expiresAt?: string;
+    lastHeartbeatAt?: string;
+}
+
+export interface JobEvent {
+    jobId: string;
+    ts: string;
+    type: string;
+    data?: Record<string, unknown>;
+}
+
+export interface JobsRepository {
+    create(row: Omit<JobRow, 'createdAt' | 'updatedAt'>): Promise<JobRow>;
+    get(id: string): Promise<JobRow | null>;
+    update(id: string, patch: Partial<JobRow>): Promise<JobRow>;
+    listByStatus(
+        status: JobStatus,
+        limit?: number,
+        offset?: number
+    ): Promise<JobRow[]>;
+    transition(
+        id: string,
+        next: JobStatus,
+        event?: { type?: string; data?: Record<string, unknown> }
+    ): Promise<JobRow>;
+}
+
+export interface JobEventsRepository {
+    add(evt: JobEvent): Promise<void>;
+    list(jobId: string, limit?: number, offset?: number): Promise<JobEvent[]>;
+}
+
+// --- ASR (Automatic Speech Recognition) domain types ---
+export type AsrJobStatus = 'queued' | 'processing' | 'done' | 'failed';
+
+export interface AsrJobRow {
+    id: string;
+    clipJobId?: string;
+    sourceType: string; // upload | youtube | internal
+    sourceKey?: string;
+    mediaHash: string;
+    modelVersion: string;
+    languageHint?: string;
+    detectedLanguage?: string;
+    durationSec?: number;
+    status: AsrJobStatus;
+    errorCode?: string;
+    errorMessage?: string;
+    createdAt: string;
+    updatedAt: string;
+    completedAt?: string;
+    expiresAt?: string;
+}
+
+export interface AsrArtifactRow {
+    asrJobId: string;
+    kind: 'srt' | 'text' | 'json';
+    storageKey: string;
+    sizeBytes?: number;
+    createdAt: string;
+}
+
+export interface AsrJobsRepository {
+    create(
+        row: Omit<AsrJobRow, 'createdAt' | 'updatedAt' | 'status'> &
+            Partial<Pick<AsrJobRow, 'status'>>
+    ): Promise<AsrJobRow>;
+    get(id: string): Promise<AsrJobRow | null>;
+    getReusable(
+        mediaHash: string,
+        modelVersion: string
+    ): Promise<(AsrJobRow & { artifacts: AsrArtifactRow[] }) | null>;
+    patch(id: string, patch: Partial<AsrJobRow>): Promise<AsrJobRow>;
+}
+
+export interface AsrArtifactsRepository {
+    put(artifact: AsrArtifactRow): Promise<void>;
+    list(asrJobId: string): Promise<AsrArtifactRow[]>;
+}
+
+// Minimal in-memory impl to wire API/worker until DB is added
+export class InMemoryJobsRepo implements JobsRepository {
+    private map = new Map<string, JobRow>();
+    async create(
+        row: Omit<JobRow, 'createdAt' | 'updatedAt'>
+    ): Promise<JobRow> {
+        const now = new Date().toISOString();
+        const rec: JobRow = { ...row, createdAt: now, updatedAt: now };
+        this.map.set(rec.id, rec);
+        return rec;
+    }
+    async get(id: string) {
+        return this.map.get(id) ?? null;
+    }
+    async update(id: string, patch: Partial<JobRow>): Promise<JobRow> {
+        const cur = this.map.get(id);
+        if (!cur) throw new Error('NOT_FOUND');
+        const next = {
+            ...cur,
+            ...patch,
+            updatedAt: new Date().toISOString(),
+        } as JobRow;
+        this.map.set(id, next);
+        return next;
+    }
+    async listByStatus(
+        status: JobStatus,
+        limit = 50,
+        offset = 0
+    ): Promise<JobRow[]> {
+        return Array.from(this.map.values())
+            .filter((r) => r.status === status)
+            .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+            .slice(offset, offset + limit);
+    }
+    async transition(
+        id: string,
+        next: JobStatus,
+        event?: { type?: string; data?: Record<string, unknown> }
+    ): Promise<JobRow> {
+        const cur = await this.get(id);
+        if (!cur) throw new Error('NOT_FOUND');
+        const updated = await this.update(id, { status: next });
+        // no-op event store here; handled by InMemoryJobEventsRepo
+        return updated;
+    }
+}
+
+export class InMemoryJobEventsRepo implements JobEventsRepository {
+    private events: JobEvent[] = [];
+    async add(evt: JobEvent): Promise<void> {
+        this.events.push(evt);
+    }
+    async listRecent(jobId: string, limit = 10) {
+        return this.events
+            .filter((e) => e.jobId === jobId)
+            .sort((a, b) => a.ts.localeCompare(b.ts))
+            .slice(0, limit);
+    }
+    async list(jobId: string, limit = 100, offset = 0): Promise<JobEvent[]> {
+        return this.events
+            .filter((e) => e.jobId === jobId)
+            .sort((a, b) => a.ts.localeCompare(b.ts))
+            .slice(offset, offset + limit);
+    }
+}
+
+// (If a DrizzleJobEventsRepo is defined elsewhere, ensure it has listRecent; placeholder below if needed.)
+````
+
 ## File: src/data/storage.ts
 ````typescript
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
@@ -6372,6 +6993,7 @@ export const storageKeys = {
     source: (jobId: string, ext: string) =>
         `sources/${jobId}/source.${ext.replace(/^\./, '')}`,
     resultVideo: (jobId: string) => `results/${jobId}/clip.mp4`,
+    resultVideoBurned: (jobId: string) => `results/${jobId}/clip.subbed.mp4`,
     resultSrt: (jobId: string) => `results/${jobId}/clip.srt`,
     transcriptSrt: (ownerId: string) =>
         `results/${ownerId}/transcript/clip.srt`,
@@ -6490,186 +7112,6 @@ function guessContentType(key: string): string {
 }
 ````
 
-## File: package.json
-````json
-{
-    "name": "clipper",
-    "module": "index.ts",
-    "type": "module",
-    "private": true,
-    "scripts": {
-        "test": "bunx vitest run",
-        "db:generate": "bunx drizzle-kit generate --config=drizzle.config.ts",
-        "db:migrate": "bunx drizzle-kit migrate --config=drizzle.config.ts",
-        "db:push": "bunx drizzle-kit push --config=drizzle.config.ts"
-    },
-    "devDependencies": {
-        "@types/bun": "latest"
-    },
-    "peerDependencies": {
-        "typescript": "^5"
-    },
-    "dependencies": {
-        "@elysiajs/cors": "^1.3.3",
-        "@supabase/supabase-js": "^2.54.0",
-        "@types/pg": "^8.15.5",
-        "dotenv": "^17.2.1",
-        "drizzle-kit": "^0.31.4",
-        "drizzle-orm": "^0.44.4",
-        "elysia": "^1.3.8",
-        "pg": "^8.16.3",
-        "pg-boss": "^10.3.2",
-        "zod": "^4.0.17",
-        "zod-to-openapi": "^0.2.1"
-    }
-}
-````
-
-## File: planning/asr/tasks.md
-````markdown
-# ASR Service Tasks
-
-artifact_id: 39d0ca49-8c65-44c0-8f8e-5fd9b3180c3c
-
-Mappings: Req numbers refer to ASR requirements document.
-
-## 1. Database & Schema
-
--   [x] Add Drizzle schema additions (Req: 1,2,3,4,8,9,10,11)
-    -   [x] Create tables: asr_jobs, asr_artifacts
-    -   [x] Add unique index (media_hash, model_version) where status='done'
-    -   [x] Generate migration SQL
-    -   [x] Update drizzle meta snapshot (journal updated; snapshot auto-updated next migrate)
--   [x] Repository interfaces (Req: 1,3,5,8,9,10)
-    -   [x] Implement AsrJobsRepository in `src/data/db/repos.ts`
-    -   [x] Implement AsrArtifactsRepository
-    -   [x] Add getReusable(mediaHash, modelVersion)
-    -   [x] Unit tests with DB (integration test asr.repos.integration.test.ts)
-
-## 2. Provider Abstraction
-
--   [x] Define provider interfaces/types (Req: 5,6)
-    -   [x] Add `src/asr/provider.ts` with AsrProvider, segment/result types
-    -   [x] Add error class ProviderHttpError
--   [x] GroqWhisperProvider (Req: 6,7)
-    -   [x] Implement multipart POST per docs with timeout & abort
-    -   [x] Map verbose_json to segments
-    -   [x] Retry wrapper (exponential backoff, max 3) for 5xx/429/network
-    -   [x] Unit tests (mock fetch)
-
-## 3. Formatting & Artifacts
-
--   [x] TranscriptFormatter (Req: 5)
-    -   [x] Implement merge & SRT generation logic
-    -   [x] Implement plain text and optional JSON builder
-    -   [x] Unit tests for gap merge, timestamp rounding, control char stripping
--   [x] Artifact builder integration (Req: 5,10)
-    -   [x] Function buildArtifacts returning { srt, text, json? }
-
-## 4. Facade & Caching
-
--   [ ] ASR Facade (Req: 1,5,10)
-    -   [x] Implement request() computing mediaHash (SHA256 stream)
-    -   [x] Reuse existing completed job via getReusable
-    -   [x] Create new asr_job row; enqueue message
-    -   [x] Update worker clipping pipeline to call facade when subtitleLang=auto
-    -   [x] Tests: reuse path vs new path
-
-## 5. Queue Integration
-
--   [ ] Queue topic (Req: 1,3)
-    -   [x] Add ASR queue name constant (e.g., 'asr') in `src/queue/types.ts`
-    -   [x] Extend pgboss adapter subscribe for ASR job handler
--   [ ] Message shape & validation (Req: 1)
-    -   [x] Define zod schema for ASR queue payload
-    -   [x] Tests for invalid payload rejection
-
-## 6. Worker Implementation
-
--   [ ] ASR Worker logic (Req: 1,5,6,7,8,9,10)
-    -   [ ] Claim job; transition queued->processing
-    -   [ ] Call provider with timeout
-    -   [ ] Format artifacts
-    -   [ ] Upload artifacts (StorageRepo)
-    -   [ ] Insert asr_artifacts rows
-    -   [ ] Patch job done (durationSec, detectedLanguage, completedAt)
-    -   [ ] Emit metrics/events
-    -   [ ] Error path: patch failed (errorCode, errorMessage), events, metrics
-    -   [ ] Tests with mock provider success/failure
-
-## 7. External API (Future Flag)
-
--   [ ] Endpoints (Req: 2,3,4)
-    -   [ ] POST /v1/asr/jobs (flag ENABLE_ASR_API)
-    -   [ ] GET /v1/asr/jobs/:id
-    -   [ ] GET /v1/asr/jobs/:id/results
-    -   [ ] OpenAPI schemas additions
-    -   [ ] Integration tests
-
-## 8. Metrics & Observability
-
--   [ ] Metrics (Req: 7,8)
-    -   [ ] Register counters/histograms
-    -   [ ] Instrument provider call duration & retries
-    -   [ ] Add inflight gauge updates
--   [ ] Logging & events (Req: 9)
-    -   [ ] Add job_events for ASR transitions
-    -   [ ] Redact secrets in error logs
-
-## 9. Cleanup
-
--   [ ] Extend cleanup logic (Req: 11)
-    -   [ ] Include transcript prefixes in deletion
-    -   [ ] Expire asr_jobs rows (status done/failed) past retention
-    -   [ ] Tests for cleanup idempotency
-
-## 10. Configuration & Env
-
--   [ ] Document new env vars (Req: 6,7)
-    -   [ ] Update README and sample .env (without real keys)
-    -   [ ] Add config parsing for ASR_REQUEST_TIMEOUT_MS, ASR_MAX_DURATION_SEC, ASR_JSON_SEGMENTS, ASR_CONCURRENCY, MERGE_GAP_MS
-    -   [ ] Tests for config defaults
-
-## 11. Performance & Reliability
-
--   [ ] Benchmark test (Req: 7)
-    -   [ ] Measure formatting time for synthetic 500/1000 segment arrays
--   [ ] Retry/backoff test (Req: 6)
-    -   [ ] Simulate 500, 429 with Retry-After
-
-## 12. Security Review
-
--   [ ] Redaction verification (Req: 9)
-    -   [ ] Ensure GROQ_API_KEY never appears in logs
-    -   [ ] Test redaction against provider error payloads
-
-## 13. Documentation
-
--   [ ] Update planning docs cross-links (Req: 1-11)
-    -   [ ] Link main requirements subtitle section to ASR doc
--   [ ] Add usage notes for internal vs external ASR jobs
-
-## 14. Future Hooks (Deferred)
-
--   [ ] Speaker diarization placeholder (deferred)
--   [ ] Real-time streaming pathway (deferred)
-
----
-
-Milestones:
-M1 – Schema + Provider + Formatter (Sections 1-3)
-M2 – Facade + Queue + Worker (Sections 4-6)
-M3 – External API + Metrics + Cleanup (Sections 7-9)
-M4 – Perf, Security, Docs (Sections 10-13)
-
-Risks & Mitigations:
-
--   Provider rate limits: implement exponential backoff + metrics.
--   Large segment counts: merge algorithm reduces fragmentation.
--   Hash collisions extremely unlikely; still rely on SHA256.
--   Timeout edge: ensure proper abort to release connection.
-````
-
 ## File: src/worker/index.ts
 ````typescript
 import {
@@ -6691,12 +7133,14 @@ import {
 import { PgBossQueueAdapter } from '@clipper/queue';
 import { BunClipper } from '@clipper/ffmpeg';
 import { AsrFacade } from '@clipper/asr/facade';
+import { InMemoryMetrics } from '@clipper/common/metrics';
 export * from './asr.ts';
 
 const log = createLogger((readEnv('LOG_LEVEL') as any) || 'info').with({
     mod: 'worker',
 });
 
+const metrics = new InMemoryMetrics();
 const jobs = new DrizzleJobsRepo(createDb());
 const events = new DrizzleJobEventsRepo(createDb());
 const queue = new PgBossQueueAdapter({
@@ -6721,25 +7165,39 @@ async function main() {
     await queue.start();
     await queue.consume(async ({ jobId }: { jobId: string }) => {
         const startedAt = Date.now();
+        const maxMs = Number(readEnv('CLIP_MAX_RUNTIME_SEC') || 600) * 1000; // default 10m
         const nowIso = () => new Date().toISOString();
         let cleanup: (() => Promise<void>) | null = null;
         let outputLocal: string | null = null;
+        let lastHeartbeat = 0;
+        const heartbeatIntervalMs = Number(
+            readEnv('WORKER_HEARTBEAT_INTERVAL_MS') || 15_000
+        );
+        const sendHeartbeat = async () => {
+            const now = Date.now();
+            if (now - lastHeartbeat < heartbeatIntervalMs) return;
+            lastHeartbeat = now;
+            try {
+                await jobs.update(jobId, { lastHeartbeatAt: nowIso() } as any);
+            } catch {}
+        };
 
         const finish = async (status: 'done' | 'failed', patch: any = {}) => {
             await jobs.update(jobId, { status, ...patch });
             await events.add({ jobId, ts: nowIso(), type: status });
         };
 
-        try {
+    try {
             const job = await jobs.get(jobId);
             if (!job) {
-                log.warn('job not found', { jobId });
+        log.warn('job not found', { jobId });
                 return;
             }
             if (job.status === 'done') return; // idempotent
             if (job.status !== 'processing') {
                 await jobs.update(jobId, { status: 'processing', progress: 0 });
                 await events.add({ jobId, ts: nowIso(), type: 'processing' });
+        log.info('job processing start', { jobId });
             }
 
             // Resolve source
@@ -6774,6 +7232,7 @@ async function main() {
             });
 
             // Perform clip
+            const clipStart = Date.now();
             const { localPath: clipPath, progress$ } = await clipper.clip({
                 input: resolveRes.localPath,
                 startSec: job.startSec,
@@ -6791,10 +7250,15 @@ async function main() {
                     type: 'progress',
                     data: { pct, stage: 'clip' },
                 });
+                await sendHeartbeat();
             };
             const debounceMs = 500;
             for await (const pct of progress$) {
                 const now = Date.now();
+                // Global timeout enforcement
+                if (now - startedAt > maxMs) {
+                    throw new Error('CLIP_TIMEOUT');
+                }
                 if (
                     pct === 100 ||
                     pct >= lastPct + 1 ||
@@ -6803,14 +7267,53 @@ async function main() {
                     await persist(pct);
                     lastPersist = now;
                     lastPct = pct;
+                } else {
+                    // Even if we didn't persist progress, still emit heartbeat occasionally
+                    await sendHeartbeat();
                 }
             }
             if (lastPct < 100) await persist(100);
+            await sendHeartbeat();
 
             // Upload result
             if (!storage) throw new Error('STORAGE_NOT_AVAILABLE');
             const key = storageKeys.resultVideo(jobId);
-            await storage.upload(clipPath, key, 'video/mp4');
+            // Retry transient storage failures (network / 5xx) with exponential backoff
+            const uploadWithRetry = async () => {
+                const maxAttempts = Number(
+                    readEnv('STORAGE_UPLOAD_ATTEMPTS') || 4
+                );
+                let attempt = 0;
+                let delay = 200;
+                // simple transient detector
+                const isTransient = (err: any) => {
+                    const msg = String(err?.message || err);
+                    return /timeout|fetch|network|ECONN|EAI_AGAIN|ENOTFOUND|5\d{2}/i.test(
+                        msg
+                    );
+                };
+                // eslint-disable-next-line no-constant-condition
+                while (true) {
+                    try {
+                        attempt++;
+                        await storage.upload(clipPath, key, 'video/mp4');
+                        return;
+                    } catch (e) {
+                        if (attempt >= maxAttempts || !isTransient(e)) {
+                            throw e;
+                        }
+                        log.warn('storage upload retry', {
+                            jobId,
+                            attempt,
+                            error: String(e),
+                        });
+                        await new Promise((r) => setTimeout(r, delay));
+                        delay = Math.min(delay * 2, 2000);
+                    }
+                }
+            };
+            await uploadWithRetry();
+            metrics.observe('clip.upload_ms', Date.now() - clipStart);
             await events.add({
                 jobId,
                 ts: nowIso(),
@@ -6851,11 +7354,13 @@ async function main() {
             }
 
             await finish('done', { progress: 100, resultVideoKey: key });
+            metrics.observe('clip.total_ms', Date.now() - startedAt);
             const ms = Date.now() - startedAt;
             log.info('job completed', { jobId, ms });
         } catch (e) {
             const err = fromException(e, jobId);
             log.error('job failed', { jobId, err });
+            metrics.inc('clip.failures');
             try {
                 await jobs.update(jobId, {
                     status: 'failed',
@@ -6867,6 +7372,10 @@ async function main() {
                 await events.add({ jobId, ts: nowIso(), type: 'failed' });
             } catch {}
         } finally {
+            // Final heartbeat on exit (success or failure) if runtime not exceeded
+            try {
+                await jobs.update(jobId, { lastHeartbeatAt: nowIso() } as any);
+            } catch {}
             // Cleanup source + local output
             if (cleanup) {
                 try {

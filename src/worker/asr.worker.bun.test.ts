@@ -1,4 +1,4 @@
-import { describe, test, expect, beforeEach } from 'bun:test';
+import { describe, test, expect, beforeEach } from 'vitest';
 import { startAsrWorker } from '@clipper/worker/asr';
 import type { AsrJobRow, AsrArtifactRow, JobRow } from '@clipper/data';
 import { storageKeys } from '@clipper/data';
