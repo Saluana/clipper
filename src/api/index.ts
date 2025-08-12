@@ -269,11 +269,37 @@ export const app = addHttpInstrumentation(baseApp)
         (store as any).apiKeyId = rec.id;
     })
     .get('/healthz', async ({ store }) => {
-        const h = await queue.health();
+        const correlationId = (store as any).correlationId;
+        // Queue health
+        let queueHealth: any = { ok: false, error: 'uninitialized' };
+        try {
+            queueHealth = await queue.health();
+        } catch (e) {
+            queueHealth = {
+                ok: false,
+                error: e instanceof Error ? e.message : String(e),
+            };
+        }
+        // DB ping latency (simple SELECT 1)
+        let dbMs = -1;
+        let dbOk = false;
+        try {
+            const start = performance.now();
+            // Use jobsRepo (drizzle) low-level query; drizzle .execute needs a sql template.
+            // Use a raw query through the adapter's underlying client if available.
+            // Fallback: listByStatus with 0 limit as lightweight ping.
+            await jobsRepo.listByStatus('queued', 1, 0);
+            dbMs = performance.now() - start;
+            dbOk = true;
+        } catch (e) {
+            dbOk = false;
+        }
+        const ok = queueHealth.ok && dbOk;
         return {
-            ok: h.ok,
-            queue: h,
-            correlationId: (store as any).correlationId,
+            ok,
+            queue: queueHealth,
+            db: { ok: dbOk, ping_ms: dbMs },
+            correlationId,
         };
     })
     .get('/metrics/queue', ({ store }) => ({

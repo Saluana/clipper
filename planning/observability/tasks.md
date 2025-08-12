@@ -60,13 +60,13 @@ artifact_id: 8f5b7a3c-9d8a-4c1f-b2f9-3e6d2c1a7b90
 
 ## 9. Health & Readiness Expansion
 
--   [ ] 9.1 Extend /healthz with queue status & db ping ms (Req 9)
--   [ ] 9.2 Failure path returns ok:false (Req 9)
+-   [x] 9.1 Extend /healthz with queue status & db ping ms (Req 9)
+-   [x] 9.2 Failure path returns ok:false (Req 9)
 
 ## 10. SLO Documentation & Burn Rate Queries
 
--   [ ] 10.1 Document SLOs in docs/metrics.md (Req 10)
--   [ ] 10.2 Provide example PromQL or pseudo queries (Req 10)
+-   [x] 10.1 Document SLOs in docs/metrics.md (Req 10)
+-   [x] 10.2 Provide example PromQL or pseudo queries (Req 10)
 
 ## 11. Metrics Endpoint Performance
 
