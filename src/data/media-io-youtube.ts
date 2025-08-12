@@ -203,48 +203,71 @@ export async function resolveYouTubeSource(
 
     const timeoutMs = Math.min(MAX_DUR * 1000, 15 * 60 * 1000);
     const dlStart = Date.now();
-    let timedOut = false;
-    const proc = Bun.spawn([bin, ...ytdlpArgs], {
-        stdout: 'pipe',
-        stderr: 'pipe',
-        env: { PATH: (process as any).env?.PATH || '' },
-    });
-    const timer = setTimeout(() => {
-        try {
-            proc.kill('SIGKILL');
-            timedOut = true;
-        } catch {}
-    }, timeoutMs);
-    const stderrP = new Response(proc.stderr).text();
-    const stdoutP = new Response(proc.stdout).text();
-    const exitCode = await proc.exited;
-    const [stderrText, stdoutText] = await Promise.all([
-        stderrP.catch(() => ''),
-        stdoutP.catch(() => ''),
-    ]);
-    clearTimeout(timer);
+    let stderrText = '';
+    let stdoutText = '';
+    await withExternal(
+        metrics as any,
+        {
+            dep: 'yt_dlp',
+            op: 'download',
+            timeoutMs,
+            classifyError: (e) => {
+                const msg = String(e?.message || e);
+                if (msg === 'YTDLP_TIMEOUT') return 'timeout';
+                if (msg.startsWith('YTDLP_FAILED:')) {
+                    const code = msg.split(':')[1] || '1';
+                    return `exit_${code}`;
+                }
+                if (msg === 'YTDLP_NOT_FOUND') return 'not_found';
+                if (msg === 'YTDLP_DISABLED') return 'disabled';
+                return undefined;
+            },
+        },
+        async (signal) => {
+            let timedOut = false;
+            const proc = Bun.spawn([bin!, ...ytdlpArgs], {
+                stdout: 'pipe',
+                stderr: 'pipe',
+                env: { PATH: (process as any).env?.PATH || '' },
+            });
+            const onAbort = () => {
+                try {
+                    proc.kill('SIGKILL');
+                    timedOut = true;
+                } catch {}
+            };
+            signal.addEventListener('abort', onAbort, { once: true });
+            const stderrP = new Response(proc.stderr).text();
+            const stdoutP = new Response(proc.stdout).text();
+            const exitCode = await proc.exited;
+            stderrText = await stderrP.catch(() => '');
+            stdoutText = await stdoutP.catch(() => '');
+            signal.removeEventListener('abort', onAbort);
+            if (timedOut) {
+                await Bun.spawn(['rm', '-rf', baseDir]).exited;
+                throw new Error('YTDLP_TIMEOUT');
+            }
+            if (exitCode !== 0) {
+                if (DEBUG)
+                    logger.error('yt-dlp failed', {
+                        exitCode,
+                        stderr: stderrText.slice(0, 800),
+                    });
+                await Bun.spawn(['rm', '-rf', baseDir]).exited;
+                throw new Error(`YTDLP_FAILED:${exitCode}`);
+            }
+            if (DEBUG)
+                logger.info('yt-dlp succeeded', {
+                    exitCode,
+                    stderrPreview: stderrText.slice(0, 200),
+                    stdoutPreview: stdoutText.slice(0, 200),
+                });
+            return null;
+        }
+    );
     metrics.observe('mediaio.ytdlp.duration_ms', Date.now() - dlStart, {
         jobId: job.id,
     });
-    if (timedOut) {
-        await Bun.spawn(['rm', '-rf', baseDir]).exited;
-        throw new Error('YTDLP_TIMEOUT');
-    }
-    if (exitCode !== 0) {
-        if (DEBUG)
-            logger.error('yt-dlp failed', {
-                exitCode,
-                stderr: stderrText.slice(0, 800),
-            });
-        await Bun.spawn(['rm', '-rf', baseDir]).exited;
-        throw new Error(`YTDLP_FAILED:${exitCode}`);
-    }
-    if (DEBUG)
-        logger.info('yt-dlp succeeded', {
-            exitCode,
-            stderrPreview: stderrText.slice(0, 200),
-            stdoutPreview: stdoutText.slice(0, 200),
-        });
 
     const localPath = await findDownloadedFile(baseDir);
     if (!localPath) {

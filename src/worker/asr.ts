@@ -17,7 +17,12 @@ import {
     AsrQueuePayloadSchema,
     type AsrQueuePayload,
 } from '@clipper/queue/asr';
-import { createLogger, readEnv, fromException } from '@clipper/common';
+import {
+    createLogger,
+    readEnv,
+    fromException,
+    withExternal,
+} from '@clipper/common';
 
 export interface AsrWorkerDeps {
     asrJobs?: DrizzleAsrJobsRepo;
@@ -93,25 +98,49 @@ export async function startAsrWorker(deps: AsrWorkerDeps) {
             }
 
             // Transcribe
-            let res;
-            try {
-                res = await provider.transcribe(inputLocal, {
+            const res = await withExternal(
+                metrics as any,
+                {
+                    dep: 'asr',
+                    op: 'transcribe',
                     timeoutMs,
-                    languageHint,
-                });
-            } catch (err: any) {
-                // Map provider errors to internal codes
-                if (err?.name === 'AbortError') throw new Error('TIMEOUT');
-                if (err instanceof ProviderHttpError) {
-                    if (err.status === 0) throw new Error('UPSTREAM_FAILURE');
-                    if (err.status >= 500) throw new Error('UPSTREAM_FAILURE');
-                    if (err.status === 400)
-                        throw new Error('VALIDATION_FAILED');
-                    // treat others as upstream
-                    throw new Error('UPSTREAM_FAILURE');
+                    classifyError: (e) => {
+                        const msg = String(e?.message || e);
+                        if (msg === 'TIMEOUT' || /abort/i.test(msg))
+                            return 'timeout';
+                        if (msg === 'VALIDATION_FAILED') return 'validation';
+                        if (msg === 'UPSTREAM_FAILURE') return 'upstream';
+                        if (e instanceof ProviderHttpError) {
+                            if (e.status === 400) return 'validation';
+                            if (e.status === 0) return 'network';
+                            if (e.status >= 500) return 'upstream';
+                        }
+                        return undefined;
+                    },
+                },
+                async (signal) => {
+                    try {
+                        return await provider.transcribe(inputLocal, {
+                            timeoutMs,
+                            languageHint,
+                            signal,
+                        });
+                    } catch (err: any) {
+                        if (err?.name === 'AbortError')
+                            throw new Error('TIMEOUT');
+                        if (err instanceof ProviderHttpError) {
+                            if (err.status === 0)
+                                throw new Error('UPSTREAM_FAILURE');
+                            if (err.status >= 500)
+                                throw new Error('UPSTREAM_FAILURE');
+                            if (err.status === 400)
+                                throw new Error('VALIDATION_FAILED');
+                            throw new Error('UPSTREAM_FAILURE');
+                        }
+                        throw err;
+                    }
                 }
-                throw err;
-            }
+            );
 
             // Build artifacts
             const built = buildArtifacts(res.segments, {
