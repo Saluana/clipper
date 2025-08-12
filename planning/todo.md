@@ -17,8 +17,8 @@ Only incomplete planned items from layers doc; excludes new/optional stretch fea
 
 ## 3. Storage & Delivery (required by result endpoint reliability)
 
--   [ ] Signed URL integration in result endpoint
--   [ ] Retry transient storage upload failures (limited backoff)
+-   [x] Signed URL integration in result endpoint
+-   [x] Retry transient storage upload failures (limited backoff)
 
 ## 4. Reliability Hardening (stabilize before ASR load)
 

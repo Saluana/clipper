@@ -136,7 +136,41 @@ async function main() {
             // Upload result
             if (!storage) throw new Error('STORAGE_NOT_AVAILABLE');
             const key = storageKeys.resultVideo(jobId);
-            await storage.upload(clipPath, key, 'video/mp4');
+            // Retry transient storage failures (network / 5xx) with exponential backoff
+            const uploadWithRetry = async () => {
+                const maxAttempts = Number(
+                    readEnv('STORAGE_UPLOAD_ATTEMPTS') || 4
+                );
+                let attempt = 0;
+                let delay = 200;
+                // simple transient detector
+                const isTransient = (err: any) => {
+                    const msg = String(err?.message || err);
+                    return /timeout|fetch|network|ECONN|EAI_AGAIN|ENOTFOUND|5\d{2}/i.test(
+                        msg
+                    );
+                };
+                // eslint-disable-next-line no-constant-condition
+                while (true) {
+                    try {
+                        attempt++;
+                        await storage.upload(clipPath, key, 'video/mp4');
+                        return;
+                    } catch (e) {
+                        if (attempt >= maxAttempts || !isTransient(e)) {
+                            throw e;
+                        }
+                        log.warn('storage upload retry', {
+                            jobId,
+                            attempt,
+                            error: String(e),
+                        });
+                        await new Promise((r) => setTimeout(r, delay));
+                        delay = Math.min(delay * 2, 2000);
+                    }
+                }
+            };
+            await uploadWithRetry();
             await events.add({
                 jobId,
                 ts: nowIso(),
