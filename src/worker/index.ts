@@ -7,6 +7,7 @@ import {
 import {
     DrizzleJobsRepo,
     DrizzleJobEventsRepo,
+    DrizzleAsrJobsRepo,
     createDb,
     resolveUploadSource,
     resolveYouTubeSource,
@@ -15,6 +16,7 @@ import {
 } from '@clipper/data';
 import { PgBossQueueAdapter } from '@clipper/queue';
 import { BunClipper } from '@clipper/ffmpeg';
+import { AsrFacade } from '@clipper/asr/facade';
 
 const log = createLogger((readEnv('LOG_LEVEL') as any) || 'info').with({
     mod: 'worker',
@@ -36,6 +38,9 @@ const storage = (() => {
         return null as any;
     }
 })();
+const asrFacade = new AsrFacade({
+    asrJobs: new DrizzleAsrJobsRepo(createDb()),
+});
 
 async function main() {
     await queue.start();
@@ -137,6 +142,38 @@ async function main() {
                 type: 'uploaded',
                 data: { key },
             });
+
+            // If subtitles requested and set to auto, create ASR job request (fire-and-forget)
+            if (
+                job.withSubtitles &&
+                (job.subtitleLang === 'auto' || !job.subtitleLang)
+            ) {
+                try {
+                    const asrRes = await asrFacade.request({
+                        localPath: clipPath,
+                        clipJobId: job.id,
+                        sourceType: 'internal',
+                        languageHint: job.subtitleLang ?? 'auto',
+                    });
+                    await events.add({
+                        jobId,
+                        ts: nowIso(),
+                        type: 'asr:requested',
+                        data: {
+                            asrJobId: asrRes.asrJobId,
+                            status: asrRes.status,
+                        },
+                    });
+                } catch (e) {
+                    // don't fail the clip if ASR enqueue fails
+                    await events.add({
+                        jobId,
+                        ts: nowIso(),
+                        type: 'asr:error',
+                        data: { err: String(e) },
+                    });
+                }
+            }
 
             await finish('done', { progress: 100, resultVideoKey: key });
             const ms = Date.now() - startedAt;

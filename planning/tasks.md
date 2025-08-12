@@ -66,7 +66,7 @@ Legend: Requirements mapping uses section.item from requirements.md.
     -   [ ] Implement helper to attempt stream-copy and fallback to re-encode; expose metrics
     -   [ ] Validate duration tolerance and set result container
 -   [ ] ASR via Groq (Req: 5)
-    -   [ ] Add minimal client for Groq Whisper; convert to SRT
+    -   [x] Add minimal client for Groq Whisper; convert to SRT
     -   [ ] Burn-in using ffmpeg subtitles filter when requested
 
 ## 5. API surface

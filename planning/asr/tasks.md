@@ -19,32 +19,32 @@ Mappings: Req numbers refer to ASR requirements document.
 
 ## 2. Provider Abstraction
 
--   [ ] Define provider interfaces/types (Req: 5,6)
-    -   [ ] Add `src/asr/provider.ts` with AsrProvider, segment/result types
-    -   [ ] Add error class ProviderHttpError
--   [ ] GroqWhisperProvider (Req: 6,7)
-    -   [ ] Implement multipart POST per docs with timeout & abort
-    -   [ ] Map verbose_json to segments
-    -   [ ] Retry wrapper (exponential backoff, max 3) for 5xx/429/network
-    -   [ ] Unit tests (mock fetch)
+-   [x] Define provider interfaces/types (Req: 5,6)
+    -   [x] Add `src/asr/provider.ts` with AsrProvider, segment/result types
+    -   [x] Add error class ProviderHttpError
+-   [x] GroqWhisperProvider (Req: 6,7)
+    -   [x] Implement multipart POST per docs with timeout & abort
+    -   [x] Map verbose_json to segments
+    -   [x] Retry wrapper (exponential backoff, max 3) for 5xx/429/network
+    -   [x] Unit tests (mock fetch)
 
 ## 3. Formatting & Artifacts
 
--   [ ] TranscriptFormatter (Req: 5)
-    -   [ ] Implement merge & SRT generation logic
-    -   [ ] Implement plain text and optional JSON builder
-    -   [ ] Unit tests for gap merge, timestamp rounding, control char stripping
--   [ ] Artifact builder integration (Req: 5,10)
-    -   [ ] Function buildArtifacts returning { srt, text, json? }
+-   [x] TranscriptFormatter (Req: 5)
+    -   [x] Implement merge & SRT generation logic
+    -   [x] Implement plain text and optional JSON builder
+    -   [x] Unit tests for gap merge, timestamp rounding, control char stripping
+-   [x] Artifact builder integration (Req: 5,10)
+    -   [x] Function buildArtifacts returning { srt, text, json? }
 
 ## 4. Facade & Caching
 
 -   [ ] ASR Facade (Req: 1,5,10)
-    -   [ ] Implement request() computing mediaHash (SHA256 stream)
-    -   [ ] Reuse existing completed job via getReusable
-    -   [ ] Create new asr_job row; enqueue message
-    -   [ ] Update worker clipping pipeline to call facade when subtitleLang=auto
-    -   [ ] Tests: reuse path vs new path
+    -   [x] Implement request() computing mediaHash (SHA256 stream)
+    -   [x] Reuse existing completed job via getReusable
+    -   [x] Create new asr_job row; enqueue message
+    -   [x] Update worker clipping pipeline to call facade when subtitleLang=auto
+    -   [x] Tests: reuse path vs new path
 
 ## 5. Queue Integration
 
