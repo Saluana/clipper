@@ -152,7 +152,6 @@
 
 Not built
 
-ASR Service (Groq Whisper)
 Minimal UI
 
 ---

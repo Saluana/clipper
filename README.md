@@ -50,8 +50,11 @@ bun install
 cp .env.example .env
 # Fill in DATABASE_URL, SUPABASE_* values, etc.
 
-# 3. Run migrations (drizzle-kit configured)
-# (Add migration command here when generated) – schema currently bootstrap via SQL file.
+# 3. Run migrations (drizzle-kit)
+bun run db:migrate
+
+# (If first time and DB empty you can also generate):
+# bun run db:generate (then inspect) before migrate
 
 # 4. Start API (once endpoints added) & worker in separate terminals
 bun run src/api/index.ts &

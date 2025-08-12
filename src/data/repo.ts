@@ -1,4 +1,5 @@
 import type { JobStatus } from '@clipper/contracts';
+import { desc, eq } from 'drizzle-orm';
 
 export interface JobRow {
     id: string;
@@ -150,6 +151,12 @@ export class InMemoryJobEventsRepo implements JobEventsRepository {
     async add(evt: JobEvent): Promise<void> {
         this.events.push(evt);
     }
+    async listRecent(jobId: string, limit = 10) {
+        return this.events
+            .filter((e) => e.jobId === jobId)
+            .sort((a, b) => a.ts.localeCompare(b.ts))
+            .slice(0, limit);
+    }
     async list(jobId: string, limit = 100, offset = 0): Promise<JobEvent[]> {
         return this.events
             .filter((e) => e.jobId === jobId)
@@ -157,3 +164,5 @@ export class InMemoryJobEventsRepo implements JobEventsRepository {
             .slice(offset, offset + limit);
     }
 }
+
+// (If a DrizzleJobEventsRepo is defined elsewhere, ensure it has listRecent; placeholder below if needed.)
