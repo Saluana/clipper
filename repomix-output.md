@@ -36,7 +36,11 @@ The content is organized as follows:
 # Directory Structure
 ```
 docs/
+  api-reference.md
   ffmpeg.md
+  guide.md
+  metrics.md
+  security.md
 planning/
   asr/
     design.md
@@ -216,6 +220,272 @@ Each job gets an isolated scratch subdirectory: `${SCRATCH_DIR}/jobs/<jobId>/`. 
 ---
 
 Last updated: (add date when editing)
+````
+
+## File: docs/guide.md
+````markdown
+# Clipper Tutorial / Quick Guide
+
+This guide walks you from zero to a clipped video using the Clipper API + worker.
+
+---
+
+## 1. Install & Configure
+
+```
+bun install
+cp .env.example .env
+# Edit .env: DATABASE_URL=..., SUPABASE_*, ENABLE_YTDLP=true (for YouTube)
+```
+
+Ensure `ffmpeg`, `ffprobe`, and optionally `yt-dlp` are installed and in PATH.
+
+Run migrations:
+
+```
+bun run db:migrate
+```
+
+---
+
+## 2. Start Services
+
+In two terminals:
+
+```
+bun run dev        # API
+bun run dev:worker # Worker
+```
+
+Set `LOG_LEVEL=debug` temporarily for deeper logs.
+
+Check health:
+
+```
+curl http://localhost:3000/healthz
+```
+
+Expect `{ "ok": true, ... }`.
+
+---
+
+## 3. Create a YouTube Clip Job
+
+Pick a short segment. Example: 25 seconds starting at 1 minute.
+
+```
+curl -X POST http://localhost:3000/api/jobs \
+ -H 'Content-Type: application/json' \
+ -d '{"sourceType":"youtube","youtubeUrl":"https://www.youtube.com/watch?v=VIDEO","start":"00:01:00","end":"00:01:25","withSubtitles":false}'
+```
+
+Response includes the `job.id`.
+
+If using API keys (`ENABLE_API_KEYS=true`):
+
+```
+-H 'Authorization: Bearer <your_key>'
+```
+
+---
+
+## 4. Poll Job Status
+
+```
+JOB_ID=<uuid>
+watch -n2 curl -s http://localhost:3000/api/jobs/$JOB_ID | jq .
+```
+
+You will see `status` change to `processing`, progress values, then `done`.
+
+Events show lifecycle: `created`, `processing`, `source:ready`, periodic `progress`, `uploaded`, `done`.
+
+---
+
+## 5. Fetch the Result
+
+```
+curl http://localhost:3000/api/jobs/$JOB_ID/result | jq .
+```
+
+Grab the signed `video.url` and download:
+
+```
+curl -L "<signedUrl>" -o clip.mp4
+```
+
+Play it to verify.
+
+---
+
+## 6. Upload Source Workflow (Alternative)
+
+Instead of YouTube, first upload a file to storage (e.g. via Supabase client) at a key like:
+
+```
+sources/<uuid>/source.mp4
+```
+
+Then create job:
+
+```
+curl -X POST http://localhost:3000/api/jobs \
+ -H 'Content-Type: application/json' \
+ -d '{"sourceType":"upload","uploadKey":"sources/<uuid>/source.mp4","start":"00:00:05","end":"00:00:12"}'
+```
+
+---
+
+## 7. Subtitles (Future / When Enabled)
+
+Set `withSubtitles:true` and (optionally) `subtitleLang:"auto"`.
+Events will include `asr:requested` and later job status will gain `resultSrtKey`.
+If `burnSubtitles:true`, a burned variant will upload under `clip.subbed.mp4` (future path).
+
+---
+
+## 8. Troubleshooting
+
+| Symptom                 | Action                                                           |
+| ----------------------- | ---------------------------------------------------------------- |
+| `YTDLP_NOT_FOUND`       | Install `yt-dlp` or set `YTDLP_BIN` env path                     |
+| `INPUT_TOO_LARGE`       | Adjust `MAX_INPUT_MB` / download smaller format (`YTDLP_FORMAT`) |
+| Stuck at `queued`       | Ensure worker process running and queue connected (DATABASE_URL) |
+| `STORAGE_UPLOAD_FAILED` | Verify Supabase credentials & bucket; check object size limit    |
+| Wrong duration          | Re-encode fallback now auto-corrects; ensure ffmpeg in PATH      |
+
+View logs with `LOG_LEVEL=debug` for granular ffmpeg / yt-dlp details.
+
+---
+
+## 9. Cleaning Up
+
+Expired jobs removed by cleanup scripts (if scheduled). You can manually delete scratch dir:
+
+```
+rm -rf ${SCRATCH_DIR:-/tmp/ytc}/sources/*
+```
+
+---
+
+## 10. Extending
+
+-   Add new events → update API docs.
+-   Add metrics counters (use `metrics.observe` / `metrics.inc`).
+-   Implement WebSocket push for progress (subscribe clients instead of polling).
+
+---
+
+Happy clipping!
+````
+
+## File: docs/metrics.md
+````markdown
+# Metrics Reference
+
+Endpoint: `GET /metrics` returns a JSON snapshot (simple counters + observed distributions). Names below indicate intent.
+
+## Job Lifecycle
+
+-   jobs.created (counter) — Number of clip jobs created.
+-   jobs.enqueue_latency_ms (histogram/summary) — Latency from job creation to queue publish.
+-   jobs.status_fetch (counter) — Status endpoint hits.
+-   jobs.result_fetch (counter) — Result endpoint hits.
+
+## Cleanup
+
+-   cleanup.jobs.deleted (counter) — Expired clip jobs removed.
+-   cleanup.asrJobs.deleted (counter) — Expired ASR jobs removed.
+
+## Media IO (Download / Probe / Resolve)
+
+-   mediaio.download.bytes (counter) — Bytes streamed for uploaded media (labels include maybe source/type).
+-   mediaio.ytdlp.duration_ms (histogram) — Time spent running yt-dlp.
+-   mediaio.ffprobe.duration_ms (histogram) — Time spent running ffprobe.
+-   mediaio.resolve.duration_ms (histogram) — End-to-end resolve (download + probe) time.
+
+## Repository (Database) Operations
+
+-   repo.op.duration_ms (histogram) — Duration of repository operations; has label `op` (e.g., jobs.create, jobs.get, asrJobs.create, asrArtifacts.put)
+
+## Clip Worker
+
+-   clip.upload_ms (histogram) — Time to upload generated clip to storage.
+-   clip.total_ms (histogram) — Overall clip processing duration.
+-   clip.failures (counter) — Clip processing failures.
+
+## ASR Pipeline
+
+-   asr.duration_ms (histogram) — Time for ASR transcription per job.
+-   asr.completed (counter) — Successful ASR jobs.
+-   asr.failures (counter) — Failed ASR jobs.
+
+## Queue
+
+-   (From /metrics/queue) Implementation-specific fields (depth, active, etc.) produced by PgBoss adapter.
+
+## Usage Guidance
+
+Counters monotonically increase until process restart. Histograms/observations are aggregated in-memory; scrape interval should be frequent (`15s-60s`) for real-time dashboards.
+
+## Adding New Metrics
+
+Follow naming: `<domain>.<action>[_<unit>]` with `_ms` for millisecond durations, plural nouns for counts (e.g., `jobs.created`). Keep domain sets small & stable.
+````
+
+## File: docs/security.md
+````markdown
+# Security & Abuse Controls
+
+## API Key Authentication
+
+Enabled by setting `ENABLE_API_KEYS=true` in the environment. When enabled, all endpoints except `/healthz`, `/metrics`, and `/metrics/queue` require a valid API key.
+
+Send the key in either header:
+
+-   `Authorization: Bearer <token>`
+-   `X-API-Key: <token>`
+
+Tokens are issued via the `api_keys` table logic (`DrizzleApiKeysRepo.issue`). A token format: `ck_<uuid>_<secret>`. Only the hashed secret is stored (Bun.password hashing). On each request the token is unpacked, the secret verified, and the row's `last_used_at` updated. A small in-memory cache (5 min TTL) reduces verification DB hits.
+
+Disable keys by setting `ENABLE_API_KEYS=false` or revoking an individual key (sets `revoked=true`). Revoked keys immediately fail verification.
+
+## Rate Limiting
+
+Applied only to `POST /api/jobs`.
+
+Environment variables:
+
+-   `RATE_LIMIT_WINDOW_SEC` (default 60)
+-   `RATE_LIMIT_MAX` (default 30) requests per identity per window
+
+Identity is the API key ID when authenticated, otherwise the caller IP (from `X-Forwarded-For`, then `X-Real-IP`, fallback `ip:anon`). Exceeding the limit returns `429` with code `RATE_LIMITED`.
+
+Implementation: simple fixed window counters stored in-memory (Map). Suitable for single instance; in multi-instance deployments replace with a shared store (Redis) and a leaky bucket or sliding window algorithm.
+
+## SSRF Allowlist & Network Safeguards
+
+YouTube media resolution (`resolveYouTubeSource`) enforces multiple protections:
+
+1. Protocol must be `http` or `https`.
+2. Optional hostname allowlist via `ALLOWLIST_HOSTS` (comma separated). If set, any host not in the list is blocked.
+3. DNS resolution of the hostname; each resolved IP is checked and blocked if private, loopback, link-local, or otherwise non-public (basic IPv4 & IPv6 checks).
+4. DNS resolution failures are treated as blocked.
+
+Violations raise `SSRF_BLOCKED` errors. Unit tests in `src/data/tests/yt-youtube.unit.test.ts` cover these behaviors.
+
+## Future Hardening Ideas
+
+-   Persist rate limit counters in Redis for horizontal scale.
+-   Add per-IP + per-key burst token bucket to smooth spikes.
+-   Expire/rotate API keys automatically and enforce scopes (read vs write).
+-   Add HMAC signature option for payload integrity.
+
+## Operational Notes
+
+-   Ensure `Bun.password` is available (Bun runtime) for API key hashing.
+-   Keep `api_keys` table small by revoking unused keys periodically.
+-   Monitor `RATE_LIMITED` and `UNAUTHORIZED` counts via metrics (add instrumentation if needed).
 ````
 
 ## File: planning/asr/design.md
@@ -2924,49 +3194,6 @@ if (import.meta.main) {
 }
 ````
 
-## File: src/data/scripts/cleanup.ts
-````typescript
-import { cleanupExpiredJobs } from '../cleanup';
-import { createSupabaseStorageRepo } from '../storage';
-import { readEnv, readIntEnv } from '@clipper/common';
-import { createLogger } from '@clipper/common/logger';
-
-const DRY_RUN =
-    (readEnv('CLEANUP_DRY_RUN') ?? 'true').toLowerCase() !== 'false';
-const BATCH = readIntEnv('CLEANUP_BATCH_SIZE', 100) ?? 100;
-const RATE_DELAY = readIntEnv('CLEANUP_RATE_LIMIT_MS', 0) ?? 0;
-const USE_STORAGE =
-    (readEnv('CLEANUP_STORAGE') ?? 'true').toLowerCase() === 'true';
-
-async function main() {
-    const logger = createLogger((readEnv('LOG_LEVEL') as any) ?? 'info');
-    const storage = USE_STORAGE
-        ? (() => {
-              try {
-                  return createSupabaseStorageRepo();
-              } catch {
-                  return null;
-              }
-          })()
-        : null;
-    const res = await cleanupExpiredJobs({
-        dryRun: DRY_RUN,
-        batchSize: BATCH,
-        rateLimitDelayMs: RATE_DELAY,
-        storage,
-        logger,
-    });
-    logger.info('cleanup finished', res as any);
-}
-
-if (import.meta.main) {
-    main().catch((err) => {
-        console.error(err);
-        process.exit(1);
-    });
-}
-````
-
 ## File: src/data/scripts/seed.ts
 ````typescript
 import { createDb } from '../db/connection';
@@ -3644,6 +3871,222 @@ console.log("Hello via Bun!");
 }
 ````
 
+## File: docs/api-reference.md
+````markdown
+# Clipper API Reference
+
+Base URL: `http://localhost:3000` (override with `PORT`).
+If `ENABLE_API_KEYS=true`, include either `Authorization: Bearer <key>` or `x-api-key: <key>`.
+Send an optional `x-request-id` to correlate logs; returned as `correlationId`.
+
+---
+
+## Conventions
+
+-   Timecodes: `HH:MM:SS` or `HH:MM:SS.mmm` (milliseconds optional).
+-   All responses: JSON.
+-   Errors: unified envelope.
+
+### Error Envelope
+
+```
+{
+  "error": { "code": "STRING", "message": "Text", "correlationId": "id" }
+}
+```
+
+Common codes: `VALIDATION_FAILED`, `NOT_FOUND`, `NOT_READY`, `GONE`, `UNAUTHORIZED`, `RATE_LIMITED`, `INTERNAL`, plus worker surface codes like `YTDLP_*`, `INPUT_TOO_LARGE`, `STORAGE_UPLOAD_FAILED:*`, `CLIP_TIMEOUT`.
+
+---
+
+## Create Clip Job
+
+POST `/api/jobs`
+
+Create a clipping job from an uploaded source object or a YouTube URL.
+
+Request Body:
+
+```
+{
+  "sourceType": "upload" | "youtube",
+  "uploadKey": "sources/<id>/source.mp4",      // required when sourceType=upload
+  "youtubeUrl": "https://www.youtube.com/...", // required when sourceType=youtube
+  "start": "HH:MM:SS[.mmm]",                   // inclusive start
+  "end":   "HH:MM:SS[.mmm]",                   // exclusive end (> start)
+  "withSubtitles": false,                       // request ASR transcription
+  "burnSubtitles": false,                       // burn subtitles (if withSubtitles)
+  "subtitleLang": "auto" | "en" | <langCode>   // optional
+}
+```
+
+Constraints:
+
+-   `end - start <= MAX_CLIP_SECONDS` (env, default 120)
+-   YouTube URL must pass allowlist + SSRF checks
+-   File / source size & duration must satisfy `MAX_INPUT_MB`, `MAX_CLIP_INPUT_DURATION_SEC`
+
+200 Response:
+
+```
+{
+  "correlationId": "...",
+  "job": { "id": "uuid", "status": "queued", "progress": 0, "expiresAt": "ISO" }
+}
+```
+
+Errors: 400 `VALIDATION_FAILED` or `CLIP_TOO_LONG`; 401 `UNAUTHORIZED`; 429 `RATE_LIMITED`.
+
+---
+
+## Get Job Status
+
+GET `/api/jobs/{id}`
+
+200 Response:
+
+```
+{
+  "correlationId": "...",
+  "job": {
+    "id": "uuid",
+    "status": "queued" | "processing" | "done" | "failed",
+    "progress": 0-100,
+    "resultVideoKey": "results/<id>/clip.mp4"?,
+    "resultSrtKey": "results/<id>/clip.srt"?,
+    "expiresAt": "ISO"?
+  },
+  "events": [
+    { "ts": "ISO", "type": "created" },
+    { "ts": "ISO", "type": "processing" },
+    { "ts": "ISO", "type": "source:ready", "data": { "durationSec": 900.1 } },
+    { "ts": "ISO", "type": "progress", "data": { "pct": 42, "stage": "clip" } },
+    { "ts": "ISO", "type": "uploaded", "data": { "key": "results/<id>/clip.mp4" } },
+    { "ts": "ISO", "type": "asr:requested", "data": { "asrJobId": "..." } },
+    { "ts": "ISO", "type": "asr:error", "data": { "err": "..." } },
+    { "ts": "ISO", "type": "done" | "failed" }
+  ]
+}
+```
+
+Errors: 404 `NOT_FOUND`; 410 `GONE` (expired).
+
+---
+
+## Get Job Result
+
+GET `/api/jobs/{id}/result`
+
+200 Response (only when job done):
+
+```
+{
+  "correlationId": "...",
+  "result": {
+    "id": "uuid",
+    "video": { "key": "results/<id>/clip.mp4", "url": "signedUrl" },
+    "srt": { "key": "results/<id>/clip.srt", "url": "signedUrl" }?
+  }
+}
+```
+
+Errors: 404 `NOT_READY` (not done yet); 404 `NOT_FOUND`; 410 `GONE`; 500 `STORAGE_UNAVAILABLE`.
+
+---
+
+## Health
+
+GET `/healthz`
+
+```
+{ "ok": true, "queue": { ... }, "correlationId": "..." }
+```
+
+---
+
+## Metrics
+
+GET `/metrics` -> in‑memory metrics snapshot.
+GET `/metrics/queue` -> queue depth & timings.
+
+---
+
+## Events (Types)
+
+`created`, `processing`, `source:ready`, `progress`, `uploaded`, `asr:requested`, `asr:error`, `failed`, `done`.
+
+---
+
+## Lifecycle
+
+```
+queued -> processing -> (done | failed)
+```
+
+Heartbeats update `lastHeartbeatAt` internally.
+
+---
+
+## Storage Keys
+
+```
+results/{jobId}/clip.mp4
+results/{jobId}/clip.subbed.mp4 (future)
+results/{jobId}/clip.srt (ASR)
+```
+
+---
+
+## Worker Pass-through Error Codes
+
+`YTDLP_NOT_FOUND`, `YTDLP_TIMEOUT`, `YTDLP_DISABLED`, `YTDLP_FAILED:<n>`, `INPUT_TOO_LARGE`, `FFPROBE_FAILED`, `STORAGE_UPLOAD_FAILED:<msg>`, `CLIP_TIMEOUT`, `BAD_REQUEST` (ffmpeg failures).
+
+---
+
+## Core Environment Variables
+
+| Var                                                                | Description                   |
+| ------------------------------------------------------------------ | ----------------------------- | ---- | ---- | ----- |
+| PORT                                                               | API port (3000)               |
+| DATABASE_URL                                                       | Postgres (Drizzle + pg-boss)  |
+| SCRATCH_DIR                                                        | Temp space for sources/clips  |
+| SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY / SUPABASE_STORAGE_BUCKET | Storage config                |
+| ENABLE_YTDLP                                                       | Enable YouTube resolver       |
+| MAX_INPUT_MB                                                       | Max source size (MB)          |
+| MAX_CLIP_INPUT_DURATION_SEC                                        | Max source duration (s)       |
+| MAX_CLIP_SECONDS                                                   | Max requested clip length (s) |
+| SIGNED_URL_TTL_SEC                                                 | Signed URL lifetime           |
+| LOG_LEVEL                                                          | debug                         | info | warn | error |
+| ENABLE_API_KEYS                                                    | Require API keys              |
+| RATE_LIMIT_WINDOW_SEC / RATE_LIMIT_MAX                             | Rate limiting                 |
+| STORAGE_UPLOAD_ATTEMPTS                                            | Upload retry attempts         |
+| YTDLP_FORMAT / YTDLP_SECTIONS                                      | yt-dlp override/sections      |
+
+---
+
+## Curl Examples
+
+Create YouTube job:
+
+```
+curl -X POST http://localhost:3000/api/jobs \
+ -H 'Content-Type: application/json' \
+ -d '{"sourceType":"youtube","youtubeUrl":"https://www.youtube.com/watch?v=VIDEO","start":"00:01:00","end":"00:01:25","withSubtitles":false}'
+```
+
+Poll status:
+
+```
+curl http://localhost:3000/api/jobs/<jobId>
+```
+
+Fetch result:
+
+```
+curl http://localhost:3000/api/jobs/<jobId>/result
+```
+````
+
 ## File: planning/tasks.md
 ````markdown
 # Tasks
@@ -4057,110 +4500,53 @@ export function createDb(url = readEnv('DATABASE_URL')): DB {
 }
 ````
 
-## File: src/data/cleanup.ts
+## File: src/data/scripts/cleanup.ts
 ````typescript
-import { createDb } from './db/connection';
-import { jobs } from './db/schema';
-import { lte, isNotNull, and, eq, desc } from 'drizzle-orm';
-import type { StorageRepo } from './storage';
-import type { Logger } from '../common';
-import { createLogger, noopMetrics, type Metrics } from '../common';
+import { cleanupExpiredJobs, cleanupExpiredAsrJobs } from '../cleanup';
+import { createSupabaseStorageRepo } from '../storage';
+import { readEnv, readIntEnv } from '@clipper/common';
+import { createLogger } from '@clipper/common/logger';
 
-export type CleanupOptions = {
-    now?: Date;
-    batchSize?: number;
-    dryRun?: boolean;
-    rateLimitDelayMs?: number;
-    storage?: StorageRepo | null;
-    logger?: Logger;
-    metrics?: Metrics;
-};
+const DRY_RUN =
+    (readEnv('CLEANUP_DRY_RUN') ?? 'true').toLowerCase() !== 'false';
+const BATCH = readIntEnv('CLEANUP_BATCH_SIZE', 100) ?? 100;
+const RATE_DELAY = readIntEnv('CLEANUP_RATE_LIMIT_MS', 0) ?? 0;
+const USE_STORAGE =
+    (readEnv('CLEANUP_STORAGE') ?? 'true').toLowerCase() === 'true';
 
-export type CleanupItem = {
-    jobId: string;
-    resultKeys: string[];
-};
-
-export type CleanupResult = {
-    scanned: number;
-    deletedJobs: number;
-    deletedObjects: number;
-    items: CleanupItem[];
-    errors: Array<{ jobId: string; stage: 'storage' | 'db'; error: string }>;
-};
-
-export async function cleanupExpiredJobs(
-    opts: CleanupOptions = {}
-): Promise<CleanupResult> {
-    const db = createDb();
-    const now = opts.now ?? new Date();
-    const limit = opts.batchSize ?? 100;
-    const dryRun = opts.dryRun ?? true;
-    const delay = opts.rateLimitDelayMs ?? 0;
-    const storage = opts.storage ?? null;
-    const logger =
-        opts.logger ?? createLogger('info').with({ comp: 'cleanup' });
-    const metrics = opts.metrics ?? noopMetrics;
-
-    const rows = await db
-        .select()
-        .from(jobs)
-        .where(and(isNotNull(jobs.expiresAt), lte(jobs.expiresAt, now)))
-        .orderBy(desc(jobs.expiresAt))
-        .limit(limit);
-
-    const result: CleanupResult = {
-        scanned: rows.length,
-        deletedJobs: 0,
-        deletedObjects: 0,
-        items: [],
-        errors: [],
-    };
-
-    for (const r of rows) {
-        const jobId = r.id as string;
-        const keys = [r.resultVideoKey, r.resultSrtKey].filter(
-            (k): k is string => !!k
-        );
-        result.items.push({ jobId, resultKeys: keys });
-
-        if (dryRun) continue;
-
-        // remove storage objects if configured
-        if (storage) {
-            for (const key of keys) {
-                try {
-                    await storage.remove(key);
-                    result.deletedObjects++;
-                } catch (e) {
-                    const msg = e instanceof Error ? e.message : String(e);
-                    result.errors.push({ jobId, stage: 'storage', error: msg });
-                    logger?.warn('storage delete failed', { jobId, key, msg });
-                }
-                if (delay > 0) await sleep(delay);
-            }
-        }
-
-        // delete the job (cascades events)
-        try {
-            await db.delete(jobs).where(eq(jobs.id, jobId));
-            result.deletedJobs++;
-            metrics.inc('cleanup.jobs.deleted', 1);
-            logger.info('job deleted', { jobId });
-        } catch (e) {
-            const msg = e instanceof Error ? e.message : String(e);
-            result.errors.push({ jobId, stage: 'db', error: msg });
-            logger?.error('db delete failed', { jobId, msg });
-        }
-
-        if (delay > 0) await sleep(delay);
-    }
-
-    return result;
+async function main() {
+    const logger = createLogger((readEnv('LOG_LEVEL') as any) ?? 'info');
+    const storage = USE_STORAGE
+        ? (() => {
+              try {
+                  return createSupabaseStorageRepo();
+              } catch {
+                  return null;
+              }
+          })()
+        : null;
+    const clipRes = await cleanupExpiredJobs({
+        dryRun: DRY_RUN,
+        batchSize: BATCH,
+        rateLimitDelayMs: RATE_DELAY,
+        storage,
+        logger,
+    });
+    const asrRes = await cleanupExpiredAsrJobs({
+        dryRun: DRY_RUN,
+        batchSize: BATCH,
+        rateLimitDelayMs: RATE_DELAY,
+        storage,
+        logger,
+    });
+    logger.info('cleanup finished', { clip: clipRes, asr: asrRes } as any);
 }
 
-function sleep(ms: number) {
-    return new Promise((res) => setTimeout(res, ms));
+if (import.meta.main) {
+    main().catch((err) => {
+        console.error(err);
+        process.exit(1);
+    });
 }
 ````
 
@@ -4289,460 +4675,6 @@ export async function resolveUploadSource(
         sizeBytes: meta.sizeBytes,
     });
     return { localPath, cleanup, meta };
-}
-````
-
-## File: src/data/media-io-youtube.ts
-````typescript
-import {
-    readEnv,
-    readIntEnv,
-    createLogger,
-    noopMetrics,
-    type Metrics,
-} from '../common/index';
-import type { ResolveResult as SharedResolveResult } from './media-io';
-import { readdir } from 'node:fs/promises';
-import { lookup } from 'node:dns/promises';
-
-type ResolveJob = {
-    id: string;
-    sourceType: 'youtube';
-    sourceUrl: string; // required for youtube path
-};
-
-export type FfprobeMeta = {
-    durationSec: number;
-    sizeBytes: number;
-    container?: string;
-};
-
-export type YouTubeResolveResult = SharedResolveResult;
-
-function isPrivateIPv4(ip: string): boolean {
-    if (!/^[0-9.]+$/.test(ip)) return false;
-    const parts = ip.split('.').map((x) => Number(x));
-    if (parts.length !== 4) return false;
-    const a = parts[0]!;
-    const b = parts[1]!;
-    if (a === 10) return true; // 10.0.0.0/8
-    if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12
-    if (a === 192 && b === 168) return true; // 192.168.0.0/16
-    if (a === 127) return true; // 127.0.0.0/8 loopback
-    if (a === 169 && b === 254) return true; // 169.254.0.0/16 link-local
-    if (a === 0) return true; // 0.0.0.0/8
-    return false;
-}
-
-function isPrivateIPv6(ip: string): boolean {
-    // very coarse checks
-    const v = ip.toLowerCase();
-    if (v === '::1') return true; // loopback
-    if (v.startsWith('fc') || v.startsWith('fd')) return true; // ULA fc00::/7
-    if (v.startsWith('fe80:')) return true; // link-local fe80::/10
-    if (v === '::' || v === '::0') return true; // unspecified
-    return false;
-}
-
-async function assertSafeUrl(rawUrl: string) {
-    let u: URL;
-    try {
-        u = new URL(rawUrl);
-    } catch {
-        throw new Error('SSRF_BLOCKED');
-    }
-    if (!/^https?:$/.test(u.protocol)) throw new Error('SSRF_BLOCKED');
-    const allowlist = (readEnv('ALLOWLIST_HOSTS') ?? '')
-        .split(',')
-        .map((s) => s.trim())
-        .filter(Boolean);
-    if (allowlist.length > 0 && !allowlist.includes(u.hostname)) {
-        throw new Error('SSRF_BLOCKED');
-    }
-    // Resolve host to IPs and block private/link-local
-    try {
-        const res = await lookup(u.hostname, { all: true });
-        for (const { address, family } of res) {
-            if (
-                (family === 4 && isPrivateIPv4(address)) ||
-                (family === 6 && isPrivateIPv6(address))
-            )
-                throw new Error('SSRF_BLOCKED');
-        }
-    } catch (e) {
-        // If DNS fails, treat as blocked to be safe
-        throw new Error('SSRF_BLOCKED');
-    }
-}
-
-async function ffprobe(localPath: string): Promise<FfprobeMeta> {
-    const args = [
-        '-v',
-        'error',
-        '-print_format',
-        'json',
-        '-show_format',
-        '-show_streams',
-        localPath,
-    ];
-    const proc = Bun.spawn(['ffprobe', ...args], {
-        stdout: 'pipe',
-        stderr: 'pipe',
-    });
-    const stdout = await new Response(proc.stdout).text();
-    const exit = await proc.exited;
-    if (exit !== 0) throw new Error('FFPROBE_FAILED');
-    const json = JSON.parse(stdout);
-    const durationSec = json?.format?.duration
-        ? Number(json.format.duration)
-        : 0;
-    const sizeBytes = json?.format?.size
-        ? Number(json.format.size)
-        : Bun.file(localPath).size;
-    const container = json?.format?.format_name as string | undefined;
-    return { durationSec, sizeBytes, container };
-}
-
-async function findDownloadedFile(baseDir: string): Promise<string | null> {
-    const files = await readdir(baseDir).catch(() => []);
-    const candidates = files.filter((f) => f.startsWith('source.'));
-    if (candidates.length === 0) return null;
-    // Prefer mp4 if present
-    const mp4 = candidates.find((f) => f.endsWith('.mp4'));
-    const chosen = mp4 ?? candidates[0];
-    return `${baseDir}/${chosen}`;
-}
-
-export async function resolveYouTubeSource(
-    job: ResolveJob,
-    deps: { metrics?: Metrics } = {}
-): Promise<YouTubeResolveResult> {
-    const logger = createLogger((readEnv('LOG_LEVEL') as any) ?? 'info').with({
-        comp: 'mediaio',
-        jobId: job.id,
-    });
-    const metrics = deps.metrics ?? noopMetrics;
-
-    const SCRATCH_DIR = readEnv('SCRATCH_DIR') ?? '/tmp/ytc';
-    const MAX_MB = readIntEnv('MAX_INPUT_MB', 1024)!;
-    const MAX_DUR = readIntEnv('MAX_CLIP_INPUT_DURATION_SEC', 7200)!;
-    const ENABLE = (readEnv('ENABLE_YTDLP') ?? 'false') === 'true';
-
-    const baseDir = `${SCRATCH_DIR.replace(/\/$/, '')}/sources/${job.id}`;
-    const outTemplate = `${baseDir}/source.%(ext)s`;
-
-    const resolveStart = Date.now();
-    logger.info('resolving youtube to local path');
-
-    if (!ENABLE) {
-        logger.warn('yt-dlp disabled, rejecting request');
-        throw new Error('YTDLP_DISABLED');
-    }
-
-    await assertSafeUrl(job.sourceUrl);
-
-    {
-        const p = Bun.spawn(['mkdir', '-p', baseDir]);
-        const code = await p.exited;
-        if (code !== 0) throw new Error('MKDIR_FAILED');
-    }
-
-    // Run yt-dlp
-    const ytdlpArgs = [
-        '-f',
-        'bv*+ba/b',
-        '-o',
-        outTemplate,
-        '--quiet',
-        '--no-progress',
-        '--no-cache-dir',
-        '--no-part',
-        '--retries',
-        '3',
-    ];
-    if (MAX_MB && MAX_MB > 0) {
-        ytdlpArgs.push('--max-filesize', `${MAX_MB}m`);
-    }
-    ytdlpArgs.push(job.sourceUrl);
-
-    const ytdlpStart = Date.now();
-    const proc = Bun.spawn(['yt-dlp', ...ytdlpArgs], {
-        stdout: 'pipe',
-        stderr: 'pipe',
-        env: {}, // minimal env to avoid secret leaks
-    });
-    const timeoutMs = Math.min(MAX_DUR * 1000, 15 * 60 * 1000); // cap timeout to 15min
-    let timedOut = false;
-    const timeout = setTimeout(() => {
-        try {
-            proc.kill('SIGKILL');
-            timedOut = true;
-        } catch {}
-    }, timeoutMs);
-
-    const exitCode = await proc.exited;
-    clearTimeout(timeout);
-    metrics.observe('mediaio.ytdlp.duration_ms', Date.now() - ytdlpStart, {
-        jobId: job.id,
-    });
-
-    if (timedOut) {
-        // cleanup and throw
-        const p = Bun.spawn(['rm', '-rf', baseDir]);
-        await p.exited;
-        throw new Error('YTDLP_TIMEOUT');
-    }
-    if (exitCode !== 0) {
-        const p = Bun.spawn(['rm', '-rf', baseDir]);
-        await p.exited;
-        throw new Error('YTDLP_FAILED');
-    }
-
-    const localPath = await findDownloadedFile(baseDir);
-    if (!localPath) {
-        const p = Bun.spawn(['rm', '-rf', baseDir]);
-        await p.exited;
-        throw new Error('YTDLP_FAILED');
-    }
-
-    // ffprobe validation
-    const ffStart = Date.now();
-    const meta = await ffprobe(localPath);
-    metrics.observe('mediaio.ffprobe.duration_ms', Date.now() - ffStart, {
-        jobId: job.id,
-    });
-
-    if (meta.durationSec > MAX_DUR || meta.sizeBytes > MAX_MB * 1024 * 1024) {
-        const p = Bun.spawn(['rm', '-rf', baseDir]);
-        await p.exited;
-        throw new Error('INPUT_TOO_LARGE');
-    }
-
-    const cleanup = async () => {
-        const p = Bun.spawn(['rm', '-rf', baseDir]);
-        await p.exited;
-    };
-
-    const totalMs = Date.now() - resolveStart;
-    metrics.observe('mediaio.resolve.duration_ms', totalMs, {
-        jobId: job.id,
-    });
-    logger.info('youtube resolved', {
-        durationSec: meta.durationSec,
-        sizeBytes: meta.sizeBytes,
-        durationMs: totalMs,
-    });
-
-    return { localPath, cleanup, meta };
-}
-````
-
-## File: src/ffmpeg/clipper.ts
-````typescript
-/**
- * BunClipper: performs a two-phase FFmpeg clipping strategy
- * 1) Fast path: stream copy (-c copy)
- * 2) Fallback: re-encode (libx264 + aac)
- * Exposes an AsyncIterable progress$ (0..100) for the successful attempt.
- */
-import type { ClipArgs, ClipResult, Clipper } from './types';
-import { parseFfmpegProgress } from './progress';
-import { createLogger, readEnv } from '@clipper/common';
-import { mkdir } from 'node:fs/promises';
-import { ServiceError } from '@clipper/common/errors';
-
-const log = createLogger((readEnv('LOG_LEVEL') as any) || 'info').with({
-    mod: 'ffmpeg',
-});
-
-// Format seconds into HH:MM:SS.mmm (zero padded)
-function fmtTs(sec: number): string {
-    const sign = sec < 0 ? '-' : '';
-    const s = Math.abs(sec);
-    const hh = Math.floor(s / 3600)
-        .toString()
-        .padStart(2, '0');
-    const mm = Math.floor((s % 3600) / 60)
-        .toString()
-        .padStart(2, '0');
-    const ss = Math.floor(s % 60)
-        .toString()
-        .padStart(2, '0');
-    const ms = Math.round((s - Math.floor(s)) * 1000)
-        .toString()
-        .padStart(3, '0');
-    return `${sign}${hh}:${mm}:${ss}.${ms}`;
-}
-
-interface AttemptResult {
-    ok: boolean;
-    code: number;
-    stderrSnippet?: string;
-}
-
-/**
- * BunClipper implements the Clipper interface using a two-phase strategy:
- * 1. Attempt a fast stream copy (no re-encode) for speed when keyframes align.
- * 2. On failure, fallback to a re-encode ensuring playable, accurate output.
- *
- * Progress semantics:
- * - Each attempt produces its own progress stream.
- * - For a successful copy attempt, the progress stream usually completes quickly.
- * - If fallback is required, only the fallback attempt's progress is exposed.
- */
-export class BunClipper implements Clipper {
-    constructor(private readonly opts: { scratchDir?: string } = {}) {}
-
-    async clip(args: ClipArgs): Promise<ClipResult> {
-        // Input validation
-        if (args.startSec < 0 || args.endSec < 0) {
-            throw new ServiceError(
-                'VALIDATION_FAILED',
-                'start/end must be >= 0'
-            );
-        }
-        if (args.endSec <= args.startSec) {
-            throw new ServiceError(
-                'VALIDATION_FAILED',
-                'endSec must be > startSec'
-            );
-        }
-        const srcFile = Bun.file(args.input);
-        // Bun.file(...).size will throw if not exists; so optionally check via try/catch
-        let fileExists = false;
-        try {
-            // @ts-ignore size triggers stat
-            await srcFile.arrayBuffer(); // minimal read (will allocate). If large file this is heavy; prefer stat when Bun exposes. For now just check existence via stream open.
-            fileExists = true;
-        } catch {
-            fileExists = false;
-        }
-        if (!fileExists) {
-            throw new ServiceError(
-                'VALIDATION_FAILED',
-                'input file does not exist'
-            );
-        }
-
-        const scratchBase =
-            this.opts.scratchDir || readEnv('SCRATCH_DIR') || '/tmp/ytc';
-        const outDir = `${scratchBase}/${args.jobId}`;
-        const outPath = `${outDir}/clip.mp4`;
-        await mkdir(outDir, { recursive: true });
-
-        const totalDuration = args.endSec - args.startSec;
-        const startTs = fmtTs(args.startSec);
-        // ffmpeg -ss <start> -i input -to <end> where -ss before -i is fast seek; -to uses absolute timeline
-        const endTs = fmtTs(args.endSec);
-
-        const attempt = async (
-            mode: 'copy' | 'reencode'
-        ): Promise<{
-            attempt: AttemptResult;
-            progress$?: AsyncIterable<number>;
-        }> => {
-            const common = [
-                '-hide_banner',
-                '-y',
-                '-progress',
-                'pipe:1',
-                '-ss',
-                startTs,
-                '-i',
-                args.input,
-                '-to',
-                endTs,
-                '-movflags',
-                '+faststart',
-            ];
-            const modeArgs =
-                mode === 'copy'
-                    ? ['-c', 'copy']
-                    : [
-                          '-c:v',
-                          'libx264',
-                          '-preset',
-                          'veryfast',
-                          '-c:a',
-                          'aac',
-                          '-profile:v',
-                          'high',
-                          '-pix_fmt',
-                          'yuv420p',
-                      ];
-            const full = ['ffmpeg', ...common, ...modeArgs, outPath];
-            const started = performance.now();
-            log.debug('ffmpeg attempt start', {
-                jobId: args.jobId,
-                mode,
-                full,
-            });
-            const proc = Bun.spawn(full, { stdout: 'pipe', stderr: 'pipe' });
-            const stderrChunks: Uint8Array[] = [];
-            const maxErrBytes = 4096;
-            (async () => {
-                if (!proc.stderr) return;
-                for await (const chunk of proc.stderr) {
-                    if (
-                        stderrChunks.reduce((a, c) => a + c.byteLength, 0) <
-                        maxErrBytes
-                    ) {
-                        stderrChunks.push(chunk);
-                    }
-                }
-            })();
-            const progress$ = proc.stdout
-                ? parseFfmpegProgress(proc.stdout, totalDuration)
-                : (async function* () {
-                      yield 100;
-                  })();
-            const exitCode = await proc.exited;
-            const durMs = Math.round(performance.now() - started);
-            const attemptRes: AttemptResult = {
-                ok: exitCode === 0,
-                code: exitCode,
-                stderrSnippet: !stderrChunks.length
-                    ? undefined
-                    : new TextDecoder().decode(
-                          stderrChunks.reduce(
-                              (acc, c) =>
-                                  new Uint8Array([
-                                      ...acc,
-                                      ...new Uint8Array(c),
-                                  ]),
-                              new Uint8Array()
-                          )
-                      ),
-            };
-            log.debug('ffmpeg attempt done', {
-                jobId: args.jobId,
-                mode,
-                code: exitCode,
-                ms: durMs,
-            });
-            return { attempt: attemptRes, progress$ };
-        };
-
-        // Fast path attempt
-        const copyResult = await attempt('copy');
-        if (copyResult.attempt.ok) {
-            // Provide progress$ from copy attempt (already consumed until exit). For copy success, progress$ has already completed.
-            return { localPath: outPath, progress$: copyResult.progress$! };
-        }
-
-        // Fallback (fresh progress stream)
-        log.info('stream copy failed; falling back to re-encode', {
-            jobId: args.jobId,
-            code: copyResult.attempt.code,
-        });
-        const reResult = await attempt('reencode');
-        if (reResult.attempt.ok) {
-            return { localPath: outPath, progress$: reResult.progress$! };
-        }
-        // Both failed
-        const msg = `ffmpeg failed (copy code=${copyResult.attempt.code}, reencode code=${reResult.attempt.code})`;
-        throw new ServiceError('BAD_REQUEST', msg); // using existing code enum; adjust if more codes added later
-    }
 }
 ````
 
@@ -5193,336 +5125,6 @@ This document breaks down the work required to implement the FFmpeg Service (Cli
     -   [x] Update the main `README.md` or other relevant docs if necessary to mention that `ffmpeg` is now a required dependency.
 ````
 
-## File: src/api/index.ts
-````typescript
-import { Elysia } from 'elysia';
-import cors from '@elysiajs/cors';
-import { Schemas, type CreateJobInputType } from '@clipper/contracts';
-import {
-    createLogger,
-    readEnv,
-    readIntEnv,
-    requireEnv,
-    fromException,
-} from '@clipper/common';
-import {
-    DrizzleJobsRepo,
-    DrizzleJobEventsRepo,
-    createDb,
-    createSupabaseStorageRepo,
-} from '@clipper/data';
-import { InMemoryMetrics } from '@clipper/common/metrics';
-import { PgBossQueueAdapter } from '@clipper/queue';
-
-const metrics = new InMemoryMetrics();
-const log = createLogger((readEnv('LOG_LEVEL') as any) || 'info').with({
-    mod: 'api',
-});
-
-function buildDeps() {
-    let queue: any;
-    try {
-        const cs = requireEnv('DATABASE_URL');
-        queue = new PgBossQueueAdapter({ connectionString: cs });
-        queue.start?.();
-    } catch {
-        queue = {
-            publish: async () => {},
-            publishTo: async () => {},
-            health: async () => ({ ok: true }),
-            getMetrics: () => ({}),
-        };
-    }
-    const db = createDb();
-    const jobsRepo = new DrizzleJobsRepo(db);
-    const eventsRepo = new DrizzleJobEventsRepo(db);
-    const storage = (() => {
-        try {
-            return createSupabaseStorageRepo();
-        } catch (e) {
-            log.warn('storage init failed (signing disabled)', {
-                error: String(e),
-            });
-            return null as any;
-        }
-    })();
-    return { queue, jobsRepo, eventsRepo, storage };
-}
-const { queue, jobsRepo, eventsRepo, storage } = buildDeps();
-
-function tcToSec(tc: string) {
-    const [hh, mm, rest] = tc.split(':');
-    const [ss, ms] = rest?.split('.') || [rest || '0', undefined];
-    return (
-        Number(hh) * 3600 +
-        Number(mm) * 60 +
-        Number(ss) +
-        (ms ? Number(`0.${ms}`) : 0)
-    );
-}
-
-// Simple correlation id + uniform error envelope middleware
-interface ApiErrorEnvelope {
-    error: { code: string; message: string; correlationId: string };
-}
-function buildError(
-    set: any,
-    code: number,
-    errCode: string,
-    message: string,
-    correlationId: string
-): ApiErrorEnvelope {
-    set.status = code;
-    return { error: { code: errCode, message, correlationId } };
-}
-
-export const app = new Elysia()
-    .use(cors())
-    .onRequest(({ request, store }) => {
-        const cid = request.headers.get('x-request-id') || crypto.randomUUID();
-        (store as any).correlationId = cid;
-    })
-    .state('correlationId', '')
-    .get('/healthz', async ({ store }) => {
-        const h = await queue.health();
-        return {
-            ok: h.ok,
-            queue: h,
-            correlationId: (store as any).correlationId,
-        };
-    })
-    .get('/metrics/queue', ({ store }) => ({
-        metrics: queue.getMetrics(),
-        correlationId: (store as any).correlationId,
-    }))
-    .get('/metrics', () => {
-        const snap = metrics.snapshot();
-        return snap;
-    })
-    .post('/api/jobs', async ({ body, set, store }) => {
-        const correlationId = (store as any).correlationId;
-        try {
-            const parsed = Schemas.CreateJobInput.safeParse(body);
-            if (!parsed.success) {
-                return buildError(
-                    set,
-                    400,
-                    'VALIDATION_FAILED',
-                    parsed.error.message,
-                    correlationId
-                );
-            }
-            const input = parsed.data as CreateJobInputType;
-            const id = crypto.randomUUID();
-            const startSec = tcToSec(input.start);
-            const endSec = tcToSec(input.end);
-            if (
-                endSec - startSec >
-                Number(readIntEnv('MAX_CLIP_SECONDS', 120))
-            ) {
-                return buildError(
-                    set,
-                    400,
-                    'CLIP_TOO_LONG',
-                    'Clip exceeds MAX_CLIP_SECONDS',
-                    correlationId
-                );
-            }
-            const retentionHours = Number(readIntEnv('RETENTION_HOURS', 72));
-            const expiresAt = new Date(Date.now() + retentionHours * 3600_000);
-            const row = await jobsRepo.create({
-                id,
-                status: 'queued',
-                progress: 0,
-                sourceType: input.sourceType,
-                sourceKey: input.uploadKey,
-                sourceUrl: input.youtubeUrl,
-                startSec,
-                endSec,
-                withSubtitles: input.withSubtitles,
-                burnSubtitles: input.burnSubtitles,
-                subtitleLang: input.subtitleLang,
-                resultVideoKey: undefined,
-                resultSrtKey: undefined,
-                errorCode: undefined,
-                errorMessage: undefined,
-                expiresAt: expiresAt.toISOString(),
-            });
-            await eventsRepo.add({
-                jobId: id,
-                ts: new Date().toISOString(),
-                type: 'created',
-            });
-            const publishedAt = Date.now();
-            await queue.publish({ jobId: id, priority: 'normal' });
-            metrics.inc('jobs.created');
-            metrics.observe(
-                'jobs.enqueue_latency_ms',
-                Date.now() - publishedAt
-            );
-            log.info('job enqueued', { jobId: id, correlationId });
-            return {
-                correlationId,
-                job: {
-                    id: row.id,
-                    status: row.status,
-                    progress: row.progress,
-                    expiresAt: expiresAt.toISOString(),
-                },
-            };
-        } catch (e) {
-            const err = fromException(e, correlationId);
-            return buildError(
-                set,
-                500,
-                err.error.code,
-                err.error.message,
-                correlationId
-            );
-        }
-    })
-    .get('/api/jobs/:id', async ({ params, set, store }) => {
-        const correlationId = (store as any).correlationId;
-        const { id } = params as any;
-        try {
-            const job = await jobsRepo.get(id);
-            if (!job) {
-                return buildError(
-                    set,
-                    404,
-                    'NOT_FOUND',
-                    'Job not found',
-                    correlationId
-                );
-            }
-            if (job.expiresAt && new Date(job.expiresAt) < new Date()) {
-                return buildError(
-                    set,
-                    410,
-                    'GONE',
-                    'Job expired',
-                    correlationId
-                );
-            }
-            // recent events (last 10)
-            const ev =
-                (await (eventsRepo as any).listRecent?.(job.id, 10)) ||
-                (await (eventsRepo as any).list(job.id, 10, 0));
-            metrics.inc('jobs.status_fetch');
-            return {
-                correlationId,
-                job: {
-                    id: job.id,
-                    status: job.status,
-                    progress: job.progress,
-                    resultVideoKey: job.resultVideoKey ?? undefined,
-                    resultSrtKey: job.resultSrtKey ?? undefined,
-                    expiresAt: job.expiresAt ?? undefined,
-                },
-                events: ev.map((e: any) => ({
-                    ts: e.ts,
-                    type: e.type,
-                    data: e.data,
-                })),
-            };
-        } catch (e) {
-            const err = fromException(e, correlationId);
-            return buildError(
-                set,
-                500,
-                err.error.code,
-                err.error.message,
-                correlationId
-            );
-        }
-    })
-    .get('/api/jobs/:id/result', async ({ params, set, store }) => {
-        const correlationId = (store as any).correlationId;
-        const { id } = params as any;
-        try {
-            const job = await jobsRepo.get(id);
-            if (!job) {
-                return buildError(
-                    set,
-                    404,
-                    'NOT_FOUND',
-                    'Job not found',
-                    correlationId
-                );
-            }
-            if (job.expiresAt && new Date(job.expiresAt) < new Date()) {
-                return buildError(
-                    set,
-                    410,
-                    'GONE',
-                    'Job expired',
-                    correlationId
-                );
-            }
-            if (!job.resultVideoKey || job.status !== 'done') {
-                return buildError(
-                    set,
-                    404,
-                    'NOT_READY',
-                    'Result not available yet',
-                    correlationId
-                );
-            }
-            if (!storage) {
-                return buildError(
-                    set,
-                    500,
-                    'STORAGE_UNAVAILABLE',
-                    'Storage not configured',
-                    correlationId
-                );
-            }
-            const videoUrl = await storage.sign(job.resultVideoKey);
-            let srtUrl: string | undefined;
-            if (job.resultSrtKey) {
-                try {
-                    srtUrl = await storage.sign(job.resultSrtKey);
-                } catch {}
-            }
-            metrics.inc('jobs.result_fetch');
-            return {
-                correlationId,
-                result: {
-                    id: job.id,
-                    video: { key: job.resultVideoKey, url: videoUrl },
-                    srt:
-                        job.resultSrtKey && srtUrl
-                            ? { key: job.resultSrtKey, url: srtUrl }
-                            : undefined,
-                },
-            };
-        } catch (e) {
-            const err = fromException(e, correlationId);
-            return buildError(
-                set,
-                500,
-                err.error.code,
-                err.error.message,
-                correlationId
-            );
-        }
-    });
-
-if (import.meta.main) {
-    const port = Number(readIntEnv('PORT', 3000));
-    const server = Bun.serve({ fetch: app.fetch, port });
-    log.info('API started', { port });
-    const stop = async () => {
-        log.info('API stopping');
-        server.stop(true);
-        await queue.shutdown();
-        process.exit(0);
-    };
-    process.on('SIGINT', stop);
-    process.on('SIGTERM', stop);
-}
-````
-
 ## File: src/data/db/schema.ts
 ````typescript
 import {
@@ -5671,6 +5273,745 @@ export type AsrJob = typeof asrJobs.$inferSelect;
 export type NewAsrJob = typeof asrJobs.$inferInsert;
 export type AsrArtifact = typeof asrArtifacts.$inferSelect;
 export type NewAsrArtifact = typeof asrArtifacts.$inferInsert;
+````
+
+## File: src/data/cleanup.ts
+````typescript
+import { createDb } from './db/connection';
+import { jobs, asrJobs, asrArtifacts } from './db/schema';
+import { lte, isNotNull, and, eq, desc } from 'drizzle-orm';
+import type { StorageRepo } from './storage';
+import type { Logger } from '../common';
+import { createLogger, noopMetrics, type Metrics } from '../common';
+
+export type CleanupOptions = {
+    now?: Date;
+    batchSize?: number;
+    dryRun?: boolean;
+    rateLimitDelayMs?: number;
+    storage?: StorageRepo | null;
+    logger?: Logger;
+    metrics?: Metrics;
+};
+
+export type CleanupItem = {
+    jobId: string;
+    resultKeys: string[];
+};
+
+export type CleanupResult = {
+    scanned: number;
+    deletedJobs: number;
+    deletedObjects: number;
+    items: CleanupItem[];
+    errors: Array<{ jobId: string; stage: 'storage' | 'db'; error: string }>;
+};
+
+export async function cleanupExpiredJobs(
+    opts: CleanupOptions = {}
+): Promise<CleanupResult> {
+    const db = createDb();
+    const now = opts.now ?? new Date();
+    const limit = opts.batchSize ?? 100;
+    const dryRun = opts.dryRun ?? true;
+    const delay = opts.rateLimitDelayMs ?? 0;
+    const storage = opts.storage ?? null;
+    const logger =
+        opts.logger ?? createLogger('info').with({ comp: 'cleanup' });
+    const metrics = opts.metrics ?? noopMetrics;
+
+    const rows = await db
+        .select()
+        .from(jobs)
+        .where(and(isNotNull(jobs.expiresAt), lte(jobs.expiresAt, now)))
+        .orderBy(desc(jobs.expiresAt))
+        .limit(limit);
+
+    const result: CleanupResult = {
+        scanned: rows.length,
+        deletedJobs: 0,
+        deletedObjects: 0,
+        items: [],
+        errors: [],
+    };
+
+    for (const r of rows) {
+        const jobId = r.id as string;
+        const keys = [r.resultVideoKey, r.resultSrtKey].filter(
+            (k): k is string => !!k
+        );
+        result.items.push({ jobId, resultKeys: keys });
+
+        if (dryRun) continue;
+
+        // remove storage objects if configured
+        if (storage) {
+            for (const key of keys) {
+                try {
+                    await storage.remove(key);
+                    result.deletedObjects++;
+                } catch (e) {
+                    const msg = e instanceof Error ? e.message : String(e);
+                    result.errors.push({ jobId, stage: 'storage', error: msg });
+                    logger?.warn('storage delete failed', { jobId, key, msg });
+                }
+                if (delay > 0) await sleep(delay);
+            }
+        }
+
+        // delete the job (cascades events)
+        try {
+            await db.delete(jobs).where(eq(jobs.id, jobId));
+            result.deletedJobs++;
+            metrics.inc('cleanup.jobs.deleted', 1);
+            logger.info('job deleted', { jobId });
+        } catch (e) {
+            const msg = e instanceof Error ? e.message : String(e);
+            result.errors.push({ jobId, stage: 'db', error: msg });
+            logger?.error('db delete failed', { jobId, msg });
+        }
+
+        if (delay > 0) await sleep(delay);
+    }
+
+    return result;
+}
+
+// --- ASR Cleanup -----------------------------------------------------------
+
+export type AsrCleanupItem = {
+    asrJobId: string;
+    artifactKeys: string[];
+};
+
+export type AsrCleanupResult = {
+    scanned: number; // expired ASR jobs found
+    deletedAsrJobs: number;
+    deletedArtifacts: number; // storage objects removed
+    items: AsrCleanupItem[];
+    errors: Array<{
+        asrJobId: string;
+        stage: 'storage' | 'db';
+        error: string;
+    }>;
+};
+
+export async function cleanupExpiredAsrJobs(
+    opts: CleanupOptions = {}
+): Promise<AsrCleanupResult> {
+    const db = createDb();
+    const now = opts.now ?? new Date();
+    const limit = opts.batchSize ?? 100;
+    const dryRun = opts.dryRun ?? true;
+    const delay = opts.rateLimitDelayMs ?? 0;
+    const storage = opts.storage ?? null;
+    const logger =
+        opts.logger ?? createLogger('info').with({ comp: 'cleanup.asr' });
+    const metrics = opts.metrics ?? noopMetrics;
+
+    // Fetch expired ASR jobs
+    const rows = await db
+        .select()
+        .from(asrJobs)
+        .where(and(isNotNull(asrJobs.expiresAt), lte(asrJobs.expiresAt, now)))
+        .orderBy(desc(asrJobs.expiresAt))
+        .limit(limit);
+
+    const result: AsrCleanupResult = {
+        scanned: rows.length,
+        deletedAsrJobs: 0,
+        deletedArtifacts: 0,
+        items: [],
+        errors: [],
+    };
+
+    for (const r of rows) {
+        const asrJobId = r.id as string;
+        // Load artifacts for storage keys
+        let artifactsRows: Array<{ storageKey: string | null }> = [];
+        try {
+            artifactsRows = await db
+                .select({ storageKey: asrArtifacts.storageKey })
+                .from(asrArtifacts)
+                .where(eq(asrArtifacts.asrJobId, asrJobId));
+        } catch (e) {
+            // Non-fatal; proceed with empty list
+            logger.warn('artifact list failed', { asrJobId });
+        }
+        const artifactKeys = artifactsRows
+            .map((a) => a.storageKey)
+            .filter((k): k is string => !!k);
+        result.items.push({ asrJobId, artifactKeys });
+
+        if (dryRun) continue;
+
+        if (storage) {
+            for (const key of artifactKeys) {
+                try {
+                    await storage.remove(key);
+                    result.deletedArtifacts++;
+                } catch (e) {
+                    const msg = e instanceof Error ? e.message : String(e);
+                    result.errors.push({
+                        asrJobId,
+                        stage: 'storage',
+                        error: msg,
+                    });
+                    logger.warn('artifact delete failed', {
+                        asrJobId,
+                        key,
+                        msg,
+                    });
+                }
+                if (delay > 0) await sleep(delay);
+            }
+        }
+
+        // Delete ASR job (cascades artifacts table rows)
+        try {
+            await db.delete(asrJobs).where(eq(asrJobs.id, asrJobId));
+            result.deletedAsrJobs++;
+            metrics.inc('cleanup.asrJobs.deleted', 1);
+            logger.info('asr job deleted', { asrJobId });
+        } catch (e) {
+            const msg = e instanceof Error ? e.message : String(e);
+            result.errors.push({
+                asrJobId,
+                stage: 'db',
+                error: msg,
+            });
+            logger.error('asr db delete failed', { asrJobId, msg });
+        }
+        if (delay > 0) await sleep(delay);
+    }
+    return result;
+}
+
+function sleep(ms: number) {
+    return new Promise((res) => setTimeout(res, ms));
+}
+````
+
+## File: src/data/media-io-youtube.ts
+````typescript
+// Clean YouTube resolver (yt-dlp) with SSRF protections, binary fallback & debug logging
+import {
+    readEnv,
+    readIntEnv,
+    createLogger,
+    noopMetrics,
+    type Metrics,
+} from '../common/index';
+import type { ResolveResult as SharedResolveResult } from './media-io';
+import { readdir } from 'node:fs/promises';
+import { lookup } from 'node:dns/promises';
+
+export type ResolveJob = {
+    id: string;
+    sourceType: 'youtube';
+    sourceUrl: string;
+};
+export type FfprobeMeta = {
+    durationSec: number;
+    sizeBytes: number;
+    container?: string;
+};
+export type YouTubeResolveResult = SharedResolveResult;
+
+function isPrivateIPv4(ip: string): boolean {
+    if (!/^[0-9.]+$/.test(ip)) return false;
+    const parts = ip.split('.').map(Number);
+    if (parts.length !== 4) return false;
+    const a = parts[0];
+    const b = parts[1];
+    return !!(
+        a === 10 ||
+        (a === 172 && b !== undefined && b >= 16 && b <= 31) ||
+        (a === 192 && b === 168) ||
+        a === 127 ||
+        (a === 169 && b === 254) ||
+        a === 0
+    );
+}
+function isPrivateIPv6(ip: string): boolean {
+    const v = ip.toLowerCase();
+    return (
+        v === '::1' ||
+        v.startsWith('fc') ||
+        v.startsWith('fd') ||
+        v.startsWith('fe80:') ||
+        v === '::' ||
+        v === '::0'
+    );
+}
+
+async function assertSafeUrl(raw: string) {
+    let u: URL;
+    try {
+        u = new URL(raw);
+    } catch {
+        throw new Error('SSRF_BLOCKED');
+    }
+    if (!/^https?:$/.test(u.protocol)) throw new Error('SSRF_BLOCKED');
+    const allow = (readEnv('ALLOWLIST_HOSTS') || '')
+        .split(',')
+        .map((s) => s.trim().toLowerCase())
+        .filter(Boolean);
+    if (allow.length) {
+        const host = u.hostname.toLowerCase();
+        if (!allow.some((h) => host === h || host.endsWith(`.${h}`)))
+            throw new Error('SSRF_BLOCKED');
+    }
+    try {
+        const res = await lookup(u.hostname, { all: true });
+        for (const { address, family } of res) {
+            if (
+                (family === 4 && isPrivateIPv4(address)) ||
+                (family === 6 && isPrivateIPv6(address))
+            )
+                throw new Error('SSRF_BLOCKED');
+        }
+    } catch {
+        throw new Error('SSRF_BLOCKED');
+    }
+}
+
+async function ffprobe(localPath: string): Promise<FfprobeMeta> {
+    const args = [
+        '-v',
+        'error',
+        '-print_format',
+        'json',
+        '-show_format',
+        '-show_streams',
+        localPath,
+    ];
+    const proc = Bun.spawn(['ffprobe', ...args], {
+        stdout: 'pipe',
+        stderr: 'pipe',
+    });
+    const stdout = await new Response(proc.stdout).text();
+    if ((await proc.exited) !== 0) throw new Error('FFPROBE_FAILED');
+    const json = JSON.parse(stdout);
+    const durationSec = json?.format?.duration
+        ? Number(json.format.duration)
+        : 0;
+    const sizeBytes = json?.format?.size
+        ? Number(json.format.size)
+        : Bun.file(localPath).size;
+    const container = json?.format?.format_name as string | undefined;
+    return { durationSec, sizeBytes, container };
+}
+
+async function findDownloadedFile(dir: string): Promise<string | null> {
+    const files = await readdir(dir).catch(() => []);
+    const candidates = files.filter((f) => f.startsWith('source.'));
+    if (!candidates.length) return null;
+    const mp4 = candidates.find((f) => f.endsWith('.mp4'));
+    return `${dir}/${mp4 ?? candidates[0]}`;
+}
+
+export async function resolveYouTubeSource(
+    job: ResolveJob,
+    deps: { metrics?: Metrics } = {}
+): Promise<YouTubeResolveResult> {
+    const logger = createLogger((readEnv('LOG_LEVEL') as any) || 'info').with({
+        comp: 'mediaio',
+        jobId: job.id,
+    });
+    const metrics = deps.metrics ?? noopMetrics;
+    const SCRATCH = readEnv('SCRATCH_DIR') || '/tmp/ytc';
+    const MAX_MB = readIntEnv('MAX_INPUT_MB', 1024)!;
+    const MAX_DUR = readIntEnv('MAX_CLIP_INPUT_DURATION_SEC', 7200)!;
+    const ENABLE = (readEnv('ENABLE_YTDLP') || 'false') === 'true';
+    const DEBUG = (readEnv('YTDLP_DEBUG') || 'false').toLowerCase() === 'true';
+    const BIN_OVERRIDE = readEnv('YTDLP_BIN');
+
+    logger.info('resolving youtube to local path');
+    if (!ENABLE) throw new Error('YTDLP_DISABLED');
+    await assertSafeUrl(job.sourceUrl);
+
+    const baseDir = `${SCRATCH.replace(/\/$/, '')}/sources/${job.id}`;
+    await Bun.spawn(['mkdir', '-p', baseDir]).exited;
+    const outTemplate = `${baseDir}/source.%(ext)s`;
+    const format = readEnv('YTDLP_FORMAT') || 'bv*+ba/b';
+    const ytdlpArgs = [
+        '-f',
+        format,
+        '-o',
+        outTemplate,
+        '--quiet',
+        '--no-progress',
+        '--no-cache-dir',
+        '--no-part',
+        '--retries',
+        '3',
+        '--merge-output-format',
+        'mp4',
+    ];
+    if (MAX_MB > 0) ytdlpArgs.push('--max-filesize', `${MAX_MB}m`);
+    const sections = readEnv('YTDLP_SECTIONS');
+    if (sections) {
+        // Expect comma-separated list like "*00:01:00-00:02:00,*00:10:00-00:10:30"
+        for (const sec of sections
+            .split(',')
+            .map((s) => s.trim())
+            .filter(Boolean)) {
+            ytdlpArgs.push('--download-sections', sec);
+        }
+    }
+    ytdlpArgs.push(job.sourceUrl);
+
+    const candidates = Array.from(
+        new Set([
+            BIN_OVERRIDE || 'yt-dlp',
+            '/opt/homebrew/bin/yt-dlp',
+            '/usr/local/bin/yt-dlp',
+            '/usr/bin/yt-dlp',
+        ])
+    );
+    let bin: string | undefined;
+    for (const b of candidates) {
+        try {
+            const t = Bun.spawn([b, '--version'], {
+                stdout: 'ignore',
+                stderr: 'ignore',
+            });
+            if ((await t.exited) === 0) {
+                bin = b;
+                break;
+            }
+        } catch {}
+    }
+    if (!bin) throw new Error('YTDLP_NOT_FOUND');
+    if (DEBUG)
+        logger.info('yt-dlp starting', { bin, args: ytdlpArgs.join(' ') });
+
+    const timeoutMs = Math.min(MAX_DUR * 1000, 15 * 60 * 1000);
+    const dlStart = Date.now();
+    let timedOut = false;
+    const proc = Bun.spawn([bin, ...ytdlpArgs], {
+        stdout: 'pipe',
+        stderr: 'pipe',
+        env: { PATH: (process as any).env?.PATH || '' },
+    });
+    const timer = setTimeout(() => {
+        try {
+            proc.kill('SIGKILL');
+            timedOut = true;
+        } catch {}
+    }, timeoutMs);
+    const stderrP = new Response(proc.stderr).text();
+    const stdoutP = new Response(proc.stdout).text();
+    const exitCode = await proc.exited;
+    const [stderrText, stdoutText] = await Promise.all([
+        stderrP.catch(() => ''),
+        stdoutP.catch(() => ''),
+    ]);
+    clearTimeout(timer);
+    metrics.observe('mediaio.ytdlp.duration_ms', Date.now() - dlStart, {
+        jobId: job.id,
+    });
+    if (timedOut) {
+        await Bun.spawn(['rm', '-rf', baseDir]).exited;
+        throw new Error('YTDLP_TIMEOUT');
+    }
+    if (exitCode !== 0) {
+        if (DEBUG)
+            logger.error('yt-dlp failed', {
+                exitCode,
+                stderr: stderrText.slice(0, 800),
+            });
+        await Bun.spawn(['rm', '-rf', baseDir]).exited;
+        throw new Error(`YTDLP_FAILED:${exitCode}`);
+    }
+    if (DEBUG)
+        logger.info('yt-dlp succeeded', {
+            exitCode,
+            stderrPreview: stderrText.slice(0, 200),
+            stdoutPreview: stdoutText.slice(0, 200),
+        });
+
+    const localPath = await findDownloadedFile(baseDir);
+    if (!localPath) {
+        await Bun.spawn(['rm', '-rf', baseDir]).exited;
+        throw new Error('YTDLP_FAILED');
+    }
+
+    const ffStart = Date.now();
+    const meta = await ffprobe(localPath);
+    metrics.observe('mediaio.ffprobe.duration_ms', Date.now() - ffStart, {
+        jobId: job.id,
+    });
+    if (meta.durationSec > MAX_DUR || meta.sizeBytes > MAX_MB * 1024 * 1024) {
+        await Bun.spawn(['rm', '-rf', baseDir]).exited;
+        throw new Error('INPUT_TOO_LARGE');
+    }
+
+    const cleanup = async () => {
+        await Bun.spawn(['rm', '-rf', baseDir]).exited;
+    };
+    metrics.observe('mediaio.resolve.duration_ms', Date.now() - dlStart, {
+        jobId: job.id,
+    });
+    logger.info('youtube resolved', {
+        durationSec: meta.durationSec,
+        sizeBytes: meta.sizeBytes,
+    });
+    return { localPath, cleanup, meta };
+}
+````
+
+## File: src/ffmpeg/clipper.ts
+````typescript
+/**
+ * BunClipper: performs a two-phase FFmpeg clipping strategy
+ * 1) Fast path: stream copy (-c copy)
+ * 2) Fallback: re-encode (libx264 + aac)
+ * Exposes an AsyncIterable progress$ (0..100) for the successful attempt.
+ */
+import type { ClipArgs, ClipResult, Clipper } from './types';
+import { parseFfmpegProgress } from './progress';
+import { createLogger, readEnv } from '@clipper/common';
+import { mkdir } from 'node:fs/promises';
+import { ServiceError } from '@clipper/common/errors';
+
+const log = createLogger((readEnv('LOG_LEVEL') as any) || 'info').with({
+    mod: 'ffmpeg',
+});
+
+// Format seconds into HH:MM:SS.mmm (zero padded)
+function fmtTs(sec: number): string {
+    const sign = sec < 0 ? '-' : '';
+    const s = Math.abs(sec);
+    const hh = Math.floor(s / 3600)
+        .toString()
+        .padStart(2, '0');
+    const mm = Math.floor((s % 3600) / 60)
+        .toString()
+        .padStart(2, '0');
+    const ss = Math.floor(s % 60)
+        .toString()
+        .padStart(2, '0');
+    const ms = Math.round((s - Math.floor(s)) * 1000)
+        .toString()
+        .padStart(3, '0');
+    return `${sign}${hh}:${mm}:${ss}.${ms}`;
+}
+
+async function probeDuration(path: string): Promise<number | null> {
+    try {
+        const proc = Bun.spawn(
+            [
+                'ffprobe',
+                '-v',
+                'error',
+                '-show_entries',
+                'format=duration',
+                '-of',
+                'default=noprint_wrappers=1:nokey=1',
+                path,
+            ],
+            { stdout: 'pipe', stderr: 'ignore' }
+        );
+        const out = await new Response(proc.stdout).text();
+        await proc.exited;
+        const dur = Number(out.trim());
+        if (!Number.isFinite(dur)) return null;
+        return dur;
+    } catch {
+        return null;
+    }
+}
+
+interface AttemptResult {
+    ok: boolean;
+    code: number;
+    stderrSnippet?: string;
+}
+
+/**
+ * BunClipper implements the Clipper interface using a two-phase strategy:
+ * 1. Attempt a fast stream copy (no re-encode) for speed when keyframes align.
+ * 2. On failure, fallback to a re-encode ensuring playable, accurate output.
+ *
+ * Progress semantics:
+ * - Each attempt produces its own progress stream.
+ * - For a successful copy attempt, the progress stream usually completes quickly.
+ * - If fallback is required, only the fallback attempt's progress is exposed.
+ */
+export class BunClipper implements Clipper {
+    constructor(private readonly opts: { scratchDir?: string } = {}) {}
+
+    async clip(args: ClipArgs): Promise<ClipResult> {
+        // Input validation
+        if (args.startSec < 0 || args.endSec < 0) {
+            throw new ServiceError(
+                'VALIDATION_FAILED',
+                'start/end must be >= 0'
+            );
+        }
+        if (args.endSec <= args.startSec) {
+            throw new ServiceError(
+                'VALIDATION_FAILED',
+                'endSec must be > startSec'
+            );
+        }
+        const srcFile = Bun.file(args.input);
+        // Bun.file(...).size will throw if not exists; so optionally check via try/catch
+        let fileExists = false;
+        try {
+            // @ts-ignore size triggers stat
+            await srcFile.arrayBuffer(); // minimal read (will allocate). If large file this is heavy; prefer stat when Bun exposes. For now just check existence via stream open.
+            fileExists = true;
+        } catch {
+            fileExists = false;
+        }
+        if (!fileExists) {
+            throw new ServiceError(
+                'VALIDATION_FAILED',
+                'input file does not exist'
+            );
+        }
+
+        const scratchBase =
+            this.opts.scratchDir || readEnv('SCRATCH_DIR') || '/tmp/ytc';
+        const outDir = `${scratchBase}/${args.jobId}`;
+        const outPath = `${outDir}/clip.mp4`;
+        await mkdir(outDir, { recursive: true });
+
+        const totalDuration = args.endSec - args.startSec;
+        const startTs = fmtTs(args.startSec);
+        // ffmpeg -ss <start> -i input -to <end> where -ss before -i is fast seek; -to uses absolute timeline
+        const endTs = fmtTs(args.endSec);
+
+        const attempt = async (
+            mode: 'copy' | 'reencode'
+        ): Promise<{
+            attempt: AttemptResult;
+            progress$?: AsyncIterable<number>;
+        }> => {
+            const common = [
+                '-hide_banner',
+                '-y',
+                '-progress',
+                'pipe:1',
+                // For accuracy we will vary placement of -ss and duration flags per mode
+                '-ss',
+                startTs,
+                '-i',
+                args.input,
+                // We'll prefer -to for copy (fast seek) and switch to -t during re-encode for precision
+                ...(mode === 'copy'
+                    ? ['-to', endTs]
+                    : ['-t', totalDuration.toString()]),
+                '-movflags',
+                '+faststart',
+            ];
+            const modeArgs =
+                mode === 'copy'
+                    ? ['-c', 'copy']
+                    : [
+                          '-c:v',
+                          'libx264',
+                          '-preset',
+                          'veryfast',
+                          '-c:a',
+                          'aac',
+                          '-profile:v',
+                          'high',
+                          '-pix_fmt',
+                          'yuv420p',
+                      ];
+            const full = ['ffmpeg', ...common, ...modeArgs, outPath];
+            const started = performance.now();
+            log.debug('ffmpeg attempt start', {
+                jobId: args.jobId,
+                mode,
+                full,
+            });
+            const proc = Bun.spawn(full, { stdout: 'pipe', stderr: 'pipe' });
+            const stderrChunks: Uint8Array[] = [];
+            const maxErrBytes = 4096;
+            (async () => {
+                if (!proc.stderr) return;
+                for await (const chunk of proc.stderr) {
+                    if (
+                        stderrChunks.reduce((a, c) => a + c.byteLength, 0) <
+                        maxErrBytes
+                    ) {
+                        stderrChunks.push(chunk);
+                    }
+                }
+            })();
+            const progress$ = proc.stdout
+                ? parseFfmpegProgress(proc.stdout, totalDuration)
+                : (async function* () {
+                      yield 100;
+                  })();
+            const exitCode = await proc.exited;
+            const durMs = Math.round(performance.now() - started);
+            const attemptRes: AttemptResult = {
+                ok: exitCode === 0,
+                code: exitCode,
+                stderrSnippet: !stderrChunks.length
+                    ? undefined
+                    : new TextDecoder().decode(
+                          stderrChunks.reduce(
+                              (acc, c) =>
+                                  new Uint8Array([
+                                      ...acc,
+                                      ...new Uint8Array(c),
+                                  ]),
+                              new Uint8Array()
+                          )
+                      ),
+            };
+            log.debug('ffmpeg attempt done', {
+                jobId: args.jobId,
+                mode,
+                code: exitCode,
+                ms: durMs,
+            });
+            return { attempt: attemptRes, progress$ };
+        };
+
+        // Fast path attempt
+        const copyResult = await attempt('copy');
+        if (copyResult.attempt.ok) {
+            // Validate duration accuracy; tolerate +/- 1s drift; if larger drift fallback to precise re-encode
+            const observed = await probeDuration(outPath);
+            if (
+                observed != null &&
+                (observed > totalDuration + 1 || observed < totalDuration - 1)
+            ) {
+                log.info(
+                    'copy duration inaccurate; re-encoding for precision',
+                    {
+                        jobId: args.jobId,
+                        expected: totalDuration,
+                        observed,
+                    }
+                );
+            } else {
+                return { localPath: outPath, progress$: copyResult.progress$! };
+            }
+        }
+
+        // Fallback (fresh progress stream)
+        log.info('stream copy failed; falling back to re-encode', {
+            jobId: args.jobId,
+            code: copyResult.attempt.code,
+        });
+        const reResult = await attempt('reencode');
+        if (reResult.attempt.ok) {
+            return { localPath: outPath, progress$: reResult.progress$! };
+        }
+        // Both failed
+        const msg = `ffmpeg failed (copy code=${copyResult.attempt.code}, reencode code=${reResult.attempt.code})`;
+        throw new ServiceError('BAD_REQUEST', msg); // using existing code enum; adjust if more codes added later
+    }
+}
 ````
 
 ## File: src/worker/asr.ts
@@ -5920,41 +6261,6 @@ export async function startAsrWorker(deps: AsrWorkerDeps) {
             } catch {}
         }
     });
-}
-````
-
-## File: package.json
-````json
-{
-    "name": "clipper",
-    "module": "index.ts",
-    "type": "module",
-    "private": true,
-    "scripts": {
-        "test": "bunx vitest run",
-        "db:generate": "bunx drizzle-kit generate --config=drizzle.config.ts",
-        "db:migrate": "bunx drizzle-kit migrate --config=drizzle.config.ts",
-        "db:push": "bunx drizzle-kit push --config=drizzle.config.ts"
-    },
-    "devDependencies": {
-        "@types/bun": "latest"
-    },
-    "peerDependencies": {
-        "typescript": "^5"
-    },
-    "dependencies": {
-        "@elysiajs/cors": "^1.3.3",
-        "@supabase/supabase-js": "^2.54.0",
-        "@types/pg": "^8.15.5",
-        "dotenv": "^17.2.1",
-        "drizzle-kit": "^0.31.4",
-        "drizzle-orm": "^0.44.4",
-        "elysia": "^1.3.8",
-        "pg": "^8.16.3",
-        "pg-boss": "^10.3.2",
-        "zod": "^4.0.17",
-        "zod-to-openapi": "^0.2.1"
-    }
 }
 ````
 
@@ -6466,6 +6772,438 @@ interface Storage {
 -   Handles 100+ concurrent stream-copy jobs on a single node without errors.
 -   Clean error envelopes; retries + idempotency verified.
 -   Docs published; minimal UI demo works end-to-end.
+````
+
+## File: src/api/index.ts
+````typescript
+import { Elysia } from 'elysia';
+// Some test environments may not set internal Elysia globals; ensure placeholder
+// to prevent TypeError when constructing Elysia during Vitest runs.
+// @ts-ignore
+if (typeof (globalThis as any).ELYSIA_AOT === 'undefined') {
+    // @ts-ignore
+    (globalThis as any).ELYSIA_AOT = false;
+}
+import cors from '@elysiajs/cors';
+import { Schemas, type CreateJobInputType } from '@clipper/contracts';
+import {
+    createLogger,
+    readEnv,
+    readIntEnv,
+    requireEnv,
+    fromException,
+} from '@clipper/common';
+import {
+    DrizzleJobsRepo,
+    DrizzleJobEventsRepo,
+    DrizzleApiKeysRepo,
+    createDb,
+    createSupabaseStorageRepo,
+} from '@clipper/data';
+import { InMemoryMetrics } from '@clipper/common/metrics';
+import { PgBossQueueAdapter } from '@clipper/queue';
+
+const metrics = new InMemoryMetrics();
+const log = createLogger((readEnv('LOG_LEVEL') as any) || 'info').with({
+    mod: 'api',
+});
+
+// Simple in-memory API key cache & rate limiter (sufficient for single-instance / test)
+type ApiKeyCacheEntry = { record: any; expiresAt: number };
+const apiKeyCache = new Map<string, ApiKeyCacheEntry>();
+const API_KEY_CACHE_TTL_MS = 5 * 60_000; // 5 minutes
+
+interface RateBucket {
+    count: number;
+    windowStart: number;
+}
+const rateBuckets = new Map<string, RateBucket>();
+function rateLimitHit(key: string, max: number, windowMs: number) {
+    const now = Date.now();
+    const b = rateBuckets.get(key);
+    if (!b || now - b.windowStart >= windowMs) {
+        rateBuckets.set(key, { count: 1, windowStart: now });
+        return false; // first hit
+    }
+    if (b.count >= max) return true;
+    b.count++;
+    return false;
+}
+
+function buildDeps() {
+    let queue: any;
+    try {
+        const cs = requireEnv('DATABASE_URL');
+        queue = new PgBossQueueAdapter({ connectionString: cs });
+        queue.start?.();
+    } catch {
+        queue = {
+            publish: async () => {},
+            publishTo: async () => {},
+            health: async () => ({ ok: true }),
+            getMetrics: () => ({}),
+        };
+    }
+    const db = createDb();
+    const jobsRepo = new DrizzleJobsRepo(db);
+    const eventsRepo = new DrizzleJobEventsRepo(db);
+    const storage = (() => {
+        try {
+            return createSupabaseStorageRepo();
+        } catch (e) {
+            log.warn('storage init failed (signing disabled)', {
+                error: String(e),
+            });
+            return null as any;
+        }
+    })();
+    const apiKeys = new DrizzleApiKeysRepo(db);
+    return { queue, jobsRepo, eventsRepo, storage, apiKeys };
+}
+const { queue, jobsRepo, eventsRepo, storage, apiKeys } = buildDeps();
+
+function tcToSec(tc: string) {
+    const [hh, mm, rest] = tc.split(':');
+    const [ss, ms] = rest?.split('.') || [rest || '0', undefined];
+    return (
+        Number(hh) * 3600 +
+        Number(mm) * 60 +
+        Number(ss) +
+        (ms ? Number(`0.${ms}`) : 0)
+    );
+}
+
+// Simple correlation id + uniform error envelope middleware
+interface ApiErrorEnvelope {
+    error: { code: string; message: string; correlationId: string };
+}
+function buildError(
+    set: any,
+    code: number,
+    errCode: string,
+    message: string,
+    correlationId: string
+): ApiErrorEnvelope {
+    set.status = code;
+    return { error: { code: errCode, message, correlationId } };
+}
+
+const ENABLE_API_KEYS =
+    (readEnv('ENABLE_API_KEYS') || 'false').toLowerCase() === 'true';
+const RATE_WINDOW_SEC = Number(readEnv('RATE_LIMIT_WINDOW_SEC') || '60');
+const RATE_MAX = Number(readEnv('RATE_LIMIT_MAX') || '30');
+
+async function resolveApiKey(request: Request) {
+    if (!ENABLE_API_KEYS) return null;
+    const auth = request.headers.get('authorization') || '';
+    let token: string | null = null;
+    if (/^bearer /i.test(auth)) token = auth.slice(7).trim();
+    else token = request.headers.get('x-api-key');
+    if (!token) return null; // absence handled separately (auth required?)
+    const cached = apiKeyCache.get(token);
+    if (cached && cached.expiresAt > Date.now()) return cached.record;
+    const rec = await apiKeys.verify(token);
+    if (rec)
+        apiKeyCache.set(token, {
+            record: rec,
+            expiresAt: Date.now() + API_KEY_CACHE_TTL_MS,
+        });
+    return rec;
+}
+
+function clientIdentity(request: Request, apiKeyId?: string | null): string {
+    if (apiKeyId) return `key:${apiKeyId}`;
+    const xf = request.headers.get('x-forwarded-for');
+    if (xf) return `ip:${xf.split(',')[0]!.trim()}`;
+    const xr = request.headers.get('x-real-ip');
+    if (xr) return `ip:${xr}`;
+    return 'ip:anon';
+}
+
+export const app = new Elysia()
+    .use(cors())
+    .onRequest(({ request, store }) => {
+        const cid = request.headers.get('x-request-id') || crypto.randomUUID();
+        (store as any).correlationId = cid;
+    })
+    .state('correlationId', '')
+    // Attach auth info (if enabled) early
+    .onBeforeHandle(async ({ request, store, set, path }) => {
+        if (!ENABLE_API_KEYS) return; // feature disabled
+        // exempt health & metrics endpoints
+        if (/^\/(healthz|metrics)/.test(path)) return;
+        const rec = await resolveApiKey(request);
+        if (!rec) {
+            set.status = 401;
+            return {
+                error: {
+                    code: 'UNAUTHORIZED',
+                    message: 'API key required or invalid',
+                    correlationId: (store as any).correlationId,
+                },
+            } satisfies ApiErrorEnvelope;
+        }
+        (store as any).apiKeyId = rec.id;
+    })
+    .get('/healthz', async ({ store }) => {
+        const h = await queue.health();
+        return {
+            ok: h.ok,
+            queue: h,
+            correlationId: (store as any).correlationId,
+        };
+    })
+    .get('/metrics/queue', ({ store }) => ({
+        metrics: queue.getMetrics(),
+        correlationId: (store as any).correlationId,
+    }))
+    .get('/metrics', () => {
+        const snap = metrics.snapshot();
+        return snap;
+    })
+    .post('/api/jobs', async ({ body, set, store, request }) => {
+        const correlationId = (store as any).correlationId;
+        // Rate limit (only on creation endpoint)
+        try {
+            const keyId = (store as any).apiKeyId || null;
+            const ident = clientIdentity(request, keyId);
+            const windowMs = RATE_WINDOW_SEC * 1000;
+            if (rateLimitHit(ident, RATE_MAX, windowMs)) {
+                return buildError(
+                    set,
+                    429,
+                    'RATE_LIMITED',
+                    'Rate limit exceeded',
+                    correlationId
+                );
+            }
+        } catch (e) {
+            // Ignore limiter internal errors
+        }
+        try {
+            const parsed = Schemas.CreateJobInput.safeParse(body);
+            if (!parsed.success) {
+                return buildError(
+                    set,
+                    400,
+                    'VALIDATION_FAILED',
+                    parsed.error.message,
+                    correlationId
+                );
+            }
+            const input = parsed.data as CreateJobInputType;
+            const id = crypto.randomUUID();
+            const startSec = tcToSec(input.start);
+            const endSec = tcToSec(input.end);
+            if (
+                endSec - startSec >
+                Number(readIntEnv('MAX_CLIP_SECONDS', 120))
+            ) {
+                return buildError(
+                    set,
+                    400,
+                    'CLIP_TOO_LONG',
+                    'Clip exceeds MAX_CLIP_SECONDS',
+                    correlationId
+                );
+            }
+            const retentionHours = Number(readIntEnv('RETENTION_HOURS', 72));
+            const expiresAt = new Date(Date.now() + retentionHours * 3600_000);
+            const row = await jobsRepo.create({
+                id,
+                status: 'queued',
+                progress: 0,
+                sourceType: input.sourceType,
+                sourceKey: input.uploadKey,
+                sourceUrl: input.youtubeUrl,
+                startSec,
+                endSec,
+                withSubtitles: input.withSubtitles,
+                burnSubtitles: input.burnSubtitles,
+                subtitleLang: input.subtitleLang,
+                resultVideoKey: undefined,
+                resultSrtKey: undefined,
+                errorCode: undefined,
+                errorMessage: undefined,
+                expiresAt: expiresAt.toISOString(),
+            });
+            await eventsRepo.add({
+                jobId: id,
+                ts: new Date().toISOString(),
+                type: 'created',
+            });
+            const publishedAt = Date.now();
+            await queue.publish({ jobId: id, priority: 'normal' });
+            metrics.inc('jobs.created');
+            metrics.observe(
+                'jobs.enqueue_latency_ms',
+                Date.now() - publishedAt
+            );
+            log.info('job enqueued', {
+                jobId: id,
+                correlationId,
+                apiKeyId: (store as any).apiKeyId,
+            });
+            return {
+                correlationId,
+                job: {
+                    id: row.id,
+                    status: row.status,
+                    progress: row.progress,
+                    expiresAt: expiresAt.toISOString(),
+                },
+            };
+        } catch (e) {
+            const err = fromException(e, correlationId);
+            return buildError(
+                set,
+                500,
+                err.error.code,
+                err.error.message,
+                correlationId
+            );
+        }
+    })
+    .get('/api/jobs/:id', async ({ params, set, store }) => {
+        const correlationId = (store as any).correlationId;
+        const { id } = params as any;
+        try {
+            const job = await jobsRepo.get(id);
+            if (!job) {
+                return buildError(
+                    set,
+                    404,
+                    'NOT_FOUND',
+                    'Job not found',
+                    correlationId
+                );
+            }
+            if (job.expiresAt && new Date(job.expiresAt) < new Date()) {
+                return buildError(
+                    set,
+                    410,
+                    'GONE',
+                    'Job expired',
+                    correlationId
+                );
+            }
+            // recent events (last 10)
+            const ev =
+                (await (eventsRepo as any).listRecent?.(job.id, 10)) ||
+                (await (eventsRepo as any).list(job.id, 10, 0));
+            metrics.inc('jobs.status_fetch');
+            return {
+                correlationId,
+                job: {
+                    id: job.id,
+                    status: job.status,
+                    progress: job.progress,
+                    resultVideoKey: job.resultVideoKey ?? undefined,
+                    resultSrtKey: job.resultSrtKey ?? undefined,
+                    expiresAt: job.expiresAt ?? undefined,
+                },
+                events: ev.map((e: any) => ({
+                    ts: e.ts,
+                    type: e.type,
+                    data: e.data,
+                })),
+            };
+        } catch (e) {
+            const err = fromException(e, correlationId);
+            return buildError(
+                set,
+                500,
+                err.error.code,
+                err.error.message,
+                correlationId
+            );
+        }
+    })
+    .get('/api/jobs/:id/result', async ({ params, set, store }) => {
+        const correlationId = (store as any).correlationId;
+        const { id } = params as any;
+        try {
+            const job = await jobsRepo.get(id);
+            if (!job) {
+                return buildError(
+                    set,
+                    404,
+                    'NOT_FOUND',
+                    'Job not found',
+                    correlationId
+                );
+            }
+            if (job.expiresAt && new Date(job.expiresAt) < new Date()) {
+                return buildError(
+                    set,
+                    410,
+                    'GONE',
+                    'Job expired',
+                    correlationId
+                );
+            }
+            if (!job.resultVideoKey || job.status !== 'done') {
+                return buildError(
+                    set,
+                    404,
+                    'NOT_READY',
+                    'Result not available yet',
+                    correlationId
+                );
+            }
+            if (!storage) {
+                return buildError(
+                    set,
+                    500,
+                    'STORAGE_UNAVAILABLE',
+                    'Storage not configured',
+                    correlationId
+                );
+            }
+            const videoUrl = await storage.sign(job.resultVideoKey);
+            let srtUrl: string | undefined;
+            if (job.resultSrtKey) {
+                try {
+                    srtUrl = await storage.sign(job.resultSrtKey);
+                } catch {}
+            }
+            metrics.inc('jobs.result_fetch');
+            return {
+                correlationId,
+                result: {
+                    id: job.id,
+                    video: { key: job.resultVideoKey, url: videoUrl },
+                    srt:
+                        job.resultSrtKey && srtUrl
+                            ? { key: job.resultSrtKey, url: srtUrl }
+                            : undefined,
+                },
+            };
+        } catch (e) {
+            const err = fromException(e, correlationId);
+            return buildError(
+                set,
+                500,
+                err.error.code,
+                err.error.message,
+                correlationId
+            );
+        }
+    });
+
+if (import.meta.main) {
+    const port = Number(readIntEnv('PORT', 3000));
+    const server = Bun.serve({ fetch: app.fetch, port });
+    log.info('API started', { port });
+    const stop = async () => {
+        log.info('API stopping');
+        server.stop(true);
+        await queue.shutdown();
+        process.exit(0);
+    };
+    process.on('SIGINT', stop);
+    process.on('SIGTERM', stop);
+}
 ````
 
 ## File: src/data/db/repos.ts
@@ -7177,6 +7915,43 @@ function guessContentType(key: string): string {
 }
 ````
 
+## File: package.json
+````json
+{
+    "name": "clipper",
+    "module": "index.ts",
+    "type": "module",
+    "private": true,
+    "scripts": {
+        "test": "bunx vitest run",
+        "db:generate": "bunx drizzle-kit generate --config=drizzle.config.ts",
+        "db:migrate": "bunx drizzle-kit migrate --config=drizzle.config.ts",
+        "db:push": "bunx drizzle-kit push --config=drizzle.config.ts",
+        "dev": "bun --watch src/api/index.ts",
+        "dev:worker": "bun --watch src/worker/index.ts"
+    },
+    "devDependencies": {
+        "@types/bun": "latest"
+    },
+    "peerDependencies": {
+        "typescript": "^5"
+    },
+    "dependencies": {
+        "@elysiajs/cors": "^1.3.3",
+        "@supabase/supabase-js": "^2.54.0",
+        "@types/pg": "^8.15.5",
+        "dotenv": "^17.2.1",
+        "drizzle-kit": "^0.31.4",
+        "drizzle-orm": "^0.44.4",
+        "elysia": "^1.3.8",
+        "pg": "^8.16.3",
+        "pg-boss": "^10.3.2",
+        "zod": "^4.0.17",
+        "zod-to-openapi": "^0.2.1"
+    }
+}
+````
+
 ## File: planning/todo.md
 ````markdown
 # Project Completion TODO (Focused & Prioritized)
@@ -7221,18 +7996,18 @@ Only incomplete planned items from layers doc; excludes new/optional stretch fea
 
 ## 7. Cleanup (after ASR artifacts introduced)
 
--   [ ] Extend cleanup to remove expired ASR jobs + transcript artifacts
+-   [x] Extend cleanup to remove expired ASR jobs + transcript artifacts
 
 ## 8. Security & Abuse Controls
 
--   [ ] API key auth (lookup hash)
--   [ ] Basic rate limiting for job creation (per key/IP)
--   [ ] Document existing SSRF allowlist behavior
+-   [x] API key auth (lookup hash)
+-   [x] Basic rate limiting for job creation (per key/IP)
+-   [x] Document existing SSRF allowlist behavior
 
 ## 9. Docs
 
--   [ ] API reference markdown (create/status/result) with curl examples
--   [ ] Brief metrics reference (names + purpose)
+-   [x] API reference markdown (create/status/result) with curl examples
+-   [x] Brief metrics reference (names + purpose)
 
 ## 10. Tests (add alongside each feature)
 
@@ -7348,15 +8123,12 @@ async function main() {
                     sourceKey: job.sourceKey!,
                 } as any);
             } else {
-                try {
-                    resolveRes = await resolveYouTubeSource({
-                        id: job.id,
-                        sourceType: 'youtube',
-                        sourceUrl: job.sourceUrl!,
-                    } as any);
-                } catch (e) {
-                    throw new Error('RESOLVE_FAILED');
-                }
+                // Let underlying error surface for clearer diagnostics
+                resolveRes = await resolveYouTubeSource({
+                    id: job.id,
+                    sourceType: 'youtube',
+                    sourceUrl: job.sourceUrl!,
+                } as any);
             }
             cleanup = resolveRes.cleanup;
             await events.add({
