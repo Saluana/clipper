@@ -25,8 +25,9 @@ const log = createLogger((readEnv('LOG_LEVEL') as any) || 'info').with({
 });
 
 const metrics = new InMemoryMetrics();
-const jobs = new DrizzleJobsRepo(createDb());
-const events = new DrizzleJobEventsRepo(createDb());
+const sharedDb = createDb();
+const jobs = new DrizzleJobsRepo(sharedDb, metrics);
+const events = new DrizzleJobEventsRepo(sharedDb, metrics);
 const queue = new PgBossQueueAdapter({
     connectionString: requireEnv('DATABASE_URL'),
 });
@@ -42,7 +43,7 @@ const storage = (() => {
     }
 })();
 const asrFacade = new AsrFacade({
-    asrJobs: new DrizzleAsrJobsRepo(createDb()),
+    asrJobs: new DrizzleAsrJobsRepo(sharedDb, metrics),
 });
 
 async function main() {

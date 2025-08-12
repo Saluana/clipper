@@ -2,7 +2,7 @@ import { desc, eq, and } from 'drizzle-orm';
 import { createDb } from './connection';
 import { jobEvents, jobs, asrJobs, asrArtifacts } from './schema';
 import type { JobStatus } from '@clipper/contracts';
-import { createLogger, noopMetrics, type Metrics } from '../../common/index';
+import { createLogger, noopMetrics, MetricsRegistry } from '../../common/index';
 import type {
     JobEvent as RepoJobEvent,
     JobRow,
@@ -20,7 +20,7 @@ export class DrizzleJobsRepo implements JobsRepository {
     private readonly logger = createLogger('info').with({ comp: 'jobsRepo' });
     constructor(
         private readonly db = createDb(),
-        private readonly metrics: Metrics = noopMetrics
+        private readonly metrics: MetricsRegistry = noopMetrics
     ) {}
 
     async create(
@@ -52,6 +52,10 @@ export class DrizzleJobsRepo implements JobsRepository {
         this.metrics.observe('repo.op.duration_ms', Date.now() - start, {
             op: 'jobs.create',
         });
+        // Job lifecycle metric (Req 3.1)
+        try {
+            (this.metrics as any).inc?.('jobs.created_total');
+        } catch {}
         this.logger.info('job created', { jobId: out.id });
         return out;
     }
@@ -72,6 +76,20 @@ export class DrizzleJobsRepo implements JobsRepository {
 
     async update(id: string, patch: Partial<JobRow>): Promise<JobRow> {
         const start = Date.now();
+        // Fetch current status for transition metric & latency
+        let current: any = null;
+        try {
+            const [cur] = await this.db
+                .select({
+                    id: jobs.id,
+                    status: jobs.status,
+                    createdAt: jobs.createdAt,
+                })
+                .from(jobs)
+                .where(eq(jobs.id, id))
+                .limit(1);
+            current = cur;
+        } catch {}
         const [rec] = await this.db
             .update(jobs)
             .set(toJobsPatch(patch))
@@ -82,6 +100,29 @@ export class DrizzleJobsRepo implements JobsRepository {
         this.metrics.observe('repo.op.duration_ms', Date.now() - start, {
             op: 'jobs.update',
         });
+        // Status transition metric (Req 3.2)
+        try {
+            if (current && patch.status && patch.status !== current.status) {
+                (this.metrics as any).inc?.('jobs.status_transition_total', 1, {
+                    from: current.status,
+                    to: patch.status,
+                });
+                // Total latency on terminal states (Req 3.3)
+                if (
+                    (patch.status === 'done' || patch.status === 'failed') &&
+                    current.createdAt
+                ) {
+                    const createdAt = new Date(
+                        current.createdAt as any
+                    ).getTime();
+                    const latency = Date.now() - createdAt;
+                    (this.metrics as any).observe?.(
+                        'jobs.total_latency_ms',
+                        latency
+                    );
+                }
+            }
+        } catch {}
         this.logger.info('job updated', { jobId: row.id });
         return row;
     }
@@ -140,7 +181,7 @@ export class DrizzleJobsRepo implements JobsRepository {
 export class DrizzleJobEventsRepo implements JobEventsRepository {
     constructor(
         private readonly db = createDb(),
-        private readonly metrics: Metrics = noopMetrics
+        private readonly metrics: MetricsRegistry = noopMetrics
     ) {}
 
     async add(evt: RepoJobEvent): Promise<void> {
@@ -189,7 +230,7 @@ export class DrizzleAsrJobsRepo implements AsrJobsRepository {
     });
     constructor(
         private readonly db = createDb(),
-        private readonly metrics: Metrics = noopMetrics
+        private readonly metrics: MetricsRegistry = noopMetrics
     ) {}
 
     async create(
@@ -287,7 +328,7 @@ export class DrizzleAsrJobsRepo implements AsrJobsRepository {
 export class DrizzleAsrArtifactsRepo implements AsrArtifactsRepository {
     constructor(
         private readonly db = createDb(),
-        private readonly metrics: Metrics = noopMetrics
+        private readonly metrics: MetricsRegistry = noopMetrics
     ) {}
 
     async put(artifact: AsrArtifactRow): Promise<void> {

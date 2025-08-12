@@ -21,10 +21,10 @@ artifact_id: 8f5b7a3c-9d8a-4c1f-b2f9-3e6d2c1a7b90
 
 ## 3. Job Lifecycle Metrics
 
--   [ ] 3.1 Hook job creation path -> jobs.created_total (Req 3)
--   [ ] 3.2 Hook status transitions -> jobs.status_transition_total (Req 3)
--   [ ] 3.3 Observe total latency at done/failed -> jobs.total_latency_ms (Req 3)
--   [ ] 3.4 Queue metrics merge into /metrics snapshot (Req 3)
+-   [x] 3.1 Hook job creation path -> jobs.created_total (Req 3)
+-   [x] 3.2 Hook status transitions -> jobs.status_transition_total (Req 3)
+-   [x] 3.3 Observe total latency at done/failed -> jobs.total_latency_ms (Req 3)
+-   [x] 3.4 Queue metrics merge into /metrics snapshot (Req 3)
 
 ## 4. Worker Stage Timings
 

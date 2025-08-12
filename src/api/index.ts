@@ -53,6 +53,7 @@ function rateLimitHit(key: string, max: number, windowMs: number) {
 }
 
 function buildDeps() {
+    const db = createDb();
     let queue: any;
     try {
         const cs = requireEnv('DATABASE_URL');
@@ -66,8 +67,7 @@ function buildDeps() {
             getMetrics: () => ({}),
         };
     }
-    const db = createDb();
-    const jobsRepo = new DrizzleJobsRepo(db);
+    const jobsRepo = new DrizzleJobsRepo(db, metrics);
     const eventsRepo = new DrizzleJobEventsRepo(db);
     const storage = (() => {
         try {
@@ -279,7 +279,9 @@ export const app = addHttpInstrumentation(new Elysia())
     }))
     .get('/metrics', () => {
         const snap = metrics.snapshot();
-        return snap;
+        // merge queue metrics (Req 3.4)
+        const queueMetrics = queue.getMetrics?.() || {};
+        return { ...snap, queue: queueMetrics };
     })
     .post('/api/jobs', async ({ body, set, store, request }) => {
         const correlationId = (store as any).correlationId;
@@ -354,7 +356,8 @@ export const app = addHttpInstrumentation(new Elysia())
             });
             const publishedAt = Date.now();
             await queue.publish({ jobId: id, priority: 'normal' });
-            metrics.inc('jobs.created');
+            // jobs.created_total now incremented inside DrizzleJobsRepo.create()
+            metrics.inc('jobs.created'); // legacy metric (optional)
             metrics.observe(
                 'jobs.enqueue_latency_ms',
                 Date.now() - publishedAt

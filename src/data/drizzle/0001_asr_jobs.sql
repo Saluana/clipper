@@ -1,7 +1,10 @@
 -- ASR tables migration
-CREATE TYPE "public"."asr_job_status" AS ENUM('queued','processing','done','failed');
+-- Make enum creation idempotent for local/dev reruns.
+DO $$ BEGIN
+    CREATE TYPE "public"."asr_job_status" AS ENUM('queued','processing','done','failed');
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 
-CREATE TABLE "asr_jobs" (
+CREATE TABLE IF NOT EXISTS "asr_jobs" (
     "id" uuid PRIMARY KEY NOT NULL,
     "clip_job_id" uuid,
     "source_type" text NOT NULL,
@@ -19,13 +22,15 @@ CREATE TABLE "asr_jobs" (
     "completed_at" timestamp with time zone,
     "expires_at" timestamp with time zone
 );
-ALTER TABLE "asr_jobs" ADD CONSTRAINT "asr_jobs_clip_job_id_jobs_id_fk" FOREIGN KEY ("clip_job_id") REFERENCES "public"."jobs"("id") ON DELETE no action ON UPDATE no action;
-CREATE INDEX "idx_asr_jobs_status_created_at" ON "asr_jobs" USING btree ("status","created_at");
-CREATE INDEX "idx_asr_jobs_expires_at" ON "asr_jobs" USING btree ("expires_at");
+DO $$ BEGIN
+    ALTER TABLE "asr_jobs" ADD CONSTRAINT "asr_jobs_clip_job_id_jobs_id_fk" FOREIGN KEY ("clip_job_id") REFERENCES "public"."jobs"("id") ON DELETE no action ON UPDATE no action;
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+CREATE INDEX IF NOT EXISTS "idx_asr_jobs_status_created_at" ON "asr_jobs" USING btree ("status","created_at");
+CREATE INDEX IF NOT EXISTS "idx_asr_jobs_expires_at" ON "asr_jobs" USING btree ("expires_at");
 -- unique reuse index (partial)
-CREATE UNIQUE INDEX "uq_asr_jobs_media_model_done" ON "asr_jobs" ("media_hash","model_version") WHERE status = 'done';
+CREATE UNIQUE INDEX IF NOT EXISTS "uq_asr_jobs_media_model_done" ON "asr_jobs" ("media_hash","model_version") WHERE status = 'done';
 
-CREATE TABLE "asr_artifacts" (
+CREATE TABLE IF NOT EXISTS "asr_artifacts" (
     "asr_job_id" uuid NOT NULL,
     "kind" text NOT NULL,
     "storage_key" text NOT NULL,
