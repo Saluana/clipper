@@ -178,4 +178,57 @@ describe('ASR Worker', () => {
         expect(srt).toContain('-->');
         expect(txt).toContain('Hello world');
     });
+    test('failure path: provider throws -> job failed and no artifacts', async () => {
+        const clipJobId = crypto.randomUUID();
+        const asrJobId = crypto.randomUUID();
+        const clipKey = storageKeys.resultVideo(clipJobId);
+        const clipTmp = `/tmp/${crypto.randomUUID()}.mp4`;
+        await Bun.write(clipTmp, 'FAKE_MP4_DATA');
+        await storage.upload(clipTmp, clipKey, 'video/mp4');
+        clipJobs.map.set(clipJobId, {
+            id: clipJobId,
+            status: 'done',
+            progress: 100,
+            sourceType: 'upload',
+            startSec: 0,
+            endSec: 2,
+            withSubtitles: false,
+            burnSubtitles: false,
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+            resultVideoKey: clipKey,
+        } as any);
+        await asrJobs.create({
+            id: asrJobId,
+            clipJobId,
+            sourceType: 'internal',
+            mediaHash: 'm',
+            modelVersion: 'whisper-large-v3-turbo',
+            status: 'queued',
+        });
+        class FailingProvider {
+            async transcribe() {
+                throw new Error('PROVIDER_FAIL');
+            }
+        }
+        const queue = new FakeQueue({
+            asrJobId,
+            clipJobId,
+            languageHint: 'auto',
+        });
+        await expect(
+            startAsrWorker({
+                queue,
+                asrJobs: asrJobs as any,
+                clipJobs: clipJobs as any,
+                artifacts: artifacts as any,
+                storage: storage as any,
+                provider: new FailingProvider() as any,
+            })
+        ).rejects.toThrow();
+        const updated = await asrJobs.get(asrJobId);
+        expect(updated?.status).toBe('failed');
+        const list = await artifacts.list(asrJobId);
+        expect(list.length).toBe(0);
+    });
 });
