@@ -7,3 +7,4 @@ export * from './env';
 export * from './metrics';
 export * from './redact';
 export * from './external';
+export * from './resource-sampler';

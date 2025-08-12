@@ -42,10 +42,10 @@ artifact_id: 8f5b7a3c-9d8a-4c1f-b2f9-3e6d2c1a7b90
 
 ## 6. Resource Sampler
 
--   [ ] 6.1 Implement sampler loop (Req 6)
--   [ ] 6.2 Collect RSS, event loop lag (Req 6)
--   [ ] 6.3 Collect scratch usage (Req 6)
--   [ ] 6.4 Gauge updates + tests (mock fs) (Req 6)
+-   [x] 6.1 Implement sampler loop (Req 6)
+-   [x] 6.2 Collect RSS, event loop lag (Req 6)
+-   [x] 6.3 Collect scratch usage (Req 6)
+-   [x] 6.4 Gauge updates + tests (mock fs) (Req 6)
 
 ## 7. Structured Logging Enhancements
 
