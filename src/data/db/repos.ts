@@ -1,6 +1,6 @@
-import { desc, eq } from 'drizzle-orm';
+import { desc, eq, and } from 'drizzle-orm';
 import { createDb } from './connection';
-import { jobEvents, jobs } from './schema';
+import { jobEvents, jobs, asrJobs, asrArtifacts } from './schema';
 import type { JobStatus } from '@clipper/contracts';
 import { createLogger, noopMetrics, type Metrics } from '../../common/index';
 import type {
@@ -8,6 +8,12 @@ import type {
     JobRow,
     JobEventsRepository,
     JobsRepository,
+} from '../repo';
+import type {
+    AsrJobRow,
+    AsrArtifactRow,
+    AsrJobsRepository,
+    AsrArtifactsRepository,
 } from '../repo';
 
 export class DrizzleJobsRepo implements JobsRepository {
@@ -176,6 +182,149 @@ export class DrizzleJobEventsRepo implements JobEventsRepository {
     }
 }
 
+// ASR Repositories
+export class DrizzleAsrJobsRepo implements AsrJobsRepository {
+    private readonly logger = createLogger('info').with({
+        comp: 'asrJobsRepo',
+    });
+    constructor(
+        private readonly db = createDb(),
+        private readonly metrics: Metrics = noopMetrics
+    ) {}
+
+    async create(
+        row: Omit<AsrJobRow, 'createdAt' | 'updatedAt' | 'status'> &
+            Partial<Pick<AsrJobRow, 'status'>>
+    ): Promise<AsrJobRow> {
+        const start = Date.now();
+        const [rec] = await this.db
+            .insert(asrJobs)
+            .values({
+                id: row.id,
+                clipJobId: row.clipJobId,
+                sourceType: row.sourceType,
+                sourceKey: row.sourceKey,
+                mediaHash: row.mediaHash,
+                modelVersion: row.modelVersion,
+                languageHint: row.languageHint,
+                detectedLanguage: row.detectedLanguage,
+                durationSec: row.durationSec,
+                status: row.status ?? 'queued',
+                errorCode: row.errorCode,
+                errorMessage: row.errorMessage,
+                completedAt: row.completedAt ? new Date(row.completedAt) : null,
+                expiresAt: row.expiresAt ? new Date(row.expiresAt) : null,
+            })
+            .returning();
+        const out = toAsrJobRow(rec);
+        this.metrics.observe('repo.op.duration_ms', Date.now() - start, {
+            op: 'asrJobs.create',
+        });
+        this.logger.info('asr job created', { asrJobId: out.id });
+        return out;
+    }
+
+    async get(id: string): Promise<AsrJobRow | null> {
+        const start = Date.now();
+        const [rec] = await this.db
+            .select()
+            .from(asrJobs)
+            .where(eq(asrJobs.id, id))
+            .limit(1);
+        this.metrics.observe('repo.op.duration_ms', Date.now() - start, {
+            op: 'asrJobs.get',
+        });
+        return rec ? toAsrJobRow(rec) : null;
+    }
+
+    async getReusable(
+        mediaHash: string,
+        modelVersion: string
+    ): Promise<(AsrJobRow & { artifacts: AsrArtifactRow[] }) | null> {
+        const start = Date.now();
+        const [rec] = await this.db
+            .select()
+            .from(asrJobs)
+            .where(
+                and(
+                    eq(asrJobs.mediaHash, mediaHash),
+                    eq(asrJobs.modelVersion, modelVersion),
+                    eq(asrJobs.status, 'done')
+                )
+            )
+            .limit(1);
+        if (!rec) return null;
+        const artifacts = await this.db
+            .select()
+            .from(asrArtifacts)
+            .where(eq(asrArtifacts.asrJobId, rec.id));
+        this.metrics.observe('repo.op.duration_ms', Date.now() - start, {
+            op: 'asrJobs.getReusable',
+        });
+        return {
+            ...toAsrJobRow(rec),
+            artifacts: artifacts.map(toAsrArtifactRow),
+        };
+    }
+
+    async patch(id: string, patch: Partial<AsrJobRow>): Promise<AsrJobRow> {
+        const start = Date.now();
+        const [rec] = await this.db
+            .update(asrJobs)
+            .set(toAsrJobsPatch(patch))
+            .where(eq(asrJobs.id, id))
+            .returning();
+        if (!rec) throw new Error('NOT_FOUND');
+        const row = toAsrJobRow(rec);
+        this.metrics.observe('repo.op.duration_ms', Date.now() - start, {
+            op: 'asrJobs.patch',
+        });
+        this.logger.info('asr job patched', { asrJobId: row.id });
+        return row;
+    }
+}
+
+export class DrizzleAsrArtifactsRepo implements AsrArtifactsRepository {
+    constructor(
+        private readonly db = createDb(),
+        private readonly metrics: Metrics = noopMetrics
+    ) {}
+
+    async put(artifact: AsrArtifactRow): Promise<void> {
+        const start = Date.now();
+        await this.db
+            .insert(asrArtifacts)
+            .values({
+                asrJobId: artifact.asrJobId,
+                kind: artifact.kind,
+                storageKey: artifact.storageKey,
+                sizeBytes: artifact.sizeBytes,
+            })
+            .onConflictDoUpdate({
+                target: [asrArtifacts.asrJobId, asrArtifacts.kind],
+                set: {
+                    storageKey: artifact.storageKey,
+                    sizeBytes: artifact.sizeBytes,
+                },
+            });
+        this.metrics.observe('repo.op.duration_ms', Date.now() - start, {
+            op: 'asrArtifacts.put',
+        });
+    }
+
+    async list(asrJobId: string): Promise<AsrArtifactRow[]> {
+        const start = Date.now();
+        const rows = await this.db
+            .select()
+            .from(asrArtifacts)
+            .where(eq(asrArtifacts.asrJobId, asrJobId));
+        this.metrics.observe('repo.op.duration_ms', Date.now() - start, {
+            op: 'asrArtifacts.list',
+        });
+        return rows.map(toAsrArtifactRow);
+    }
+}
+
 function toJobRow(j: any): JobRow {
     return {
         id: j.id,
@@ -207,4 +356,45 @@ function toJobsPatch(patch: Partial<JobRow>) {
         else out[k] = v as any;
     }
     return out;
+}
+
+function toAsrJobRow(j: any): AsrJobRow {
+    return {
+        id: j.id,
+        clipJobId: j.clipJobId ?? undefined,
+        sourceType: j.sourceType,
+        sourceKey: j.sourceKey ?? undefined,
+        mediaHash: j.mediaHash,
+        modelVersion: j.modelVersion,
+        languageHint: j.languageHint ?? undefined,
+        detectedLanguage: j.detectedLanguage ?? undefined,
+        durationSec: j.durationSec ?? undefined,
+        status: j.status,
+        errorCode: j.errorCode ?? undefined,
+        errorMessage: j.errorMessage ?? undefined,
+        createdAt: j.createdAt.toISOString(),
+        updatedAt: j.updatedAt.toISOString(),
+        completedAt: j.completedAt ? j.completedAt.toISOString() : undefined,
+        expiresAt: j.expiresAt ? j.expiresAt.toISOString() : undefined,
+    };
+}
+
+function toAsrJobsPatch(patch: Partial<AsrJobRow>) {
+    const out: any = { updatedAt: new Date() };
+    for (const [k, v] of Object.entries(patch)) {
+        if (v === undefined) continue;
+        if (k.endsWith('At') && v) out[k] = new Date(v as string);
+        else out[k] = v as any;
+    }
+    return out;
+}
+
+function toAsrArtifactRow(a: any): AsrArtifactRow {
+    return {
+        asrJobId: a.asrJobId,
+        kind: a.kind,
+        storageKey: a.storageKey,
+        sizeBytes: a.sizeBytes ?? undefined,
+        createdAt: a.createdAt.toISOString(),
+    };
 }

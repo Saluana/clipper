@@ -1,13 +1,20 @@
 {
-  "version": "7",
-  "dialect": "postgresql",
-  "entries": [
-    {
-      "idx": 0,
-      "version": "7",
-      "when": 1754887720633,
-      "tag": "0000_tense_yellow_claw",
-      "breakpoints": true
-    }
-  ]
+    "version": "7",
+    "dialect": "postgresql",
+    "entries": [
+        {
+            "idx": 0,
+            "version": "7",
+            "when": 1754887720633,
+            "tag": "0000_tense_yellow_claw",
+            "breakpoints": true
+        },
+        {
+            "idx": 1,
+            "version": "7",
+            "when": 1754966400000,
+            "tag": "0001_asr_jobs",
+            "breakpoints": true
+        }
+    ]
 }

@@ -6,16 +6,16 @@ Mappings: Req numbers refer to ASR requirements document.
 
 ## 1. Database & Schema
 
--   [ ] Add Drizzle schema additions (Req: 1,2,3,4,8,9,10,11)
-    -   [ ] Create tables: asr_jobs, asr_artifacts
-    -   [ ] Add unique index (media_hash, model_version) where status='done'
-    -   [ ] Generate migration SQL
-    -   [ ] Update drizzle meta snapshot
--   [ ] Repository interfaces (Req: 1,3,5,8,9,10)
-    -   [ ] Implement AsrJobsRepository in `src/data/db/repos.ts`
-    -   [ ] Implement AsrArtifactsRepository
-    -   [ ] Add getReusable(mediaHash, modelVersion)
-    -   [ ] Unit tests with in-memory / test DB
+-   [x] Add Drizzle schema additions (Req: 1,2,3,4,8,9,10,11)
+    -   [x] Create tables: asr_jobs, asr_artifacts
+    -   [x] Add unique index (media_hash, model_version) where status='done'
+    -   [x] Generate migration SQL
+    -   [x] Update drizzle meta snapshot (journal updated; snapshot auto-updated next migrate)
+-   [x] Repository interfaces (Req: 1,3,5,8,9,10)
+    -   [x] Implement AsrJobsRepository in `src/data/db/repos.ts`
+    -   [x] Implement AsrArtifactsRepository
+    -   [x] Add getReusable(mediaHash, modelVersion)
+    -   [x] Unit tests with DB (integration test asr.repos.integration.test.ts)
 
 ## 2. Provider Abstraction
 

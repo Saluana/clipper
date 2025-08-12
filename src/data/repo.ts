@@ -49,6 +49,54 @@ export interface JobEventsRepository {
     list(jobId: string, limit?: number, offset?: number): Promise<JobEvent[]>;
 }
 
+// --- ASR (Automatic Speech Recognition) domain types ---
+export type AsrJobStatus = 'queued' | 'processing' | 'done' | 'failed';
+
+export interface AsrJobRow {
+    id: string;
+    clipJobId?: string;
+    sourceType: string; // upload | youtube | internal
+    sourceKey?: string;
+    mediaHash: string;
+    modelVersion: string;
+    languageHint?: string;
+    detectedLanguage?: string;
+    durationSec?: number;
+    status: AsrJobStatus;
+    errorCode?: string;
+    errorMessage?: string;
+    createdAt: string;
+    updatedAt: string;
+    completedAt?: string;
+    expiresAt?: string;
+}
+
+export interface AsrArtifactRow {
+    asrJobId: string;
+    kind: 'srt' | 'text' | 'json';
+    storageKey: string;
+    sizeBytes?: number;
+    createdAt: string;
+}
+
+export interface AsrJobsRepository {
+    create(
+        row: Omit<AsrJobRow, 'createdAt' | 'updatedAt' | 'status'> &
+            Partial<Pick<AsrJobRow, 'status'>>
+    ): Promise<AsrJobRow>;
+    get(id: string): Promise<AsrJobRow | null>;
+    getReusable(
+        mediaHash: string,
+        modelVersion: string
+    ): Promise<(AsrJobRow & { artifacts: AsrArtifactRow[] }) | null>;
+    patch(id: string, patch: Partial<AsrJobRow>): Promise<AsrJobRow>;
+}
+
+export interface AsrArtifactsRepository {
+    put(artifact: AsrArtifactRow): Promise<void>;
+    list(asrJobId: string): Promise<AsrArtifactRow[]>;
+}
+
 // Minimal in-memory impl to wire API/worker until DB is added
 export class InMemoryJobsRepo implements JobsRepository {
     private map = new Map<string, JobRow>();

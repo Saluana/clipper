@@ -8,6 +8,7 @@ import {
     boolean,
     jsonb,
     index,
+    primaryKey,
 } from 'drizzle-orm/pg-core';
 
 // Enums
@@ -18,6 +19,12 @@ export const jobStatus = pgEnum('job_status', [
     'failed',
 ]);
 export const sourceType = pgEnum('source_type', ['upload', 'youtube']);
+export const asrJobStatus = pgEnum('asr_job_status', [
+    'queued',
+    'processing',
+    'done',
+    'failed',
+]);
 
 // jobs table
 export const jobs = pgTable(
@@ -78,9 +85,61 @@ export const apiKeys = pgTable('api_keys', {
     lastUsedAt: timestamp('last_used_at', { withTimezone: true }),
 });
 
+// ASR tables
+export const asrJobs = pgTable(
+    'asr_jobs',
+    {
+        id: uuid('id').primaryKey(),
+        clipJobId: uuid('clip_job_id').references(() => jobs.id),
+        sourceType: text('source_type').notNull(), // upload | youtube | internal
+        sourceKey: text('source_key'),
+        mediaHash: text('media_hash').notNull(),
+        modelVersion: text('model_version').notNull(),
+        languageHint: text('language_hint'),
+        detectedLanguage: text('detected_language'),
+        durationSec: integer('duration_sec'),
+        status: asrJobStatus('status').notNull().default('queued'),
+        errorCode: text('error_code'),
+        errorMessage: text('error_message'),
+        createdAt: timestamp('created_at', { withTimezone: true })
+            .notNull()
+            .defaultNow(),
+        updatedAt: timestamp('updated_at', { withTimezone: true })
+            .notNull()
+            .defaultNow(),
+        completedAt: timestamp('completed_at', { withTimezone: true }),
+        expiresAt: timestamp('expires_at', { withTimezone: true }),
+    },
+    (t) => [
+        index('idx_asr_jobs_status_created_at').on(t.status, t.createdAt),
+        index('idx_asr_jobs_expires_at').on(t.expiresAt),
+        // Unique partial index handled via raw SQL migration (media_hash, model_version) where status='done'
+    ]
+);
+
+export const asrArtifacts = pgTable(
+    'asr_artifacts',
+    {
+        asrJobId: uuid('asr_job_id')
+            .notNull()
+            .references(() => asrJobs.id, { onDelete: 'cascade' }),
+        kind: text('kind').notNull(), // srt | text | json
+        storageKey: text('storage_key').notNull(),
+        sizeBytes: integer('size_bytes'),
+        createdAt: timestamp('created_at', { withTimezone: true })
+            .notNull()
+            .defaultNow(),
+    },
+    (t) => [primaryKey({ columns: [t.asrJobId, t.kind] })]
+);
+
 export type Job = typeof jobs.$inferSelect;
 export type NewJob = typeof jobs.$inferInsert;
 export type JobEvent = typeof jobEvents.$inferSelect;
 export type NewJobEvent = typeof jobEvents.$inferInsert;
 export type ApiKey = typeof apiKeys.$inferSelect;
 export type NewApiKey = typeof apiKeys.$inferInsert;
+export type AsrJob = typeof asrJobs.$inferSelect;
+export type NewAsrJob = typeof asrJobs.$inferInsert;
+export type AsrArtifact = typeof asrArtifacts.$inferSelect;
+export type NewAsrArtifact = typeof asrArtifacts.$inferInsert;
