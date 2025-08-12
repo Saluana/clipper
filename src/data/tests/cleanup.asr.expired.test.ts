@@ -1,15 +1,19 @@
 import 'dotenv/config';
 import { test, expect } from 'vitest';
-import { cleanupExpiredJobs } from '../cleanup';
+import { cleanupExpiredAsrJobs } from '../cleanup';
 import { createDb } from '../db/connection';
-import { jobs, type NewJob } from '../db/schema';
+import {
+    asrJobs,
+    asrArtifacts,
+    type NewAsrJob,
+    type NewAsrArtifact,
+} from '../db/schema';
 import { eq, sql } from 'drizzle-orm';
-import { storageKeys } from '../storage';
 import { readFileSync } from 'node:fs';
 
 if (!process.env.DATABASE_URL) {
     throw new Error(
-        'DATABASE_URL missing for cleanup.expired.test. Add it to your .env to run integration tests.'
+        'DATABASE_URL missing for cleanup.asr.expired.test. Add it to your .env to run integration tests.'
     );
 }
 
@@ -18,9 +22,7 @@ class MemoryStorage {
     async remove(key: string) {
         this.removed.push(key);
     }
-    async upload() {
-        /* no-op */
-    }
+    async upload() {}
     async sign() {
         return '';
     }
@@ -31,7 +33,7 @@ class MemoryStorage {
 
 async function ensureSchema() {
     const db = createDb();
-    // Detect jobs table
+    // Ensure base jobs (0000)
     let jobsExists = true;
     try {
         await db.execute(sql`select 1 from "jobs" limit 1`);
@@ -40,7 +42,6 @@ async function ensureSchema() {
         else throw e;
     }
     if (!jobsExists) {
-        // Fresh DB: run full 0000 migration file manually (avoid migrator double-run issues)
         const file = new URL(
             '../../data/drizzle/0000_tense_yellow_claw.sql',
             import.meta.url
@@ -58,7 +59,7 @@ async function ensureSchema() {
             }
         }
     }
-    // Ensure ASR migration not needed here (only jobs table required) but safe to apply 0001 if present and not applied
+    // Ensure ASR (0001)
     let asrExists = true;
     try {
         await db.execute(sql`select 1 from "asr_jobs" limit 1`);
@@ -86,32 +87,64 @@ async function ensureSchema() {
     }
 }
 
-test('cleanup removes expired job objects', async () => {
+test('cleanup removes expired ASR job + artifacts objects', async () => {
     await ensureSchema();
     const db = createDb();
-    const jobId = crypto.randomUUID();
-    const videoKey = storageKeys.resultVideo(jobId);
-    const srtKey = storageKeys.resultSrt(jobId);
-    const row: NewJob = {
-        id: jobId,
+
+    // Insert expired ASR job
+    const asrJobId = crypto.randomUUID();
+    const job: NewAsrJob = {
+        id: asrJobId,
+        clipJobId: null as any,
+        sourceType: 'internal',
+        sourceKey: null as any,
+        mediaHash: 'hash-' + asrJobId,
+        modelVersion: 'v1',
+        languageHint: null as any,
+        detectedLanguage: null as any,
+        durationSec: 10,
         status: 'done',
-        progress: 100,
-        sourceType: 'upload',
-        startSec: 0,
-        endSec: 1,
-        withSubtitles: false,
-        burnSubtitles: false,
-        resultVideoKey: videoKey,
-        resultSrtKey: srtKey,
+        errorCode: null as any,
+        errorMessage: null as any,
         createdAt: new Date(),
         updatedAt: new Date(),
+        completedAt: new Date(),
         expiresAt: new Date(Date.now() - 1000),
-    } as any; // allow partial
-    await db.insert(jobs).values(row);
+    } as any;
+    await db.insert(asrJobs).values(job);
+
+    // Insert artifacts
+    const srtKey = `results/${asrJobId}/transcript/clip.srt`;
+    const txtKey = `results/${asrJobId}/transcript/clip.txt`;
+    const art1: NewAsrArtifact = {
+        asrJobId,
+        kind: 'srt',
+        storageKey: srtKey,
+        sizeBytes: 123,
+        createdAt: new Date(),
+    } as any;
+    const art2: NewAsrArtifact = {
+        asrJobId,
+        kind: 'text',
+        storageKey: txtKey,
+        sizeBytes: 77,
+        createdAt: new Date(),
+    } as any;
+    await db.insert(asrArtifacts).values([art1, art2]);
+
     const storage = new MemoryStorage();
-    const res = await cleanupExpiredJobs({ dryRun: false, storage });
-    expect(res.deletedJobs).toBeGreaterThanOrEqual(1);
-    expect(storage.removed).toEqual(expect.arrayContaining([videoKey, srtKey]));
-    const remaining = await db.select().from(jobs).where(eq(jobs.id, jobId));
-    expect(remaining.length).toBe(0);
+    const res = await cleanupExpiredAsrJobs({ dryRun: false, storage });
+
+    expect(res.deletedAsrJobs).toBeGreaterThanOrEqual(1);
+    expect(storage.removed).toEqual(expect.arrayContaining([srtKey, txtKey]));
+    const remainingJobs = await db
+        .select()
+        .from(asrJobs)
+        .where(eq(asrJobs.id, asrJobId));
+    expect(remainingJobs.length).toBe(0);
+    const remainingArtifacts = await db
+        .select()
+        .from(asrArtifacts)
+        .where(eq(asrArtifacts.asrJobId, asrJobId));
+    expect(remainingArtifacts.length).toBe(0); // cascade delete
 });

@@ -1,4 +1,4 @@
-import { cleanupExpiredJobs } from '../cleanup';
+import { cleanupExpiredJobs, cleanupExpiredAsrJobs } from '../cleanup';
 import { createSupabaseStorageRepo } from '../storage';
 import { readEnv, readIntEnv } from '@clipper/common';
 import { createLogger } from '@clipper/common/logger';
@@ -21,14 +21,21 @@ async function main() {
               }
           })()
         : null;
-    const res = await cleanupExpiredJobs({
+    const clipRes = await cleanupExpiredJobs({
         dryRun: DRY_RUN,
         batchSize: BATCH,
         rateLimitDelayMs: RATE_DELAY,
         storage,
         logger,
     });
-    logger.info('cleanup finished', res as any);
+    const asrRes = await cleanupExpiredAsrJobs({
+        dryRun: DRY_RUN,
+        batchSize: BATCH,
+        rateLimitDelayMs: RATE_DELAY,
+        storage,
+        logger,
+    });
+    logger.info('cleanup finished', { clip: clipRes, asr: asrRes } as any);
 }
 
 if (import.meta.main) {

@@ -40,18 +40,18 @@ Only incomplete planned items from layers doc; excludes new/optional stretch fea
 
 ## 7. Cleanup (after ASR artifacts introduced)
 
--   [ ] Extend cleanup to remove expired ASR jobs + transcript artifacts
+-   [x] Extend cleanup to remove expired ASR jobs + transcript artifacts
 
 ## 8. Security & Abuse Controls
 
--   [ ] API key auth (lookup hash)
--   [ ] Basic rate limiting for job creation (per key/IP)
--   [ ] Document existing SSRF allowlist behavior
+-   [x] API key auth (lookup hash)
+-   [x] Basic rate limiting for job creation (per key/IP)
+-   [x] Document existing SSRF allowlist behavior
 
 ## 9. Docs
 
--   [ ] API reference markdown (create/status/result) with curl examples
--   [ ] Brief metrics reference (names + purpose)
+-   [x] API reference markdown (create/status/result) with curl examples
+-   [x] Brief metrics reference (names + purpose)
 
 ## 10. Tests (add alongside each feature)
 

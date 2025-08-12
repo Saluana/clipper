@@ -97,15 +97,12 @@ async function main() {
                     sourceKey: job.sourceKey!,
                 } as any);
             } else {
-                try {
-                    resolveRes = await resolveYouTubeSource({
-                        id: job.id,
-                        sourceType: 'youtube',
-                        sourceUrl: job.sourceUrl!,
-                    } as any);
-                } catch (e) {
-                    throw new Error('RESOLVE_FAILED');
-                }
+                // Let underlying error surface for clearer diagnostics
+                resolveRes = await resolveYouTubeSource({
+                    id: job.id,
+                    sourceType: 'youtube',
+                    sourceUrl: job.sourceUrl!,
+                } as any);
             }
             cleanup = resolveRes.cleanup;
             await events.add({

@@ -1,4 +1,11 @@
 import { Elysia } from 'elysia';
+// Some test environments may not set internal Elysia globals; ensure placeholder
+// to prevent TypeError when constructing Elysia during Vitest runs.
+// @ts-ignore
+if (typeof (globalThis as any).ELYSIA_AOT === 'undefined') {
+    // @ts-ignore
+    (globalThis as any).ELYSIA_AOT = false;
+}
 import cors from '@elysiajs/cors';
 import { Schemas, type CreateJobInputType } from '@clipper/contracts';
 import {
@@ -11,6 +18,7 @@ import {
 import {
     DrizzleJobsRepo,
     DrizzleJobEventsRepo,
+    DrizzleApiKeysRepo,
     createDb,
     createSupabaseStorageRepo,
 } from '@clipper/data';
@@ -21,6 +29,28 @@ const metrics = new InMemoryMetrics();
 const log = createLogger((readEnv('LOG_LEVEL') as any) || 'info').with({
     mod: 'api',
 });
+
+// Simple in-memory API key cache & rate limiter (sufficient for single-instance / test)
+type ApiKeyCacheEntry = { record: any; expiresAt: number };
+const apiKeyCache = new Map<string, ApiKeyCacheEntry>();
+const API_KEY_CACHE_TTL_MS = 5 * 60_000; // 5 minutes
+
+interface RateBucket {
+    count: number;
+    windowStart: number;
+}
+const rateBuckets = new Map<string, RateBucket>();
+function rateLimitHit(key: string, max: number, windowMs: number) {
+    const now = Date.now();
+    const b = rateBuckets.get(key);
+    if (!b || now - b.windowStart >= windowMs) {
+        rateBuckets.set(key, { count: 1, windowStart: now });
+        return false; // first hit
+    }
+    if (b.count >= max) return true;
+    b.count++;
+    return false;
+}
 
 function buildDeps() {
     let queue: any;
@@ -49,9 +79,10 @@ function buildDeps() {
             return null as any;
         }
     })();
-    return { queue, jobsRepo, eventsRepo, storage };
+    const apiKeys = new DrizzleApiKeysRepo(db);
+    return { queue, jobsRepo, eventsRepo, storage, apiKeys };
 }
-const { queue, jobsRepo, eventsRepo, storage } = buildDeps();
+const { queue, jobsRepo, eventsRepo, storage, apiKeys } = buildDeps();
 
 function tcToSec(tc: string) {
     const [hh, mm, rest] = tc.split(':');
@@ -79,6 +110,38 @@ function buildError(
     return { error: { code: errCode, message, correlationId } };
 }
 
+const ENABLE_API_KEYS =
+    (readEnv('ENABLE_API_KEYS') || 'false').toLowerCase() === 'true';
+const RATE_WINDOW_SEC = Number(readEnv('RATE_LIMIT_WINDOW_SEC') || '60');
+const RATE_MAX = Number(readEnv('RATE_LIMIT_MAX') || '30');
+
+async function resolveApiKey(request: Request) {
+    if (!ENABLE_API_KEYS) return null;
+    const auth = request.headers.get('authorization') || '';
+    let token: string | null = null;
+    if (/^bearer /i.test(auth)) token = auth.slice(7).trim();
+    else token = request.headers.get('x-api-key');
+    if (!token) return null; // absence handled separately (auth required?)
+    const cached = apiKeyCache.get(token);
+    if (cached && cached.expiresAt > Date.now()) return cached.record;
+    const rec = await apiKeys.verify(token);
+    if (rec)
+        apiKeyCache.set(token, {
+            record: rec,
+            expiresAt: Date.now() + API_KEY_CACHE_TTL_MS,
+        });
+    return rec;
+}
+
+function clientIdentity(request: Request, apiKeyId?: string | null): string {
+    if (apiKeyId) return `key:${apiKeyId}`;
+    const xf = request.headers.get('x-forwarded-for');
+    if (xf) return `ip:${xf.split(',')[0]!.trim()}`;
+    const xr = request.headers.get('x-real-ip');
+    if (xr) return `ip:${xr}`;
+    return 'ip:anon';
+}
+
 export const app = new Elysia()
     .use(cors())
     .onRequest(({ request, store }) => {
@@ -86,6 +149,24 @@ export const app = new Elysia()
         (store as any).correlationId = cid;
     })
     .state('correlationId', '')
+    // Attach auth info (if enabled) early
+    .onBeforeHandle(async ({ request, store, set, path }) => {
+        if (!ENABLE_API_KEYS) return; // feature disabled
+        // exempt health & metrics endpoints
+        if (/^\/(healthz|metrics)/.test(path)) return;
+        const rec = await resolveApiKey(request);
+        if (!rec) {
+            set.status = 401;
+            return {
+                error: {
+                    code: 'UNAUTHORIZED',
+                    message: 'API key required or invalid',
+                    correlationId: (store as any).correlationId,
+                },
+            } satisfies ApiErrorEnvelope;
+        }
+        (store as any).apiKeyId = rec.id;
+    })
     .get('/healthz', async ({ store }) => {
         const h = await queue.health();
         return {
@@ -102,8 +183,25 @@ export const app = new Elysia()
         const snap = metrics.snapshot();
         return snap;
     })
-    .post('/api/jobs', async ({ body, set, store }) => {
+    .post('/api/jobs', async ({ body, set, store, request }) => {
         const correlationId = (store as any).correlationId;
+        // Rate limit (only on creation endpoint)
+        try {
+            const keyId = (store as any).apiKeyId || null;
+            const ident = clientIdentity(request, keyId);
+            const windowMs = RATE_WINDOW_SEC * 1000;
+            if (rateLimitHit(ident, RATE_MAX, windowMs)) {
+                return buildError(
+                    set,
+                    429,
+                    'RATE_LIMITED',
+                    'Rate limit exceeded',
+                    correlationId
+                );
+            }
+        } catch (e) {
+            // Ignore limiter internal errors
+        }
         try {
             const parsed = Schemas.CreateJobInput.safeParse(body);
             if (!parsed.success) {
@@ -163,7 +261,11 @@ export const app = new Elysia()
                 'jobs.enqueue_latency_ms',
                 Date.now() - publishedAt
             );
-            log.info('job enqueued', { jobId: id, correlationId });
+            log.info('job enqueued', {
+                jobId: id,
+                correlationId,
+                apiKeyId: (store as any).apiKeyId,
+            });
             return {
                 correlationId,
                 job: {

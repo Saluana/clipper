@@ -1,3 +1,4 @@
+// Clean YouTube resolver (yt-dlp) with SSRF protections, binary fallback & debug logging
 import {
     readEnv,
     readIntEnv,
@@ -9,61 +10,62 @@ import type { ResolveResult as SharedResolveResult } from './media-io';
 import { readdir } from 'node:fs/promises';
 import { lookup } from 'node:dns/promises';
 
-type ResolveJob = {
+export type ResolveJob = {
     id: string;
     sourceType: 'youtube';
-    sourceUrl: string; // required for youtube path
+    sourceUrl: string;
 };
-
 export type FfprobeMeta = {
     durationSec: number;
     sizeBytes: number;
     container?: string;
 };
-
 export type YouTubeResolveResult = SharedResolveResult;
 
 function isPrivateIPv4(ip: string): boolean {
     if (!/^[0-9.]+$/.test(ip)) return false;
-    const parts = ip.split('.').map((x) => Number(x));
+    const parts = ip.split('.').map(Number);
     if (parts.length !== 4) return false;
-    const a = parts[0]!;
-    const b = parts[1]!;
-    if (a === 10) return true; // 10.0.0.0/8
-    if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12
-    if (a === 192 && b === 168) return true; // 192.168.0.0/16
-    if (a === 127) return true; // 127.0.0.0/8 loopback
-    if (a === 169 && b === 254) return true; // 169.254.0.0/16 link-local
-    if (a === 0) return true; // 0.0.0.0/8
-    return false;
+    const a = parts[0];
+    const b = parts[1];
+    return !!(
+        a === 10 ||
+        (a === 172 && b !== undefined && b >= 16 && b <= 31) ||
+        (a === 192 && b === 168) ||
+        a === 127 ||
+        (a === 169 && b === 254) ||
+        a === 0
+    );
 }
-
 function isPrivateIPv6(ip: string): boolean {
-    // very coarse checks
     const v = ip.toLowerCase();
-    if (v === '::1') return true; // loopback
-    if (v.startsWith('fc') || v.startsWith('fd')) return true; // ULA fc00::/7
-    if (v.startsWith('fe80:')) return true; // link-local fe80::/10
-    if (v === '::' || v === '::0') return true; // unspecified
-    return false;
+    return (
+        v === '::1' ||
+        v.startsWith('fc') ||
+        v.startsWith('fd') ||
+        v.startsWith('fe80:') ||
+        v === '::' ||
+        v === '::0'
+    );
 }
 
-async function assertSafeUrl(rawUrl: string) {
+async function assertSafeUrl(raw: string) {
     let u: URL;
     try {
-        u = new URL(rawUrl);
+        u = new URL(raw);
     } catch {
         throw new Error('SSRF_BLOCKED');
     }
     if (!/^https?:$/.test(u.protocol)) throw new Error('SSRF_BLOCKED');
-    const allowlist = (readEnv('ALLOWLIST_HOSTS') ?? '')
+    const allow = (readEnv('ALLOWLIST_HOSTS') || '')
         .split(',')
-        .map((s) => s.trim())
+        .map((s) => s.trim().toLowerCase())
         .filter(Boolean);
-    if (allowlist.length > 0 && !allowlist.includes(u.hostname)) {
-        throw new Error('SSRF_BLOCKED');
+    if (allow.length) {
+        const host = u.hostname.toLowerCase();
+        if (!allow.some((h) => host === h || host.endsWith(`.${h}`)))
+            throw new Error('SSRF_BLOCKED');
     }
-    // Resolve host to IPs and block private/link-local
     try {
         const res = await lookup(u.hostname, { all: true });
         for (const { address, family } of res) {
@@ -73,8 +75,7 @@ async function assertSafeUrl(rawUrl: string) {
             )
                 throw new Error('SSRF_BLOCKED');
         }
-    } catch (e) {
-        // If DNS fails, treat as blocked to be safe
+    } catch {
         throw new Error('SSRF_BLOCKED');
     }
 }
@@ -94,8 +95,7 @@ async function ffprobe(localPath: string): Promise<FfprobeMeta> {
         stderr: 'pipe',
     });
     const stdout = await new Response(proc.stdout).text();
-    const exit = await proc.exited;
-    if (exit !== 0) throw new Error('FFPROBE_FAILED');
+    if ((await proc.exited) !== 0) throw new Error('FFPROBE_FAILED');
     const json = JSON.parse(stdout);
     const durationSec = json?.format?.duration
         ? Number(json.format.duration)
@@ -107,54 +107,41 @@ async function ffprobe(localPath: string): Promise<FfprobeMeta> {
     return { durationSec, sizeBytes, container };
 }
 
-async function findDownloadedFile(baseDir: string): Promise<string | null> {
-    const files = await readdir(baseDir).catch(() => []);
+async function findDownloadedFile(dir: string): Promise<string | null> {
+    const files = await readdir(dir).catch(() => []);
     const candidates = files.filter((f) => f.startsWith('source.'));
-    if (candidates.length === 0) return null;
-    // Prefer mp4 if present
+    if (!candidates.length) return null;
     const mp4 = candidates.find((f) => f.endsWith('.mp4'));
-    const chosen = mp4 ?? candidates[0];
-    return `${baseDir}/${chosen}`;
+    return `${dir}/${mp4 ?? candidates[0]}`;
 }
 
 export async function resolveYouTubeSource(
     job: ResolveJob,
     deps: { metrics?: Metrics } = {}
 ): Promise<YouTubeResolveResult> {
-    const logger = createLogger((readEnv('LOG_LEVEL') as any) ?? 'info').with({
+    const logger = createLogger((readEnv('LOG_LEVEL') as any) || 'info').with({
         comp: 'mediaio',
         jobId: job.id,
     });
     const metrics = deps.metrics ?? noopMetrics;
-
-    const SCRATCH_DIR = readEnv('SCRATCH_DIR') ?? '/tmp/ytc';
+    const SCRATCH = readEnv('SCRATCH_DIR') || '/tmp/ytc';
     const MAX_MB = readIntEnv('MAX_INPUT_MB', 1024)!;
     const MAX_DUR = readIntEnv('MAX_CLIP_INPUT_DURATION_SEC', 7200)!;
-    const ENABLE = (readEnv('ENABLE_YTDLP') ?? 'false') === 'true';
+    const ENABLE = (readEnv('ENABLE_YTDLP') || 'false') === 'true';
+    const DEBUG = (readEnv('YTDLP_DEBUG') || 'false').toLowerCase() === 'true';
+    const BIN_OVERRIDE = readEnv('YTDLP_BIN');
 
-    const baseDir = `${SCRATCH_DIR.replace(/\/$/, '')}/sources/${job.id}`;
-    const outTemplate = `${baseDir}/source.%(ext)s`;
-
-    const resolveStart = Date.now();
     logger.info('resolving youtube to local path');
-
-    if (!ENABLE) {
-        logger.warn('yt-dlp disabled, rejecting request');
-        throw new Error('YTDLP_DISABLED');
-    }
-
+    if (!ENABLE) throw new Error('YTDLP_DISABLED');
     await assertSafeUrl(job.sourceUrl);
 
-    {
-        const p = Bun.spawn(['mkdir', '-p', baseDir]);
-        const code = await p.exited;
-        if (code !== 0) throw new Error('MKDIR_FAILED');
-    }
-
-    // Run yt-dlp
+    const baseDir = `${SCRATCH.replace(/\/$/, '')}/sources/${job.id}`;
+    await Bun.spawn(['mkdir', '-p', baseDir]).exited;
+    const outTemplate = `${baseDir}/source.%(ext)s`;
+    const format = readEnv('YTDLP_FORMAT') || 'bv*+ba/b';
     const ytdlpArgs = [
         '-f',
-        'bv*+ba/b',
+        format,
         '-o',
         outTemplate,
         '--quiet',
@@ -163,79 +150,117 @@ export async function resolveYouTubeSource(
         '--no-part',
         '--retries',
         '3',
+        '--merge-output-format',
+        'mp4',
     ];
-    if (MAX_MB && MAX_MB > 0) {
-        ytdlpArgs.push('--max-filesize', `${MAX_MB}m`);
+    if (MAX_MB > 0) ytdlpArgs.push('--max-filesize', `${MAX_MB}m`);
+    const sections = readEnv('YTDLP_SECTIONS');
+    if (sections) {
+        // Expect comma-separated list like "*00:01:00-00:02:00,*00:10:00-00:10:30"
+        for (const sec of sections
+            .split(',')
+            .map((s) => s.trim())
+            .filter(Boolean)) {
+            ytdlpArgs.push('--download-sections', sec);
+        }
     }
     ytdlpArgs.push(job.sourceUrl);
 
-    const ytdlpStart = Date.now();
-    const proc = Bun.spawn(['yt-dlp', ...ytdlpArgs], {
+    const candidates = Array.from(
+        new Set([
+            BIN_OVERRIDE || 'yt-dlp',
+            '/opt/homebrew/bin/yt-dlp',
+            '/usr/local/bin/yt-dlp',
+            '/usr/bin/yt-dlp',
+        ])
+    );
+    let bin: string | undefined;
+    for (const b of candidates) {
+        try {
+            const t = Bun.spawn([b, '--version'], {
+                stdout: 'ignore',
+                stderr: 'ignore',
+            });
+            if ((await t.exited) === 0) {
+                bin = b;
+                break;
+            }
+        } catch {}
+    }
+    if (!bin) throw new Error('YTDLP_NOT_FOUND');
+    if (DEBUG)
+        logger.info('yt-dlp starting', { bin, args: ytdlpArgs.join(' ') });
+
+    const timeoutMs = Math.min(MAX_DUR * 1000, 15 * 60 * 1000);
+    const dlStart = Date.now();
+    let timedOut = false;
+    const proc = Bun.spawn([bin, ...ytdlpArgs], {
         stdout: 'pipe',
         stderr: 'pipe',
-        env: {}, // minimal env to avoid secret leaks
+        env: { PATH: (process as any).env?.PATH || '' },
     });
-    const timeoutMs = Math.min(MAX_DUR * 1000, 15 * 60 * 1000); // cap timeout to 15min
-    let timedOut = false;
-    const timeout = setTimeout(() => {
+    const timer = setTimeout(() => {
         try {
             proc.kill('SIGKILL');
             timedOut = true;
         } catch {}
     }, timeoutMs);
-
+    const stderrP = new Response(proc.stderr).text();
+    const stdoutP = new Response(proc.stdout).text();
     const exitCode = await proc.exited;
-    clearTimeout(timeout);
-    metrics.observe('mediaio.ytdlp.duration_ms', Date.now() - ytdlpStart, {
+    const [stderrText, stdoutText] = await Promise.all([
+        stderrP.catch(() => ''),
+        stdoutP.catch(() => ''),
+    ]);
+    clearTimeout(timer);
+    metrics.observe('mediaio.ytdlp.duration_ms', Date.now() - dlStart, {
         jobId: job.id,
     });
-
     if (timedOut) {
-        // cleanup and throw
-        const p = Bun.spawn(['rm', '-rf', baseDir]);
-        await p.exited;
+        await Bun.spawn(['rm', '-rf', baseDir]).exited;
         throw new Error('YTDLP_TIMEOUT');
     }
     if (exitCode !== 0) {
-        const p = Bun.spawn(['rm', '-rf', baseDir]);
-        await p.exited;
-        throw new Error('YTDLP_FAILED');
+        if (DEBUG)
+            logger.error('yt-dlp failed', {
+                exitCode,
+                stderr: stderrText.slice(0, 800),
+            });
+        await Bun.spawn(['rm', '-rf', baseDir]).exited;
+        throw new Error(`YTDLP_FAILED:${exitCode}`);
     }
+    if (DEBUG)
+        logger.info('yt-dlp succeeded', {
+            exitCode,
+            stderrPreview: stderrText.slice(0, 200),
+            stdoutPreview: stdoutText.slice(0, 200),
+        });
 
     const localPath = await findDownloadedFile(baseDir);
     if (!localPath) {
-        const p = Bun.spawn(['rm', '-rf', baseDir]);
-        await p.exited;
+        await Bun.spawn(['rm', '-rf', baseDir]).exited;
         throw new Error('YTDLP_FAILED');
     }
 
-    // ffprobe validation
     const ffStart = Date.now();
     const meta = await ffprobe(localPath);
     metrics.observe('mediaio.ffprobe.duration_ms', Date.now() - ffStart, {
         jobId: job.id,
     });
-
     if (meta.durationSec > MAX_DUR || meta.sizeBytes > MAX_MB * 1024 * 1024) {
-        const p = Bun.spawn(['rm', '-rf', baseDir]);
-        await p.exited;
+        await Bun.spawn(['rm', '-rf', baseDir]).exited;
         throw new Error('INPUT_TOO_LARGE');
     }
 
     const cleanup = async () => {
-        const p = Bun.spawn(['rm', '-rf', baseDir]);
-        await p.exited;
+        await Bun.spawn(['rm', '-rf', baseDir]).exited;
     };
-
-    const totalMs = Date.now() - resolveStart;
-    metrics.observe('mediaio.resolve.duration_ms', totalMs, {
+    metrics.observe('mediaio.resolve.duration_ms', Date.now() - dlStart, {
         jobId: job.id,
     });
     logger.info('youtube resolved', {
         durationSec: meta.durationSec,
         sizeBytes: meta.sizeBytes,
-        durationMs: totalMs,
     });
-
     return { localPath, cleanup, meta };
 }

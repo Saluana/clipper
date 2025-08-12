@@ -1,5 +1,5 @@
 import { createDb } from './db/connection';
-import { jobs } from './db/schema';
+import { jobs, asrJobs, asrArtifacts } from './db/schema';
 import { lte, isNotNull, and, eq, desc } from 'drizzle-orm';
 import type { StorageRepo } from './storage';
 import type { Logger } from '../common';
@@ -95,6 +95,116 @@ export async function cleanupExpiredJobs(
         if (delay > 0) await sleep(delay);
     }
 
+    return result;
+}
+
+// --- ASR Cleanup -----------------------------------------------------------
+
+export type AsrCleanupItem = {
+    asrJobId: string;
+    artifactKeys: string[];
+};
+
+export type AsrCleanupResult = {
+    scanned: number; // expired ASR jobs found
+    deletedAsrJobs: number;
+    deletedArtifacts: number; // storage objects removed
+    items: AsrCleanupItem[];
+    errors: Array<{
+        asrJobId: string;
+        stage: 'storage' | 'db';
+        error: string;
+    }>;
+};
+
+export async function cleanupExpiredAsrJobs(
+    opts: CleanupOptions = {}
+): Promise<AsrCleanupResult> {
+    const db = createDb();
+    const now = opts.now ?? new Date();
+    const limit = opts.batchSize ?? 100;
+    const dryRun = opts.dryRun ?? true;
+    const delay = opts.rateLimitDelayMs ?? 0;
+    const storage = opts.storage ?? null;
+    const logger =
+        opts.logger ?? createLogger('info').with({ comp: 'cleanup.asr' });
+    const metrics = opts.metrics ?? noopMetrics;
+
+    // Fetch expired ASR jobs
+    const rows = await db
+        .select()
+        .from(asrJobs)
+        .where(and(isNotNull(asrJobs.expiresAt), lte(asrJobs.expiresAt, now)))
+        .orderBy(desc(asrJobs.expiresAt))
+        .limit(limit);
+
+    const result: AsrCleanupResult = {
+        scanned: rows.length,
+        deletedAsrJobs: 0,
+        deletedArtifacts: 0,
+        items: [],
+        errors: [],
+    };
+
+    for (const r of rows) {
+        const asrJobId = r.id as string;
+        // Load artifacts for storage keys
+        let artifactsRows: Array<{ storageKey: string | null }> = [];
+        try {
+            artifactsRows = await db
+                .select({ storageKey: asrArtifacts.storageKey })
+                .from(asrArtifacts)
+                .where(eq(asrArtifacts.asrJobId, asrJobId));
+        } catch (e) {
+            // Non-fatal; proceed with empty list
+            logger.warn('artifact list failed', { asrJobId });
+        }
+        const artifactKeys = artifactsRows
+            .map((a) => a.storageKey)
+            .filter((k): k is string => !!k);
+        result.items.push({ asrJobId, artifactKeys });
+
+        if (dryRun) continue;
+
+        if (storage) {
+            for (const key of artifactKeys) {
+                try {
+                    await storage.remove(key);
+                    result.deletedArtifacts++;
+                } catch (e) {
+                    const msg = e instanceof Error ? e.message : String(e);
+                    result.errors.push({
+                        asrJobId,
+                        stage: 'storage',
+                        error: msg,
+                    });
+                    logger.warn('artifact delete failed', {
+                        asrJobId,
+                        key,
+                        msg,
+                    });
+                }
+                if (delay > 0) await sleep(delay);
+            }
+        }
+
+        // Delete ASR job (cascades artifacts table rows)
+        try {
+            await db.delete(asrJobs).where(eq(asrJobs.id, asrJobId));
+            result.deletedAsrJobs++;
+            metrics.inc('cleanup.asrJobs.deleted', 1);
+            logger.info('asr job deleted', { asrJobId });
+        } catch (e) {
+            const msg = e instanceof Error ? e.message : String(e);
+            result.errors.push({
+                asrJobId,
+                stage: 'db',
+                error: msg,
+            });
+            logger.error('asr db delete failed', { asrJobId, msg });
+        }
+        if (delay > 0) await sleep(delay);
+    }
     return result;
 }
 

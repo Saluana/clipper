@@ -33,6 +33,31 @@ function fmtTs(sec: number): string {
     return `${sign}${hh}:${mm}:${ss}.${ms}`;
 }
 
+async function probeDuration(path: string): Promise<number | null> {
+    try {
+        const proc = Bun.spawn(
+            [
+                'ffprobe',
+                '-v',
+                'error',
+                '-show_entries',
+                'format=duration',
+                '-of',
+                'default=noprint_wrappers=1:nokey=1',
+                path,
+            ],
+            { stdout: 'pipe', stderr: 'ignore' }
+        );
+        const out = await new Response(proc.stdout).text();
+        await proc.exited;
+        const dur = Number(out.trim());
+        if (!Number.isFinite(dur)) return null;
+        return dur;
+    } catch {
+        return null;
+    }
+}
+
 interface AttemptResult {
     ok: boolean;
     code: number;
@@ -105,12 +130,15 @@ export class BunClipper implements Clipper {
                 '-y',
                 '-progress',
                 'pipe:1',
+                // For accuracy we will vary placement of -ss and duration flags per mode
                 '-ss',
                 startTs,
                 '-i',
                 args.input,
-                '-to',
-                endTs,
+                // We'll prefer -to for copy (fast seek) and switch to -t during re-encode for precision
+                ...(mode === 'copy'
+                    ? ['-to', endTs]
+                    : ['-t', totalDuration.toString()]),
                 '-movflags',
                 '+faststart',
             ];
@@ -185,8 +213,23 @@ export class BunClipper implements Clipper {
         // Fast path attempt
         const copyResult = await attempt('copy');
         if (copyResult.attempt.ok) {
-            // Provide progress$ from copy attempt (already consumed until exit). For copy success, progress$ has already completed.
-            return { localPath: outPath, progress$: copyResult.progress$! };
+            // Validate duration accuracy; tolerate +/- 1s drift; if larger drift fallback to precise re-encode
+            const observed = await probeDuration(outPath);
+            if (
+                observed != null &&
+                (observed > totalDuration + 1 || observed < totalDuration - 1)
+            ) {
+                log.info(
+                    'copy duration inaccurate; re-encoding for precision',
+                    {
+                        jobId: args.jobId,
+                        expected: totalDuration,
+                        observed,
+                    }
+                );
+            } else {
+                return { localPath: outPath, progress$: copyResult.progress$! };
+            }
         }
 
         // Fallback (fresh progress stream)
