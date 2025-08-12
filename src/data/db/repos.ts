@@ -186,15 +186,24 @@ export class DrizzleJobEventsRepo implements JobEventsRepository {
 
     async add(evt: RepoJobEvent): Promise<void> {
         const start = Date.now();
-        await this.db.insert(jobEvents).values({
-            jobId: evt.jobId,
-            ts: new Date(evt.ts),
-            type: evt.type,
-            data: evt.data ?? null,
-        });
-        this.metrics.observe('repo.op.duration_ms', Date.now() - start, {
-            op: 'events.add',
-        });
+        try {
+            await this.db.insert(jobEvents).values({
+                jobId: evt.jobId,
+                ts: new Date(evt.ts),
+                type: evt.type,
+                data: evt.data ?? null,
+            });
+        } catch (e) {
+            // Increment persistence failure metric (Req 8.1)
+            try {
+                (this.metrics as any).inc?.('events.persist_failures_total');
+            } catch {}
+            throw e;
+        } finally {
+            this.metrics.observe('repo.op.duration_ms', Date.now() - start, {
+                op: 'events.add',
+            });
+        }
     }
 
     async list(

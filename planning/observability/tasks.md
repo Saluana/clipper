@@ -55,8 +55,8 @@ artifact_id: 8f5b7a3c-9d8a-4c1f-b2f9-3e6d2c1a7b90
 
 ## 8. Event Persistence Reliability
 
--   [ ] 8.1 Add metric events.persist_failures_total (Req 8)
--   [ ] 8.2 Test DB failure path increments metric (Req 8)
+-   [x] 8.1 Add metric events.persist_failures_total (Req 8)
+-   [x] 8.2 Test DB failure path increments metric (Req 8)
 
 ## 9. Health & Readiness Expansion
 
