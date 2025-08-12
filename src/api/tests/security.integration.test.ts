@@ -1,6 +1,6 @@
 import 'dotenv/config';
 import { describe, test, expect, beforeAll } from 'vitest';
-import { app } from './index';
+import { app } from '../index';
 import { DrizzleApiKeysRepo, createDb } from '@clipper/data';
 import { Pool } from 'pg';
 import { readdir, readFile } from 'node:fs/promises';
