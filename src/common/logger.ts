@@ -16,15 +16,34 @@ function emit(
     msg: string,
     fields?: Record<string, unknown>
 ) {
+    // Apply redaction to message & structured fields
+    const redactedBase = redactSecrets(base) as Record<string, unknown>;
+    const redactedFields = redactSecrets(fields ?? ({} as any)) as Record<
+        string,
+        unknown
+    >;
+    // Ensure correlationId (if present) not accidentally redacted
+    const correlationId =
+        (fields as any)?.correlationId || (base as any)?.correlationId;
+    if (correlationId) {
+        redactedBase.correlationId = correlationId;
+        redactedFields.correlationId = correlationId;
+    }
     const line = {
         level,
         ts: new Date().toISOString(),
         msg: redactSecrets(msg),
-        ...redactSecrets(base),
-        ...redactSecrets(fields ?? {}),
+        ...redactedBase,
+        ...redactedFields,
     };
-    // eslint-disable-next-line no-console
-    console[level === 'debug' ? 'log' : level](JSON.stringify(line));
+    try {
+        console[level === 'debug' ? 'log' : level](JSON.stringify(line));
+    } catch {
+        // Fallback minimal log on serialization error
+        try {
+            console.error('{"level":"error","msg":"log serialization failed"}');
+        } catch {}
+    }
 }
 
 export function createLogger(

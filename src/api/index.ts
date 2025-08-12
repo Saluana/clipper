@@ -187,18 +187,21 @@ function clientIdentity(request: Request, apiKeyId?: string | null): string {
     return 'ip:anon';
 }
 
+// Correlation id middleware MUST be early (Req 7.1)
+const baseApp = new Elysia().onRequest(({ request, store, set }) => {
+    const cid = request.headers.get('x-request-id') || crypto.randomUUID();
+    (store as any).correlationId = cid;
+    (store as any).__reqStart = performance.now();
+    // propagate header
+    set.headers['x-correlation-id'] = cid;
+});
+
 // HTTP metrics names:
 // http.requests_total{method,route,code_class}
 // http.errors_total{route,code}
 // http.request_latency_ms{route}
-export const app = addHttpInstrumentation(new Elysia())
+export const app = addHttpInstrumentation(baseApp)
     .use(cors())
-    .onRequest(({ request, store }) => {
-        const cid = request.headers.get('x-request-id') || crypto.randomUUID();
-        (store as any).correlationId = cid;
-        // record start time for http instrumentation
-        (store as any).__reqStart = performance.now();
-    })
     .state('correlationId', '')
     // After each handler finalize metrics (onAfterHandle does not catch thrown errors w/ set? Use onResponse hook)
     .onAfterHandle(({ store, path, request, set, response }) => {
@@ -353,6 +356,7 @@ export const app = addHttpInstrumentation(new Elysia())
                 jobId: id,
                 ts: new Date().toISOString(),
                 type: 'created',
+                data: { correlationId },
             });
             const publishedAt = Date.now();
             await queue.publish({ jobId: id, priority: 'normal' });

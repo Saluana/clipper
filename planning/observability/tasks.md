@@ -49,9 +49,9 @@ artifact_id: 8f5b7a3c-9d8a-4c1f-b2f9-3e6d2c1a7b90
 
 ## 7. Structured Logging Enhancements
 
--   [ ] 7.1 Ensure correlationId middleware early (Req 7)
--   [ ] 7.2 Include correlationId in job events/logs (Req 7)
--   [ ] 7.3 Add redaction pass for log field serialization (Req 7)
+-   [x] 7.1 Ensure correlationId middleware early (Req 7)
+-   [x] 7.2 Include correlationId in job events/logs (Req 7)
+-   [x] 7.3 Add redaction pass for log field serialization (Req 7)
 
 ## 8. Event Persistence Reliability
 
