@@ -6,7 +6,11 @@ import {
     storageKeys,
     createSupabaseStorageRepo,
 } from '@clipper/data';
-import { buildArtifacts, GroqWhisperProvider } from '@clipper/asr';
+import {
+    buildArtifacts,
+    GroqWhisperProvider,
+    ProviderHttpError,
+} from '@clipper/asr';
 import { QUEUE_TOPIC_ASR } from '@clipper/queue';
 import {
     AsrQueuePayloadSchema,
@@ -87,10 +91,25 @@ export async function startAsrWorker(deps: AsrWorkerDeps) {
             }
 
             // Transcribe
-            const res = await provider.transcribe(inputLocal, {
-                timeoutMs,
-                languageHint,
-            });
+            let res;
+            try {
+                res = await provider.transcribe(inputLocal, {
+                    timeoutMs,
+                    languageHint,
+                });
+            } catch (err: any) {
+                // Map provider errors to internal codes
+                if (err?.name === 'AbortError') throw new Error('TIMEOUT');
+                if (err instanceof ProviderHttpError) {
+                    if (err.status === 0) throw new Error('UPSTREAM_FAILURE');
+                    if (err.status >= 500) throw new Error('UPSTREAM_FAILURE');
+                    if (err.status === 400)
+                        throw new Error('VALIDATION_FAILED');
+                    // treat others as upstream
+                    throw new Error('UPSTREAM_FAILURE');
+                }
+                throw err;
+            }
 
             // Build artifacts
             const built = buildArtifacts(res.segments, {
@@ -149,6 +168,57 @@ export async function startAsrWorker(deps: AsrWorkerDeps) {
                 durationSec: Math.round(res.durationSec),
                 completedAt: new Date().toISOString(),
             });
+
+            // Update originating clip job with transcript key if available
+            if (clipJobId) {
+                try {
+                    await clipJobs.update(clipJobId, {
+                        resultSrtKey: srtKey,
+                    } as any);
+                } catch {}
+            }
+
+            // Burn-in subtitles if the originating clip requested it
+            if (clipJobId && includeJson) {
+                try {
+                    const clip = await clipJobs.get(clipJobId);
+                    if (clip?.burnSubtitles && clip?.resultVideoKey) {
+                        const burnedKey =
+                            storageKeys.resultVideoBurned(clipJobId);
+                        const clipLocal = await storage.download(
+                            clip.resultVideoKey
+                        );
+                        const srtLocal = await storage.download(srtKey);
+                        // Simple ffmpeg burn-in (assumes ffmpeg installed in env)
+                        const burnedPath = `/tmp/${clipJobId}.subbed.mp4`;
+                        const ff = Bun.spawn([
+                            'ffmpeg',
+                            '-y',
+                            '-i',
+                            clipLocal,
+                            '-vf',
+                            `subtitles=${srtLocal}:force_style='Fontsize=18'`,
+                            '-c:a',
+                            'copy',
+                            burnedPath,
+                        ]);
+                        await ff.exited;
+                        await storage.upload(
+                            burnedPath,
+                            burnedKey,
+                            'video/mp4'
+                        );
+                        await clipJobs.update(clipJobId, {
+                            resultVideoKey: burnedKey,
+                        } as any);
+                    }
+                } catch (e) {
+                    log.warn('burn-in failed (non-fatal)', {
+                        asrJobId,
+                        e: String(e),
+                    });
+                }
+            }
         } catch (e) {
             const err = fromException(e, asrJobId);
             log.error('asr job failed', { asrJobId, err });

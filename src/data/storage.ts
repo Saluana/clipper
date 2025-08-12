@@ -5,6 +5,7 @@ export const storageKeys = {
     source: (jobId: string, ext: string) =>
         `sources/${jobId}/source.${ext.replace(/^\./, '')}`,
     resultVideo: (jobId: string) => `results/${jobId}/clip.mp4`,
+    resultVideoBurned: (jobId: string) => `results/${jobId}/clip.subbed.mp4`,
     resultSrt: (jobId: string) => `results/${jobId}/clip.srt`,
     transcriptSrt: (ownerId: string) =>
         `results/${ownerId}/transcript/clip.srt`,

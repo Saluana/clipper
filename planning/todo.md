@@ -27,11 +27,11 @@ Only incomplete planned items from layers doc; excludes new/optional stretch fea
 
 ## 5. ASR Pipeline (major missing functional layer)
 
--   [ ] ASR queue consumer: extract audio (-vn -ac 1 -ar 16k), call provider, build SRT/text/(json), upload, insert asr_artifacts, update asr_jobs
--   [ ] Provider error mapping (TIMEOUT, UPSTREAM_FAILURE, VALIDATION_FAILED)
--   [ ] Update originating clip job.resultSrtKey on ASR completion
--   [ ] Persist resultSrtKey when ASR finishes
--   [ ] Burn-in subtitles when job.burnSubtitles=true
+-   [x] ASR queue consumer: extract audio (-vn -ac 1 -ar 16k), call provider, build SRT/text/(json), upload, insert asr_artifacts, update asr_jobs
+-   [x] Provider error mapping (TIMEOUT, UPSTREAM_FAILURE, VALIDATION_FAILED)
+-   [x] Update originating clip job.resultSrtKey on ASR completion
+-   [x] Persist resultSrtKey when ASR finishes
+-   [x] Burn-in subtitles when job.burnSubtitles=true
 
 ## 6. Observability (instrument after ASR path exists)
 
