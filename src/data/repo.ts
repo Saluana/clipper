@@ -20,6 +20,7 @@ export interface JobRow {
     createdAt: string;
     updatedAt: string;
     expiresAt?: string;
+    lastHeartbeatAt?: string;
 }
 
 export interface JobEvent {

@@ -345,6 +345,9 @@ function toJobRow(j: any): JobRow {
         createdAt: j.createdAt.toISOString(),
         updatedAt: j.updatedAt.toISOString(),
         expiresAt: j.expiresAt ? j.expiresAt.toISOString() : undefined,
+        lastHeartbeatAt: j.lastHeartbeatAt
+            ? j.lastHeartbeatAt.toISOString()
+            : undefined,
     };
 }
 
@@ -353,6 +356,7 @@ function toJobsPatch(patch: Partial<JobRow>) {
     for (const [k, v] of Object.entries(patch)) {
         if (v === undefined) continue;
         if (k === 'expiresAt' && v) out[k] = new Date(v as string);
+        else if (k === 'lastHeartbeatAt' && v) out[k] = new Date(v as string);
         else out[k] = v as any;
     }
     return out;

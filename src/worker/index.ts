@@ -47,9 +47,22 @@ async function main() {
     await queue.start();
     await queue.consume(async ({ jobId }: { jobId: string }) => {
         const startedAt = Date.now();
+        const maxMs = Number(readEnv('CLIP_MAX_RUNTIME_SEC') || 600) * 1000; // default 10m
         const nowIso = () => new Date().toISOString();
         let cleanup: (() => Promise<void>) | null = null;
         let outputLocal: string | null = null;
+        let lastHeartbeat = 0;
+        const heartbeatIntervalMs = Number(
+            readEnv('WORKER_HEARTBEAT_INTERVAL_MS') || 15_000
+        );
+        const sendHeartbeat = async () => {
+            const now = Date.now();
+            if (now - lastHeartbeat < heartbeatIntervalMs) return;
+            lastHeartbeat = now;
+            try {
+                await jobs.update(jobId, { lastHeartbeatAt: nowIso() } as any);
+            } catch {}
+        };
 
         const finish = async (status: 'done' | 'failed', patch: any = {}) => {
             await jobs.update(jobId, { status, ...patch });
@@ -117,10 +130,15 @@ async function main() {
                     type: 'progress',
                     data: { pct, stage: 'clip' },
                 });
+                await sendHeartbeat();
             };
             const debounceMs = 500;
             for await (const pct of progress$) {
                 const now = Date.now();
+                // Global timeout enforcement
+                if (now - startedAt > maxMs) {
+                    throw new Error('CLIP_TIMEOUT');
+                }
                 if (
                     pct === 100 ||
                     pct >= lastPct + 1 ||
@@ -129,9 +147,13 @@ async function main() {
                     await persist(pct);
                     lastPersist = now;
                     lastPct = pct;
+                } else {
+                    // Even if we didn't persist progress, still emit heartbeat occasionally
+                    await sendHeartbeat();
                 }
             }
             if (lastPct < 100) await persist(100);
+            await sendHeartbeat();
 
             // Upload result
             if (!storage) throw new Error('STORAGE_NOT_AVAILABLE');
@@ -227,6 +249,10 @@ async function main() {
                 await events.add({ jobId, ts: nowIso(), type: 'failed' });
             } catch {}
         } finally {
+            // Final heartbeat on exit (success or failure) if runtime not exceeded
+            try {
+                await jobs.update(jobId, { lastHeartbeatAt: nowIso() } as any);
+            } catch {}
             // Cleanup source + local output
             if (cleanup) {
                 try {

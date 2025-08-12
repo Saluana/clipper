@@ -22,8 +22,8 @@ Only incomplete planned items from layers doc; excludes new/optional stretch fea
 
 ## 4. Reliability Hardening (stabilize before ASR load)
 
--   [ ] Worker heartbeat writes (last_heartbeat_at updates)
--   [ ] Global clip timeout enforcement
+-   [x] Worker heartbeat writes (last_heartbeat_at updates)
+-   [x] Global clip timeout enforcement
 
 ## 5. ASR Pipeline (major missing functional layer)
 
