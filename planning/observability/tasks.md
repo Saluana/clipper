@@ -14,10 +14,10 @@ artifact_id: 8f5b7a3c-9d8a-4c1f-b2f9-3e6d2c1a7b90
 
 ## 2. HTTP Instrumentation
 
--   [ ] 2.1 Middleware wrap request lifecycle (start/end) (Req 2)
--   [ ] 2.2 Expose status code class label (2xx/4xx/5xx) (Req 2)
--   [ ] 2.3 Error path increments http.errors_total (Req 2)
--   [ ] 2.4 Integration test for GET /healthz + 404 path metrics (Req 2)
+-   [x] 2.1 Middleware wrap request lifecycle (start/end) (Req 2)
+-   [x] 2.2 Expose status code class label (2xx/4xx/5xx) (Req 2)
+-   [x] 2.3 Error path increments http.errors_total (Req 2)
+-   [x] 2.4 Integration test for GET /healthz + 404 path metrics (Req 2)
 
 ## 3. Job Lifecycle Metrics
 

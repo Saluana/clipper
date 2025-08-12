@@ -22,10 +22,10 @@ import {
     createDb,
     createSupabaseStorageRepo,
 } from '@clipper/data';
-import { InMemoryMetrics } from '@clipper/common/metrics';
+import { InMemoryMetrics, normalizeRoute } from '@clipper/common/metrics';
 import { PgBossQueueAdapter } from '@clipper/queue';
 
-const metrics = new InMemoryMetrics();
+export const metrics = new InMemoryMetrics();
 const log = createLogger((readEnv('LOG_LEVEL') as any) || 'info').with({
     mod: 'api',
 });
@@ -115,6 +115,51 @@ const ENABLE_API_KEYS =
 const RATE_WINDOW_SEC = Number(readEnv('RATE_LIMIT_WINDOW_SEC') || '60');
 const RATE_MAX = Number(readEnv('RATE_LIMIT_MAX') || '30');
 
+// HTTP instrumentation middleware (Req 2)
+function addHttpInstrumentation(app: Elysia) {
+    app.onBeforeHandle(({ store, request, path }) => {
+        (store as any)._httpStart = performance.now();
+        (store as any)._httpRoute = normalizeRoute(path || '/');
+    });
+    app.onAfterHandle(({ store, request, set, response }) => {
+        try {
+            const route =
+                (store as any)._httpRoute || normalizeRoute(request.url);
+            const started = (store as any)._httpStart || performance.now();
+            const dur = performance.now() - started;
+            const method = request.method.toUpperCase();
+            const codeNum = Number(
+                set.status || (response as any)?.status || 200
+            );
+            const codeClass = `${Math.floor(codeNum / 100)}xx`;
+            metrics.inc('http.requests_total', 1, {
+                method,
+                route,
+                code_class: codeClass,
+            });
+            metrics.observe('http.request_latency_ms', dur, { route });
+            if (codeNum >= 400)
+                metrics.inc('http.errors_total', 1, { route, code: codeNum });
+        } catch {}
+    });
+    app.onError(({ store, request, set }) => {
+        try {
+            const route =
+                (store as any)._httpRoute || normalizeRoute(request.url);
+            const method = request.method.toUpperCase();
+            const codeNum = Number(set.status || 500);
+            const codeClass = `${Math.floor(codeNum / 100)}xx`;
+            metrics.inc('http.requests_total', 1, {
+                method,
+                route,
+                code_class: codeClass,
+            });
+            metrics.inc('http.errors_total', 1, { route, code: codeNum });
+        } catch {}
+    });
+    return app;
+}
+
 async function resolveApiKey(request: Request) {
     if (!ENABLE_API_KEYS) return null;
     const auth = request.headers.get('authorization') || '';
@@ -142,13 +187,66 @@ function clientIdentity(request: Request, apiKeyId?: string | null): string {
     return 'ip:anon';
 }
 
-export const app = new Elysia()
+// HTTP metrics names:
+// http.requests_total{method,route,code_class}
+// http.errors_total{route,code}
+// http.request_latency_ms{route}
+export const app = addHttpInstrumentation(new Elysia())
     .use(cors())
     .onRequest(({ request, store }) => {
         const cid = request.headers.get('x-request-id') || crypto.randomUUID();
         (store as any).correlationId = cid;
+        // record start time for http instrumentation
+        (store as any).__reqStart = performance.now();
     })
     .state('correlationId', '')
+    // After each handler finalize metrics (onAfterHandle does not catch thrown errors w/ set? Use onResponse hook)
+    .onAfterHandle(({ store, path, request, set, response }) => {
+        try {
+            const started = (store as any).__reqStart as number | undefined;
+            if (started === undefined) return;
+            const rt = performance.now() - started;
+            const method = request.method;
+            const route = normalizeRoute(path);
+            const rawStatus: any =
+                set.status || (response as any)?.status || 200;
+            const code =
+                typeof rawStatus === 'number'
+                    ? rawStatus
+                    : Number(rawStatus) || 200;
+            const codeClass = `${Math.floor(code / 100)}xx`;
+            metrics.inc('http.requests_total', 1, {
+                method,
+                route,
+                code_class: codeClass,
+            });
+            metrics.observe('http.request_latency_ms', rt, { route });
+            if (code >= 400) {
+                metrics.inc('http.errors_total', 1, { route, code });
+            }
+        } catch {}
+    })
+    // onError hook catches exceptions & explicit error responses
+    .onError(({ store, error, path, request, set }) => {
+        try {
+            const method = request.method;
+            const route = normalizeRoute(path);
+            const rawStatus: any = set.status || 500;
+            const code =
+                typeof rawStatus === 'number'
+                    ? rawStatus
+                    : Number(rawStatus) || 500;
+            const codeClass = `${Math.floor(code / 100)}xx`;
+            // ensure request counter still increments on error (if not already)
+            metrics.inc('http.requests_total', 1, {
+                method,
+                route,
+                code_class: codeClass,
+            });
+            metrics.inc('http.errors_total', 1, { route, code });
+        } catch {}
+        return error;
+    })
     // Attach auth info (if enabled) early
     .onBeforeHandle(async ({ request, store, set, path }) => {
         if (!ENABLE_API_KEYS) return; // feature disabled
