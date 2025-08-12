@@ -247,6 +247,15 @@ export const noopMetrics = new (class extends MetricsRegistry {
     }
 })();
 
+// Lightweight interface type used by higher-level modules to allow dependency injection
+// Accept any implementation that matches the core surface (inc/observe/setGauge/snapshot)
+export type Metrics = {
+    inc(name: string, value?: number, labels?: MetricLabels): void;
+    observe(name: string, value: number, labels?: MetricLabels): void;
+    setGauge(name: string, value: number, labels?: MetricLabels): void;
+    snapshot(): MetricsSnapshot;
+};
+
 // Route normalization helper (/:id placeholder for dynamic segments)
 // Replaces UUID v4 and purely numeric path segments with :id
 export function normalizeRoute(path: string) {

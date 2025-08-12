@@ -36,8 +36,8 @@ artifact_id: 8f5b7a3c-9d8a-4c1f-b2f9-3e6d2c1a7b90
 ## 5. External Dependency Wrappers
 
 -   [ ] 5.1 Wrap yt-dlp invocation (Req 5)
--   [ ] 5.2 Wrap ffprobe (Req 5)
--   [ ] 5.3 Wrap storage signed URL & upload operations (Req 5)
+-   [x] 5.2 Wrap ffprobe (Req 5)
+-   [x] 5.3 Wrap storage signed URL & upload operations (Req 5)
 -   [ ] 5.4 Wrap ASR provider call (Req 5)
 
 ## 6. Resource Sampler

@@ -5,6 +5,7 @@ import {
     createLogger,
     noopMetrics,
     type Metrics,
+    withExternal,
 } from '../common/index';
 import type { ResolveResult as SharedResolveResult } from './media-io';
 import { readdir } from 'node:fs/promises';
@@ -80,31 +81,40 @@ async function assertSafeUrl(raw: string) {
     }
 }
 
-async function ffprobe(localPath: string): Promise<FfprobeMeta> {
-    const args = [
-        '-v',
-        'error',
-        '-print_format',
-        'json',
-        '-show_format',
-        '-show_streams',
-        localPath,
-    ];
-    const proc = Bun.spawn(['ffprobe', ...args], {
-        stdout: 'pipe',
-        stderr: 'pipe',
-    });
-    const stdout = await new Response(proc.stdout).text();
-    if ((await proc.exited) !== 0) throw new Error('FFPROBE_FAILED');
-    const json = JSON.parse(stdout);
-    const durationSec = json?.format?.duration
-        ? Number(json.format.duration)
-        : 0;
-    const sizeBytes = json?.format?.size
-        ? Number(json.format.size)
-        : Bun.file(localPath).size;
-    const container = json?.format?.format_name as string | undefined;
-    return { durationSec, sizeBytes, container };
+async function ffprobe(
+    localPath: string,
+    metrics: Metrics
+): Promise<FfprobeMeta> {
+    return withExternal(
+        metrics as any,
+        { dep: 'ffprobe', op: 'probe' },
+        async () => {
+            const args = [
+                '-v',
+                'error',
+                '-print_format',
+                'json',
+                '-show_format',
+                '-show_streams',
+                localPath,
+            ];
+            const proc = Bun.spawn(['ffprobe', ...args], {
+                stdout: 'pipe',
+                stderr: 'pipe',
+            });
+            const stdout = await new Response(proc.stdout).text();
+            if ((await proc.exited) !== 0) throw new Error('FFPROBE_FAILED');
+            const json = JSON.parse(stdout);
+            const durationSec = json?.format?.duration
+                ? Number(json.format.duration)
+                : 0;
+            const sizeBytes = json?.format?.size
+                ? Number(json.format.size)
+                : Bun.file(localPath).size;
+            const container = json?.format?.format_name as string | undefined;
+            return { durationSec, sizeBytes, container };
+        }
+    );
 }
 
 async function findDownloadedFile(dir: string): Promise<string | null> {
@@ -243,7 +253,7 @@ export async function resolveYouTubeSource(
     }
 
     const ffStart = Date.now();
-    const meta = await ffprobe(localPath);
+    const meta = await ffprobe(localPath, metrics);
     metrics.observe('mediaio.ffprobe.duration_ms', Date.now() - ffStart, {
         jobId: job.id,
     });
