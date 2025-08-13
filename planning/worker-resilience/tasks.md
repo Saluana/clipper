@@ -44,14 +44,14 @@ artifact_id: a7e5c1d2-3b4f-45c6-8d17-9f1e2d3c4b5a
 
 ## 8. Retry Classification
 
--   [ ] 8.1 Implement classify(err) (Req 7)
--   [ ] 8.2 Update attempt_count on retry (Req 7)
--   [ ] 8.3 Fail fast on fatal (Req 7)
+-   [x] 8.1 Implement classify(err) (Req 7)
+-   [x] 8.2 Update attempt_count on retry (Req 7)
+-   [x] 8.3 Fail fast on fatal (Req 7)
 
 ## 9. Progress Throttling
 
--   [ ] 9.1 Implement delta/time based throttler (Req 8)
--   [ ] 9.2 Persist last progress percent (Req 8)
+-   [x] 9.1 Implement delta/time based throttler (Req 8)
+-   [x] 9.2 Persist last progress percent (Req 8)
 
 ## 10. Scratch Management
 

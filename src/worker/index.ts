@@ -148,6 +148,113 @@ function createBackpressureController(opts: BackpressureOpts) {
     };
 }
 export const __backpressureTest = { createBackpressureController };
+// ------------------ Progress Throttling Helper (Req 8) ------------------
+interface ThrottleOpts {
+    persist: (pct: number) => Promise<void>;
+    now: () => number;
+    debounceMs: number; // time-based emit if exceeded
+    enforce?: (now: number) => void; // optional timeout / extra checks
+}
+async function throttleProgress(
+    progressIter: AsyncIterable<number>,
+    opts: ThrottleOpts
+) {
+    let lastEmitTs = 0;
+    let lastPct = -1;
+    for await (const pct of progressIter) {
+        const now = opts.now();
+        opts.enforce?.(now);
+        if (
+            pct === 100 ||
+            pct >= lastPct + 1 ||
+            now - lastEmitTs >= opts.debounceMs
+        ) {
+            await opts.persist(pct);
+            lastPct = pct;
+            lastEmitTs = now;
+        }
+    }
+    if (lastPct < 100) {
+        await opts.persist(100);
+    }
+}
+export const __progressTest = { throttleProgress };
+// Retry classification helper (Req 7)
+type RetryClass = 'retryable' | 'fatal';
+function classifyError(e: any): RetryClass {
+    const msg = String(e?.message || e || '').toUpperCase();
+    if (
+        /STORAGE_UPLOAD_FAILED|YTDLP_TIMEOUT|CLIP_TIMEOUT|UPSTREAM|INTERNAL_TRANSIENT|NETWORK|ECONN|EAI_AGAIN/.test(
+            msg
+        )
+    )
+        return 'retryable';
+    if (/OUTPUT_EMPTY|OUTPUT_MISSING/.test(msg)) return 'retryable';
+    return 'fatal';
+}
+export const __retryTest = { classifyError };
+async function handleRetryError(
+    jobId: string,
+    correlationId: string | undefined,
+    e: any
+) {
+    const nowIso = () => new Date().toISOString();
+    const clazz = classifyError(e);
+    if (clazz === 'retryable') {
+        const maxAttempts = Number(readEnv('JOB_MAX_ATTEMPTS') || 3);
+        const updated = await (sharedDb as any)
+            .update(jobsTable)
+            .set({
+                status: sql`CASE WHEN ${jobsTable.attemptCount} + 1 < ${maxAttempts} THEN 'queued' ELSE 'failed' END`,
+                attemptCount: sql`${jobsTable.attemptCount} + 1`,
+                errorCode: 'RETRYABLE_ERROR',
+                errorMessage: String(e),
+                updatedAt: new Date(),
+            })
+            .where(eq(jobsTable.id, jobId))
+            .returning({
+                attemptCount: jobsTable.attemptCount,
+                status: jobsTable.status,
+            });
+        const attempt = updated[0]?.attemptCount ?? 0;
+        metrics.inc('worker.retry_attempts_total', 1, { code: 'retryable' });
+        if (attempt >= maxAttempts) {
+            await events.add({
+                jobId,
+                ts: nowIso(),
+                type: 'failed',
+                data: { correlationId, code: 'RETRIES_EXHAUSTED' },
+            });
+        } else {
+            await events.add({
+                jobId,
+                ts: nowIso(),
+                type: 'requeued:retry',
+                data: { attempt, correlationId },
+            });
+        }
+        return clazz;
+    } else {
+        const err = fromException(e, jobId);
+        metrics.inc('clip.failures');
+        try {
+            await jobs.update(jobId, {
+                status: 'failed',
+                errorCode: (err.error && (err.error as any).code) || 'FATAL',
+                errorMessage:
+                    (err.error && (err.error as any).message) || String(e),
+            });
+            await events.add({
+                jobId,
+                ts: nowIso(),
+                type: 'failed',
+                data: { correlationId },
+            });
+        } catch {}
+        return clazz;
+    }
+}
+export const __retryInternal = { handleRetryError };
 // expose on global for tests that import worker side-effects
 (globalThis as any).__backpressureTest = __backpressureTest;
 
@@ -225,7 +332,12 @@ async function main() {
                         lastHeartbeatAt: new Date(),
                         updatedAt: new Date(),
                     })
-                    .where(and(eq(jobsTable.id, jobId), eq(jobsTable.status, 'queued')))
+                    .where(
+                        and(
+                            eq(jobsTable.id, jobId),
+                            eq(jobsTable.status, 'queued')
+                        )
+                    )
                     .returning({ id: jobsTable.id });
                 if (!acquired.length) {
                     metrics.inc('worker.acquire_conflicts_total');
@@ -241,7 +353,10 @@ async function main() {
                 log.info('job processing start', { jobId, correlationId: cid });
             } else if (job.status !== 'processing') {
                 // Unexpected state, skip (could be failed/cancelled)
-                log.info('skip job in non-runnable state', { jobId, status: job.status });
+                log.info('skip job in non-runnable state', {
+                    jobId,
+                    status: job.status,
+                });
                 return;
             }
             activeJobs.add(jobId);
@@ -316,8 +431,7 @@ async function main() {
                     })
             );
             outputLocal = clipPath;
-            let lastPersist = 0;
-            let lastPct = -1;
+            // Progress throttling (Req 8) via helper
             const persist = async (pct: number) => {
                 await jobs.update(jobId, { progress: pct });
                 await events.add({
@@ -327,24 +441,15 @@ async function main() {
                     data: { pct, stage: 'clip', correlationId: cid },
                 });
             };
-            const debounceMs = 500;
-            for await (const pct of progress$) {
-                const now = Date.now();
-                // Global timeout enforcement
-                if (now - startedAt > maxMs) {
-                    throw new Error('CLIP_TIMEOUT');
-                }
-                if (
-                    pct === 100 ||
-                    pct >= lastPct + 1 ||
-                    now - lastPersist >= debounceMs
-                ) {
-                    await persist(pct);
-                    lastPersist = now;
-                    lastPct = pct;
-                }
-            }
-            if (lastPct < 100) await persist(100);
+            const enforceTimeout = (now: number) => {
+                if (now - startedAt > maxMs) throw new Error('CLIP_TIMEOUT');
+            };
+            await throttleProgress(progress$, {
+                persist,
+                now: () => Date.now(),
+                debounceMs: 500,
+                enforce: enforceTimeout,
+            });
             // Integrity validation (size>0) & atomic move into finalOut
             try {
                 const f = Bun.file(clipPath);
@@ -456,24 +561,67 @@ async function main() {
             const ms = Date.now() - startedAt;
             log.info('job completed', { jobId, ms, correlationId: cid });
         } catch (e) {
-            const err = fromException(e, jobId);
-            log.error('job failed', { jobId, err, correlationId: cid });
-            metrics.inc('clip.failures');
-            try {
-                await jobs.update(jobId, {
-                    status: 'failed',
-                    errorCode:
-                        (err.error && (err.error as any).code) || 'INTERNAL',
-                    errorMessage:
-                        (err.error && (err.error as any).message) || String(e),
+            const clazz = classifyError(e);
+            if (clazz === 'retryable') {
+                const maxAttempts = Number(readEnv('JOB_MAX_ATTEMPTS') || 3);
+                // Atomic increment + status decision
+                const updated = await (sharedDb as any)
+                    .update(jobsTable)
+                    .set({
+                        status: sql`CASE WHEN ${jobsTable.attemptCount} + 1 < ${maxAttempts} THEN 'queued' ELSE 'failed' END`,
+                        attemptCount: sql`${jobsTable.attemptCount} + 1`,
+                        errorCode: 'RETRYABLE_ERROR',
+                        errorMessage: String(e),
+                        updatedAt: new Date(),
+                    })
+                    .where(eq(jobsTable.id, jobId))
+                    .returning({ attemptCount: jobsTable.attemptCount });
+                const attempt = updated[0]?.attemptCount ?? 0;
+                metrics.inc('worker.retry_attempts_total', 1, {
+                    code: 'retryable',
                 });
-                await events.add({
+                if (attempt >= maxAttempts) {
+                    await events.add({
+                        jobId,
+                        ts: nowIso(),
+                        type: 'failed',
+                        data: { correlationId: cid, code: 'RETRIES_EXHAUSTED' },
+                    });
+                    log.error('retry attempts exhausted', { jobId, attempt });
+                } else {
+                    await events.add({
+                        jobId,
+                        ts: nowIso(),
+                        type: 'requeued:retry',
+                        data: { attempt, correlationId: cid },
+                    });
+                    log.warn('job requeued for retry', { jobId, attempt });
+                }
+            } else {
+                const err = fromException(e, jobId);
+                log.error('job failed (fatal)', {
                     jobId,
-                    ts: nowIso(),
-                    type: 'failed',
-                    data: { correlationId: cid },
+                    err,
+                    correlationId: cid,
                 });
-            } catch {}
+                metrics.inc('clip.failures');
+                try {
+                    await jobs.update(jobId, {
+                        status: 'failed',
+                        errorCode:
+                            (err.error && (err.error as any).code) || 'FATAL',
+                        errorMessage:
+                            (err.error && (err.error as any).message) ||
+                            String(e),
+                    });
+                    await events.add({
+                        jobId,
+                        ts: nowIso(),
+                        type: 'failed',
+                        data: { correlationId: cid },
+                    });
+                } catch {}
+            }
         } finally {
             // Final heartbeat on exit (success or failure) if runtime not exceeded
             activeJobs.delete(jobId);
