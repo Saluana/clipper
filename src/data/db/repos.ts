@@ -398,6 +398,11 @@ function toJobRow(j: any): JobRow {
         lastHeartbeatAt: j.lastHeartbeatAt
             ? j.lastHeartbeatAt.toISOString()
             : undefined,
+        attemptCount:
+            typeof j.attemptCount === 'number' ? j.attemptCount : undefined,
+        processingStartedAt: j.processingStartedAt
+            ? j.processingStartedAt.toISOString()
+            : undefined,
     };
 }
 
@@ -407,6 +412,8 @@ function toJobsPatch(patch: Partial<JobRow>) {
         if (v === undefined) continue;
         if (k === 'expiresAt' && v) out[k] = new Date(v as string);
         else if (k === 'lastHeartbeatAt' && v) out[k] = new Date(v as string);
+        else if (k === 'processingStartedAt' && v)
+            out[k] = new Date(v as string);
         else out[k] = v as any;
     }
     return out;

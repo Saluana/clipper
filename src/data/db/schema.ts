@@ -53,10 +53,15 @@ export const jobs = pgTable(
             .defaultNow(),
         expiresAt: timestamp('expires_at', { withTimezone: true }),
         lastHeartbeatAt: timestamp('last_heartbeat_at', { withTimezone: true }),
+        attemptCount: integer('attempt_count').notNull().default(0),
+        processingStartedAt: timestamp('processing_started_at', {
+            withTimezone: true,
+        }),
     },
     (t) => [
         index('idx_jobs_status_created_at').on(t.status, t.createdAt),
         index('idx_jobs_expires_at').on(t.expiresAt),
+        index('idx_jobs_status_last_hb').on(t.status, t.lastHeartbeatAt),
     ]
 );
 

@@ -21,6 +21,8 @@ export interface JobRow {
     updatedAt: string;
     expiresAt?: string;
     lastHeartbeatAt?: string;
+    attemptCount?: number;
+    processingStartedAt?: string;
 }
 
 export interface JobEvent {

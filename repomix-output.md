@@ -42,11 +42,27 @@ docs/
   metrics.md
   security.md
 planning/
+  api-surface/
+    design.md
+    requirements.md
+    tasks.md
   asr/
     design.md
     requirements.md
     tasks.md
+  auth-rate-limiting/
+    design.md
+    requirements.md
+    tasks.md
   ffmpeg/
+    design.md
+    requirements.md
+    tasks.md
+  observability/
+    design.md
+    requirements.md
+    tasks.md
+  worker-resilience/
     design.md
     requirements.md
     tasks.md
@@ -69,10 +85,12 @@ src/
     config.ts
     env.ts
     errors.ts
+    external.ts
     index.ts
     logger.ts
     metrics.ts
     redact.ts
+    resource-sampler.ts
     state.ts
     time.ts
   contracts/
@@ -123,6 +141,7 @@ src/
   worker/
     asr.ts
     index.ts
+    stage.ts
 .env.example
 .gitignore
 bunfig.toml
@@ -379,60 +398,6 @@ rm -rf ${SCRATCH_DIR:-/tmp/ytc}/sources/*
 Happy clipping!
 ````
 
-## File: docs/metrics.md
-````markdown
-# Metrics Reference
-
-Endpoint: `GET /metrics` returns a JSON snapshot (simple counters + observed distributions). Names below indicate intent.
-
-## Job Lifecycle
-
--   jobs.created (counter) — Number of clip jobs created.
--   jobs.enqueue_latency_ms (histogram/summary) — Latency from job creation to queue publish.
--   jobs.status_fetch (counter) — Status endpoint hits.
--   jobs.result_fetch (counter) — Result endpoint hits.
-
-## Cleanup
-
--   cleanup.jobs.deleted (counter) — Expired clip jobs removed.
--   cleanup.asrJobs.deleted (counter) — Expired ASR jobs removed.
-
-## Media IO (Download / Probe / Resolve)
-
--   mediaio.download.bytes (counter) — Bytes streamed for uploaded media (labels include maybe source/type).
--   mediaio.ytdlp.duration_ms (histogram) — Time spent running yt-dlp.
--   mediaio.ffprobe.duration_ms (histogram) — Time spent running ffprobe.
--   mediaio.resolve.duration_ms (histogram) — End-to-end resolve (download + probe) time.
-
-## Repository (Database) Operations
-
--   repo.op.duration_ms (histogram) — Duration of repository operations; has label `op` (e.g., jobs.create, jobs.get, asrJobs.create, asrArtifacts.put)
-
-## Clip Worker
-
--   clip.upload_ms (histogram) — Time to upload generated clip to storage.
--   clip.total_ms (histogram) — Overall clip processing duration.
--   clip.failures (counter) — Clip processing failures.
-
-## ASR Pipeline
-
--   asr.duration_ms (histogram) — Time for ASR transcription per job.
--   asr.completed (counter) — Successful ASR jobs.
--   asr.failures (counter) — Failed ASR jobs.
-
-## Queue
-
--   (From /metrics/queue) Implementation-specific fields (depth, active, etc.) produced by PgBoss adapter.
-
-## Usage Guidance
-
-Counters monotonically increase until process restart. Histograms/observations are aggregated in-memory; scrape interval should be frequent (`15s-60s`) for real-time dashboards.
-
-## Adding New Metrics
-
-Follow naming: `<domain>.<action>[_<unit>]` with `_ms` for millisecond durations, plural nouns for counts (e.g., `jobs.created`). Keep domain sets small & stable.
-````
-
 ## File: docs/security.md
 ````markdown
 # Security & Abuse Controls
@@ -486,6 +451,361 @@ Violations raise `SSRF_BLOCKED` errors. Unit tests in `src/data/tests/yt-youtube
 -   Ensure `Bun.password` is available (Bun runtime) for API key hashing.
 -   Keep `api_keys` table small by revoking unused keys periodically.
 -   Monitor `RATE_LIMITED` and `UNAUTHORIZED` counts via metrics (add instrumentation if needed).
+````
+
+## File: planning/api-surface/design.md
+````markdown
+# API Surface Completion Design
+
+artifact_id: b1d34e2f-2d19-4c42-9b27-6a0d40a9f1a2
+
+## Overview
+
+Add idempotent creation, conditional caching (ETag), signed result delivery semantics, lightweight readiness probes, optional server-sent events for job progress, and pagination. Preserve backward compatibility.
+
+## Architecture
+
+```mermaid
+graph TD
+  C[Client] -->|POST /api/jobs + Idempotency-Key| A[API]
+  C -->|GET/HEAD /api/jobs/:id/result| A
+  C -->|GET /api/jobs/:id (ETag)| A
+  C -->|SSE /api/jobs/:id/events| A
+  A -->|Repos| D[(Postgres)]
+  A -->|Sign| S[Storage]
+```
+
+## Data Model Additions
+
+-   Table: idempotency_keys
+
+```sql
+CREATE TABLE idempotency_keys (
+  key text PRIMARY KEY,
+  body_hash text NOT NULL,
+  job_id uuid NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  expires_at timestamptz NOT NULL
+);
+CREATE INDEX ON idempotency_keys (expires_at);
+```
+
+Retention via cleanup.
+
+## Idempotent Create Flow
+
+1. Extract `Idempotency-Key` header.
+2. Compute `bodyHash = sha256(JSON.stringify(sortedBody))`.
+3. Upsert logic:
+    - Attempt insert (key, body_hash, job_id=newJobId, expires_at=now()+interval '24h') in one transaction with job row.
+    - On conflict (duplicate key): fetch existing row; compare body_hash.
+        - If match -> return existing job.
+        - Else -> 409 error.
+
+## ETag Strategy
+
+-   Status ETag = weak hash of selected fields: `hash(job.status + job.progress + job.resultVideoKey + job.updatedAt)` -> base64url(sha256(...)).
+-   Result ETag = hash(resultVideoKey + resultSrtKey + expiresAt).
+-   Implementation: small helper `computeEtag(obj: Partial<JobRecord>)` returns quoted string.
+
+## Conditional GET Handling
+
+```ts
+if (ifNoneMatch && ifNoneMatch === etag)
+    return Response(null, { status: 304, headers });
+```
+
+Always return correlationId header.
+
+## Signed URL Generation
+
+-   Use existing storage repo function sign(key, ttlSeconds).
+-   Apply safetyMargin = Math.ceil(ttl \* 0.05) ensuring actual TTL <= SIGNED_URL_TTL_SEC - safetyMargin.
+-   Provide refresh guidance to clients: request again if expired (component of docs).
+
+## HEAD /result Endpoint
+
+Reuses same readiness logic but short-circuits body generation.
+
+## SSE Events Endpoint
+
+-   Route: GET /api/jobs/:id/events?stream=1
+-   Content-Type: text/event-stream
+-   Implementation: fetch existing events -> send as replay (optional) then subscribe to new ones (in-memory pubsub).
+-   Heartbeat: send `:keep-alive\n\n` every 15s.
+-   Close: on job terminal state send `event: end` then `data: {"status":"done"}\n\n`.
+-   Backpressure: ensure write flush aware; simple since low event frequency.
+-   Limit concurrency: track active SSE connections; refuse with 503 if > MAX_SSE_STREAMS.
+
+## Pagination
+
+-   Endpoint: GET /api/jobs?status=&limit=&cursor=
+-   Cursor: base64url encoded { createdAt: iso, id: uuid } from last row.
+-   Query: WHERE (status filter) AND ( (created_at,id) < (cursorCreatedAt,cursorId) ) ORDER BY created_at DESC, id DESC LIMIT n+1.
+-   Response: { items:[...], nextCursor? }.
+
+## Error Envelope Enforcement
+
+Add global error handler (already partial) to wrap thrown ServiceError -> envelope.
+Ensure validation library (zod) errors mapped to VALIDATION_FAILED with details.
+
+## Middleware Chain
+
+Order:
+
+1. CorrelationId
+2. Idempotency (POST jobs only)
+3. JSON body parse + validation
+4. Handler
+5. Error handler wrapper (try/catch)
+6. Metrics instrumentation (already separate in observability project)
+
+## Interfaces (TypeScript Sketch)
+
+```ts
+interface IdempotencyRepo {
+    putFirst(
+        key: string,
+        bodyHash: string,
+        jobId: string,
+        ttlSec: number
+    ): Promise<'inserted' | 'exists'>;
+    get(
+        key: string
+    ): Promise<{ key: string; bodyHash: string; jobId: string } | null>;
+    deleteExpired(now: Date): Promise<number>;
+}
+```
+
+## Testing Plan
+
+-   Duplicate create same key/body -> same job id.
+-   Duplicate create same key/different body -> 409.
+-   Status ETag repeat -> 304.
+-   Result HEAD readiness transitions.
+-   SSE: capture sequence; server terminates after done.
+-   Pagination stable ordering with synthetic dataset.
+
+## Security Considerations
+
+-   Idempotency key treated as opaque (not sensitive) but sanitized in logs.
+-   SSE prevents header injection via explicit `\n` stripping in event data JSON serialization.
+-   Avoid leaking internal DB ids beyond job.id.
+
+## Performance
+
+-   Hashing: Use Bun.crypto.subtle.digest (async) or Node crypto; small object -> negligible (<0.2ms typical).
+-   SSE connections: low frequency (<1 msg/sec) -> minimal overhead.
+
+## Rollout
+
+1. Idempotency + ETag core
+2. HEAD endpoint
+3. Result caching headers
+4. Pagination
+5. SSE (feature flag ENABLE_SSE_EVENTS)
+
+## Documentation Updates
+
+-   Add Idempotency-Key usage, caching header semantics, SSE example curl.
+````
+
+## File: planning/api-surface/requirements.md
+````markdown
+# API Surface Completion Requirements
+
+artifact_id: 2d7e6d91-4a2c-4f57-9d0f-7a5a0b7a5c21
+
+## Introduction
+
+Close gaps in public API to support efficient client access patterns (reduced polling load, cache friendliness), consistent envelopes, idempotent creation, and signed result delivery semantics. Existing limitations: partial status/result docs, no idempotency key echo, no conditional responses, missing HEAD endpoints, no structured ETag/caching guidance.
+
+## Roles
+
+-   API Client Developer – integrates with job lifecycle
+-   Operator – monitors usage & detects abusive patterns
+-   SDK Author – relies on stable contracts
+
+## Functional Requirements
+
+1. Idempotent Job Creation
+
+-   Story: As a client I want to safely retry job creation without duplicating work.
+-   Acceptance:
+    -   WHEN POST /api/jobs includes header `Idempotency-Key` (RFC Idempotency-Key style) THEN server SHALL either create a new job (first seen) or return the previously created job with 200 (or 202) preserving original status.
+    -   Response SHALL include header `Idempotency-Key` echo and `Idempotency-Status: replayed|new`.
+    -   Stored body hash mismatch for same key within TTL SHALL return 409 CONFLICT with error code `IDEMPOTENCY_MISMATCH`.
+
+2. Job Status Endpoint Enhancements
+
+-   Story: As a client I want conditional caching to reduce bandwidth.
+-   Acceptance:
+    -   GET /api/jobs/{id} SHALL include `ETag` derived from hash(status, progress, resultKeys, updatedAt) and `Cache-Control: no-cache`.
+    -   IF client sends `If-None-Match` matching current ETag THEN server SHALL return 304 with empty body (still include correlationId header).
+    -   Endpoint SHALL increment metric jobs.status_fetch.
+
+3. Job Result Endpoint Semantics
+
+-   Story: As a client I want consistent readiness checks & signed URLs.
+-   Acceptance:
+    -   GET /api/jobs/{id}/result SHALL 404 NOT_READY if status != done; 200 with { result } if done; 410 GONE if expired.
+    -   Response SHALL include signed URLs with TTL = SIGNED_URL_TTL_SEC minus safety margin (5%).
+    -   Include `Cache-Control: private, max-age=30` and an `ETag` over result keys + expiry.
+
+4. HEAD Result Endpoint
+
+-   Story: As a client optimizing polling I want a lightweight readiness probe.
+-   Acceptance:
+    -   HEAD /api/jobs/{id}/result SHALL return 204 if ready, 404 if not ready, 410 if gone, mirroring GET semantics without body.
+
+5. Events Streaming (Optional Phase)
+
+-   Story: As a real-time client I want push updates instead of polling.
+-   Acceptance:
+    -   SSE endpoint GET /api/jobs/{id}/events?stream=true SHALL stream JSON lines of new events until job terminal state or client disconnect.
+    -   Heartbeat comment line every 15s to keep connection alive.
+
+6. Standard Error Envelope Enforcement
+
+-   Story: As a client I want uniform error objects for all failures.
+-   Acceptance:
+    -   ALL non-2xx responses SHALL include `{ error: { code, message, correlationId } }` and no other top-level fields.
+    -   Validation errors SHALL include optional `details` array of field issues.
+
+7. Pagination & Filtering (Future-proof)
+
+-   Story: As a dashboard client I may list jobs.
+-   Acceptance:
+    -   GET /api/jobs?status=processing&limit=50&cursor=<opaque> SHALL return stable ordering (createdAt DESC) and `nextCursor` when more results exist.
+    -   Limit bounded to [1,100]. Unknown filters ignored with warning metric.
+
+8. OpenAPI Spec Synchronization
+
+-   Story: As an SDK author I want an accurate machine-readable contract.
+-   Acceptance:
+    -   Generating /openapi.json SHALL include all new endpoints, headers (Idempotency-Key, ETag, etc), error schemas.
+
+9. Client Caching Guidance Documentation
+
+-   Story: As a developer I want to implement efficient polling.
+-   Acceptance:
+    -   Docs SHALL describe: use ETag for status, HEAD for result readiness, SSE for push (if enabled), recommended backoff strategy.
+
+10. Correlation ID Propagation
+
+-   Story: As a developer I want consistent trace IDs.
+-   Acceptance:
+    -   All responses SHALL echo `x-correlation-id` header; server generates if not provided.
+
+11. Rate-Limit Headers (Dependency on Auth Project)
+
+-   Story: As a client I want to know my remaining quota.
+-   Acceptance:
+    -   Responses MAY include: `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset` when auth layer supplies context.
+
+## Non-Functional Requirements
+
+-   Backward Compatibility: Existing clients (without Idempotency-Key usage) continue to function unchanged.
+-   Performance: Additional hashing for ETag MUST be O(1) relative to job object size (<1ms typical).
+-   Security: Signed URLs TTL never exceeds configured; ETag SHALL NOT leak sensitive internal IDs beyond job ID already known.
+-   Stability: SSE connections limited via max concurrent streams env guard (MAX_SSE_STREAMS) to avoid resource exhaustion.
+
+## Constraints
+
+-   Idempotency key retention window 24h; storage table pruned by cleanup job.
+-   SSE optional; polyfill fallback is polling.
+
+## Out of Scope (Initial Phase)
+
+-   WebSockets upgrade
+-   GraphQL API
+
+## Acceptance Validation
+
+-   Integration tests cover: duplicate idempotent create, mismatch body, ETag 304 path, HEAD readiness, result expiry, SSE event sequence, pagination cursors.
+````
+
+## File: planning/api-surface/tasks.md
+````markdown
+# API Surface Completion Tasks
+
+artifact_id: e3f74a8e-3d52-4a28-9461-b4c2fbf0d0c5
+
+## 1. Idempotency Infrastructure
+
+-   [ ] 1.1 Create migration for idempotency_keys table (Req 1)
+-   [ ] 1.2 Implement IdempotencyRepo.putFirst/get (Req 1)
+-   [ ] 1.3 Add POST /api/jobs middleware reading Idempotency-Key (Req 1)
+-   [ ] 1.4 Body hash computation + mismatch 409 path (Req 1)
+-   [ ] 1.5 Integration tests duplicate key same body (Req 1)
+-   [ ] 1.6 Integration tests mismatch body (Req 1)
+
+## 2. Status Endpoint ETag
+
+-   [ ] 2.1 Implement computeStatusEtag helper (Req 2)
+-   [ ] 2.2 Inject ETag + Cache-Control headers (Req 2)
+-   [ ] 2.3 304 response logic (Req 2)
+-   [ ] 2.4 Test conditional GET success (Req 2)
+
+## 3. Result Endpoint Semantics
+
+-   [ ] 3.1 Add readiness checks & NOT_READY 404 (Req 3)
+-   [ ] 3.2 Implement signed URL generation with safety margin (Req 3)
+-   [ ] 3.3 Add result ETag + Cache-Control (Req 3)
+-   [ ] 3.4 Test expired job 410 path (Req 3)
+
+## 4. HEAD /result Endpoint
+
+-   [ ] 4.1 Implement HEAD handler logic reuse (Req 4)
+-   [ ] 4.2 Test HEAD readiness states (Req 4)
+
+## 5. SSE Events (Feature Flag)
+
+-   [ ] 5.1 Add ENABLE_SSE_EVENTS env (Req 5)
+-   [ ] 5.2 Implement SSE handler with heartbeat (Req 5)
+-   [ ] 5.3 Connection limit enforcement (Req 5)
+-   [ ] 5.4 Test sequence & termination (Req 5)
+
+## 6. Error Envelope Enforcement
+
+-   [ ] 6.1 Review all handlers for uniform error return (Req 6)
+-   [ ] 6.2 Central error middleware wrap (Req 6)
+-   [ ] 6.3 Validation details shape (Req 6)
+-   [ ] 6.4 Tests for envelope consistency (Req 6)
+
+## 7. Pagination
+
+-   [ ] 7.1 Migration (if needed) indexes for created_at,id (Req 7)
+-   [ ] 7.2 Implement list handler with cursor encoding (Req 7)
+-   [ ] 7.3 Tests multi-page listing (Req 7)
+
+## 8. OpenAPI Spec Update
+
+-   [ ] 8.1 Extend schemas: headers Idempotency-Key, ETag (Req 8)
+-   [ ] 8.2 Generate and validate openapi.json includes new endpoints (Req 8)
+
+## 9. Docs Update
+
+-   [ ] 9.1 Update docs/api-reference.md with idempotency section (Req 9)
+-   [ ] 9.2 Add caching & polling guidance (Req 9)
+-   [ ] 9.3 Add SSE usage example (Req 9/5)
+
+## 10. Correlation ID Echo
+
+-   [ ] 10.1 Ensure header x-correlation-id returned everywhere (Req 10)
+-   [ ] 10.2 Test missing inbound ID generation (Req 10)
+
+## 11. Rate Limit Headers (Dependency)
+
+-   [ ] 11.1 Integrate with auth layer to set X-RateLimit-\* (Req 11)
+-   [ ] 11.2 Tests headers present when key provided (Req 11)
+
+## 12. Rollout Phases
+
+-   [ ] 12.1 Phase 1 deploy (idempotency + ETags)
+-   [ ] 12.2 Phase 2 deploy (HEAD + result semantics)
+-   [ ] 12.3 Phase 3 deploy (pagination + docs)
+-   [ ] 12.4 Phase 4 deploy (SSE)
 ````
 
 ## File: planning/asr/design.md
@@ -1013,6 +1333,383 @@ Out of scope (future): speaker diarization, custom vocabulary, language detectio
 -   Retention: aligns with RETENTION_HOURS.
 ````
 
+## File: planning/auth-rate-limiting/design.md
+````markdown
+# Authentication & Rate Limiting Enhancements Design
+
+artifact_id: c6f45d23-5f0e-4c1e-9a14-2fda7a849b32
+
+## Overview
+
+Introduce scoped API keys, daily quota tracking, layered rate limiting (key, IP, global backpressure), abuse heuristics, and operational tooling. Maintain small, testable modules with pluggable storage for future distributed cache (Redis).
+
+## Architecture
+
+```mermaid
+graph TD
+  R[Request] --> AK[API Key Middleware]
+  AK --> RL[Rate Limit Layer]
+  RL --> SC[Scopes Check]
+  SC --> H[Handler]
+  AK -->|lookup| K[(Key Store / Cache)]
+  RL -->|counters| C[(Rate Counters)]
+  H -->|emit metrics| M[Metrics]
+```
+
+## Data Model (Postgres)
+
+```sql
+CREATE TABLE api_keys (
+  id uuid PRIMARY KEY,
+  prefix text NOT NULL UNIQUE,
+  hashed_secret text NOT NULL,
+  scopes text[] NOT NULL,
+  daily_quota int NULL,
+  daily_usage int NOT NULL DEFAULT 0,
+  last_used_at timestamptz NULL,
+  revoked boolean NOT NULL DEFAULT false,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX ON api_keys (revoked);
+```
+
+Prefix: first 10 chars of uuid (or random) for audit reference.
+
+## Key Format & Parsing
+
+`ck_<prefix>_<secret>`: split by `_`. Validate length & charset. Hash secret using Bun.password.hash (argon2id) or bcrypt. Compare via Bun.password.verify.
+
+## Key Cache
+
+In-memory Map<string,payload> with TTL (KEY_CACHE_TTL_MS). Each entry: { scopes, dailyQuota, dailyUsage, revoked, lastSyncAt }.
+Eviction: LRU or size-limited (MAX_KEY_CACHE=10k). On revoked flag update, optional bump KEY_CACHE_EPOCH env variable to flush (checked each request cheaply).
+
+## Scope Enforcement
+
+Mapping:
+
+-   POST /api/jobs -> jobs:create
+-   GET /api/jobs/:id -> jobs:read
+-   GET /api/jobs/:id/result -> results:read
+-   POST /api/uploads/sign -> uploads:sign
+-   GET /metrics -> metrics:read (optional, maybe unauth for internal)
+    If scope missing -> 403 SCOPE_FORBIDDEN.
+
+## Daily Quota Tracking
+
+On job creation success increment daily_usage (atomic UPDATE returning). Reset strategy: cron job at UTC midnight sets daily_usage=0 where daily_quota IS NOT NULL.
+Alternative: store usage_day (date) and reset when changes. Chosen: usage_day column.
+
+```sql
+ALTER TABLE api_keys ADD COLUMN usage_day date NULL;
+```
+
+If usage_day != current_date then set daily_usage=1, usage_day=current_date else daily_usage+1. If daily_usage exceeds daily_quota -> reject and revert increment.
+
+## Rate Limiting Algorithms
+
+### Token Bucket (In-Memory)
+
+Structure: { lastRefillTs, tokens }. Refill = (now-lastRefill)\*ratePerSec added (capped at capacity).
+Config env:
+
+-   KEY_BUCKET_CAPACITY (default 30)
+-   KEY_BUCKET_REFILL_PER_SEC (default 0.5)
+-   IP_BUCKET_CAPACITY (default 15)
+-   IP_BUCKET_REFILL_PER_SEC (default 0.25)
+    Return 429 RATE_LIMITED when empty.
+    Metrics: auth.rate_limit_hits_total{type=key/ip}.
+
+### Global Backpressure
+
+Check queue depth & worker utilization passed via shared metrics snapshot provider. If queueDepth > QUEUE_HIGH_WATERMARK AND utilization > UTIL_THRESHOLD then return 503 OVERLOADED (or 429 BACKPRESSURE) with Retry-After header (short, e.g., 5s).
+
+## Abuse Detection
+
+Heuristics:
+
+-   validation_failures[key] rolling window 1m > VALIDATION_FAIL_THRESHOLD -> cooldown (COOLDOWN) for key for COOLDOWN_SEC.
+-   not_found_status_polls[ip] > threshold -> soft block (shadow log first). After grace escalate to limited results (404 but counted).
+    Implementation: ring buffer counters per identity with pruning.
+
+## Middleware Flow
+
+1. Extract correlationId.
+2. Parse API key if present. If required and missing -> 401.
+3. Lookup key in cache -> if miss, fetch from DB -> populate cache.
+4. Check revoked -> 401 KEY_REVOKED.
+5. Scope check -> 403 SCOPE_FORBIDDEN.
+6. Rate limit (token bucket) -> maybe 429.
+7. Quota check (POST /api/jobs) -> maybe 429 QUOTA_EXCEEDED.
+8. Global backpressure check.
+9. Proceed handler; on success update last_used_at async.
+
+## Metrics
+
+-   auth.requests_total{outcome}
+-   auth.key_cache_hits_total / misses
+-   auth.rate_limit_hits_total{type}
+-   auth.quota_exceeded_total
+-   auth.abuse_cooldowns_total{reason}
+
+## Error Codes Mapping
+
+| Condition      | Code             |
+| -------------- | ---------------- |
+| Missing key    | UNAUTHORIZED     |
+| Invalid format | KEY_INVALID      |
+| Revoked        | KEY_REVOKED      |
+| Scope missing  | SCOPE_FORBIDDEN  |
+| Quota exceeded | QUOTA_EXCEEDED   |
+| Rate limit     | RATE_LIMITED     |
+| Cooldown       | COOLDOWN         |
+| Overloaded     | OVERLOADED (503) |
+
+## CLI / Scripts
+
+Add script `scripts/api-keys.ts` with commands: issue, revoke <prefix>, list.
+Issue output shows full token once; warns to store securely.
+
+## Testing Strategy
+
+-   Unit: token bucket math, quota reset logic, scope mapping, key parsing.
+-   Integration: create key, perform requests until quota exceeded; simulate revoke; simulate cooldown trigger.
+-   Load: simulate 100 req/s burst ensure buckets enforce limits.
+
+## Security Considerations
+
+-   Secrets never logged (redact). Prefix safe to log.
+-   Hash cost tuned (argon2 parameters) ensuring <100ms per verification.
+-   Defend timing attacks: constant-time compare provided by hashing library.
+
+## Performance
+
+-   Cache hit path: <2ms target. Miss path: single DB select (indexed by prefix), hash verify ~<50ms worst-case.
+
+## Rollout
+
+1. Schema migration for api_keys (augment if existing) + usage_day.
+2. Implement key middleware w/out scopes (compat mode).
+3. Add scopes enforcement.
+4. Add rate limiting improvements.
+5. Add quotas + cooldown logic.
+6. Add global backpressure.
+7. Document & enable metrics.
+
+## Open Questions
+
+-   Do we differentiate between free vs paid tiers? (Future: plan field & per-plan quotas.)
+-   Need HMAC request signing? (Defer.)
+````
+
+## File: planning/auth-rate-limiting/requirements.md
+````markdown
+# Authentication & Rate Limiting Enhancements Requirements
+
+artifact_id: 3a8e61cb-51d6-4934-8e0d-1d264f3b09f5
+
+## Introduction
+
+Strengthen API key authentication, introduce scopes & quotas, and implement layered rate limiting and abuse detection to prevent resource exhaustion prior to horizontal scaling.
+
+## Roles
+
+-   Operator – manages keys, monitors abuse
+-   API Client – uses keys to access endpoints
+-   Security Engineer – audits access & revocation
+
+## Functional Requirements
+
+1. API Key Lifecycle Management
+
+-   Story: As an operator I want to issue, list, rotate, and revoke keys.
+-   Acceptance:
+    -   Key issuance script SHALL create token format `ck_<publicId>_<secret>` and store hashed secret plus metadata (createdAt, lastUsedAt, revoked=false, scopes[], dailyQuota, prefix).
+    -   Revoking a key SHALL take effect within <=60s (cache TTL bound) and further requests respond 401 UNAUTHORIZED.
+
+2. Key Scopes
+
+-   Story: As an operator I want least-privilege keys.
+-   Acceptance:
+    -   Keys SHALL have scopes subset of {jobs:create, jobs:read, results:read, uploads:sign, metrics:read}.
+    -   Middleware SHALL enforce scope presence for endpoint category and respond 403 FORBIDDEN if missing.
+
+3. Quotas (Daily)
+
+-   Story: As an operator I want to cap per-key daily usage.
+-   Acceptance:
+    -   Each key MAY have `dailyQuota` (# of job creations). If exceeded THEN POST /api/jobs returns 429 RATE_LIMITED with envelope code `QUOTA_EXCEEDED`.
+    -   Counters reset UTC midnight (00:00 UTC) or via sliding window table.
+
+4. Layered Rate Limiting
+
+-   Story: As a platform I want fair usage without central bottleneck.
+-   Acceptance:
+    -   Per-key token bucket (capacity=B, refill R/sec) enforced before processing job creation.
+    -   Per-IP fallback (when unauth) with separate bucket.
+    -   Global circuit breaker: IF system load (queue depth > MAX_QUEUE_DEPTH or worker busy ratio > threshold) THEN new job creations respond 503 with code `OVERLOADED` (or 429 with `BACKPRESSURE`).
+
+5. Abuse Detection Signals
+
+-   Story: As an operator I want automatic mitigation for suspicious patterns.
+-   Acceptance:
+    -   Track validation failure rate per key/IP; IF >X failures in window THEN apply temporary cooldown (return 429 with `COOLDOWN`).
+    -   Track repeated NOT_FOUND job status polls for unknown IDs; threshold triggers soft block (shadow mode first).
+
+6. Administrative Audit Logging
+
+-   Story: As a security engineer I need an audit trail for key actions.
+-   Acceptance:
+    -   Key create/rotate/revoke actions SHALL emit audit log entries with actor, action, keyPrefix, timestamp.
+
+7. Introspection Endpoint (Secure)
+
+-   Story: As an operator I need to introspect a key quickly.
+-   Acceptance:
+    -   GET /internal/api-keys/{prefix} (auth via internal token) SHALL return masked key metadata (scopes, quota usage, revoked, lastUsedAt).
+
+8. Rate Limit Headers
+
+-   Story: As a client I need to adapt usage.
+-   Acceptance:
+    -   Successful POST /api/jobs responses SHALL include remaining bucket tokens & reset estimate headers: X-RateLimit-Limit, -Remaining, -Reset.
+
+9. Caching Layer
+
+-   Story: As a performance engineer I want minimal DB hits for key auth.
+-   Acceptance:
+    -   In-memory LRU or TTL cache SHALL hold key metadata; invalidation on revoke via epoch or version bump environment var (KEY_CACHE_BUSTER optional).
+
+10. Error Codes Extension
+
+-   Story: As a client I need clear auth related error semantics.
+-   Acceptance:
+    -   Add codes: QUOTA_EXCEEDED, SCOPE_FORBIDDEN, KEY_REVOKED, KEY_INVALID, COOLDOWN, OVERLOADED.
+
+## Non-Functional Requirements
+
+-   Security: Secrets hashed with strong algorithm (bcrypt or Bun.password default) and constant-time compare.
+-   Performance: Auth + rate limit middleware adds <2ms p50 overhead.
+-   Resilience: Buckets degrade gracefully if cache eviction (fallback to DB check not >10% of requests).
+-   Observability: Metrics for auth decisions (allowed, denied, rate_limited, quota_exceeded) & abuse triggers.
+-   Scalability: Design pluggable backend (Redis) for distributed buckets.
+
+## Constraints
+
+-   Initial implementation single-instance memory; future cluster uses Redis driver.
+-   Daily quota counters persisted to DB for accurate resets.
+
+## Out of Scope
+
+-   OAuth flows, user identity management, UI for key management.
+
+## Acceptance Validation
+
+-   Tests: key issuance + immediate use; revocation; scope enforcement; quota exceed; rate limit bursts; cooldown trigger; circuit breaker activated by synthetic load metrics.
+````
+
+## File: planning/auth-rate-limiting/tasks.md
+````markdown
+# Authentication & Rate Limiting Tasks
+
+artifact_id: f9b3d1c0-7a4e-4485-9f6e-1b2a3c4d5e6f
+
+## 1. Schema & Migrations
+
+-   [ ] 1.1 Create/augment api_keys table (scopes[], daily_quota, daily_usage, usage_day) (Req 1/3)
+-   [ ] 1.2 Index revoked + prefix (Req 1)
+-   [ ] 1.3 Add migration for usage_day column (Req 3)
+
+## 2. Key Issuance Script
+
+-   [ ] 2.1 Implement scripts/api-keys.ts issue command (Req 1)
+-   [ ] 2.2 Implement list command (Req 1)
+-   [ ] 2.3 Implement revoke command (Req 1)
+-   [ ] 2.4 Output full token once (Req 1)
+
+## 3. Key Parsing & Verification
+
+-   [ ] 3.1 Implement parseKey(token) (Req 1)
+-   [ ] 3.2 Hash secret & verify (Req 1)
+-   [ ] 3.3 Unit tests valid/invalid formats (Req 1)
+
+## 4. Cache Layer
+
+-   [ ] 4.1 Implement in-memory TTL cache (Req 9)
+-   [ ] 4.2 Add KEY_CACHE_EPOCH invalidation check (Req 9)
+-   [ ] 4.3 Metrics hits/misses (Req 9)
+
+## 5. Scopes Enforcement
+
+-   [ ] 5.1 Map endpoints -> scopes (Req 2)
+-   [ ] 5.2 Middleware enforce; tests missing scope 403 (Req 2)
+
+## 6. Daily Quota Tracking
+
+-   [ ] 6.1 Update job creation to increment usage (Req 3)
+-   [ ] 6.2 Add reset logic based on usage_day (Req 3)
+-   [ ] 6.3 Quota exceed 429 path (Req 3)
+
+## 7. Token Buckets
+
+-   [ ] 7.1 Implement per-key bucket (Req 4)
+-   [ ] 7.2 Implement per-IP bucket (Req 4)
+-   [ ] 7.3 Metrics for rate limit hits (Req 4)
+-   [ ] 7.4 Tests for burst + refill (Req 4)
+
+## 8. Global Backpressure
+
+-   [ ] 8.1 Add queue depth + utilization provider (Req 4)
+-   [ ] 8.2 Implement overload check returning OVERLOADED/503 (Req 4)
+-   [ ] 8.3 Test simulated overload (Req 4)
+
+## 9. Abuse Detection
+
+-   [ ] 9.1 Track validation failures per key/IP (Req 5)
+-   [ ] 9.2 Implement cooldown map (Req 5)
+-   [ ] 9.3 NOT_FOUND poll threshold logic (Req 5)
+-   [ ] 9.4 Tests cooldown activation & expiry (Req 5)
+
+## 10. Audit Logging
+
+-   [ ] 10.1 Emit audit logs for issue/revoke (Req 6)
+-   [ ] 10.2 Test log shape (Req 6)
+
+## 11. Introspection Endpoint
+
+-   [ ] 11.1 Implement GET /internal/api-keys/:prefix (Req 7)
+-   [ ] 11.2 Auth guard (internal token) (Req 7)
+-   [ ] 11.3 Test masking output (Req 7)
+
+## 12. Rate Limit Headers
+
+-   [ ] 12.1 Add X-RateLimit-\* headers in responses (Req 8)
+-   [ ] 12.2 Tests header correctness (Req 8)
+
+## 13. Metrics Integration
+
+-   [ ] 13.1 auth.requests_total instrumentation (Req All)
+-   [ ] 13.2 auth.rate_limit_hits_total instrumentation (Req 4)
+-   [ ] 13.3 auth.quota_exceeded_total instrumentation (Req 3)
+
+## 14. Documentation
+
+-   [ ] 14.1 Update docs/security.md with scopes & quotas (Req 2/3)
+-   [ ] 14.2 Add usage examples key issuance (Req 1)
+
+## 15. Rollout
+
+-   [ ] 15.1 Deploy baseline (issue/list/revoke only)
+-   [ ] 15.2 Enable scopes enforcement
+-   [ ] 15.3 Enable rate limiting improvements
+-   [ ] 15.4 Enable quotas & abuse detection
+
+## 16. Future Enhancements (Backlog)
+
+-   [ ] 16.1 Redis bucket backend
+-   [ ] 16.2 Tiered plans & analytics
+````
+
 ## File: planning/ffmpeg/design.md
 ````markdown
 artifact_id: 6a31b93c-48f2-445d-813a-11811111818d
@@ -1229,6 +1926,706 @@ As a system architect, I want the FFmpeg service to be seamlessly integrated int
     **THEN** the worker **SHALL** update the job's status to `done` and record the `resultVideoKey`.
 -   **AFTER** the job is complete (or has failed),
     **THEN** the worker **SHALL** ensure all temporary files (source and clip) are cleaned up from the local scratch directory.
+````
+
+## File: planning/observability/design.md
+````markdown
+# Observability Improvements Design
+
+artifact_id: 7d4b0e12-a6e4-4b2a-b4d2-6ed0e42f9d11
+
+## Overview
+
+Provide comprehensive insight into system behavior (API, worker, external dependencies) with low overhead. Phased approach: Core Metrics -> Stage Timings -> Tracing Hooks -> Alert SLOs.
+
+## Architecture
+
+```mermaid
+flowchart TD
+  A[API Middleware] --> M[Metrics Registry]
+  W[Worker Stages] --> M
+  E[External Calls Wrapper] --> M
+  M -->|/metrics JSON| C[Collector / Prometheus Scrape]
+```
+
+### Components
+
+-   MetricsRegistry: lightweight singleton with typed helpers (counter, histogram, gauge).
+-   HttpMetricsMiddleware: wraps request lifecycle (start time, route normalization, error capture).
+-   WorkerStageTimer: RAII helper to measure stage durations.
+-   ExternalCallWrapper: generic timing wrapper for yt-dlp, ffprobe, storage, ASR provider.
+-   ResourceSampler: periodic sampler updating process & disk gauges.
+-   EventEmitter Integration: ensures job events cause metrics increments.
+-   TracingAdapter: noop instrumentation interface (future OTel).
+
+## Metric Catalog (Phase 1)
+
+| Name                          | Type      | Labels                    | Description                        |
+| ----------------------------- | --------- | ------------------------- | ---------------------------------- |
+| http.requests_total           | counter   | method, route, code_class | Count of HTTP responses            |
+| http.errors_total             | counter   | route, code               | Error responses (4xx/5xx)          |
+| http.request_latency_ms       | histogram | route                     | End-to-end latency                 |
+| jobs.created_total            | counter   | -                         | Jobs created                       |
+| jobs.status_transition_total  | counter   | from,to                   | Status transitions                 |
+| jobs.total_latency_ms         | histogram | -                         | Create -> terminal duration        |
+| worker.stage_latency_ms       | histogram | stage                     | Stage durations                    |
+| worker.stage_failures_total   | counter   | stage, code               | Stage failures                     |
+| external.calls_total          | counter   | service,op,outcome        | External dependency calls          |
+| external.call_latency_ms      | histogram | service,op                | Duration per external op           |
+| worker.inflight_jobs          | gauge     | -                         | Active job count                   |
+| proc.memory_rss_mb            | gauge     | -                         | Resident memory                    |
+| proc.open_fds                 | gauge     | -                         | File descriptors (best effort)     |
+| scratch.disk_used_pct         | gauge     | -                         | Scratch directory % usage          |
+| event_loop.lag_ms             | histogram | -                         | Event loop lag (setInterval drift) |
+| events.persist_failures_total | counter   | -                         | Job event DB write errors          |
+| worker.recovered_jobs_total   | counter   | reason                    | Lease recovery events              |
+
+## Implementation Details
+
+### MetricsRegistry
+
+```ts
+interface Counter {
+    inc(v?: number, labels?: LabelValues): void;
+}
+interface Histogram {
+    observe(v: number, labels?: LabelValues): void;
+}
+interface Gauge {
+    set(v: number, labels?: LabelValues): void;
+}
+
+class MetricsRegistry {
+    private counters = new Map<string, Counter>();
+    counter(name: string, opts?: { labelNames?: string[] }): Counter {
+        /* create or reuse */
+    }
+    // similar for histogram/gauge
+    snapshot(): Record<string, unknown> {
+        /* flatten */
+    }
+}
+```
+
+Label cardinality control: route normalization (e.g., /api/jobs/:id). Deny counters with more than allowed label set (log once).
+
+### HTTP Middleware
+
+Wraps request; on begin capture start; on complete compute ms. Determine route template from router context (add mapping). Add correlationId propagation.
+
+### WorkerStageTimer
+
+```ts
+async function withStage<T>(stage: string, fn: () => Promise<T>): Promise<T> {
+    const start = performance.now();
+    try {
+        return await fn();
+    } catch (e) {
+        metrics
+            .counter('worker.stage_failures_total', {
+                labelNames: ['stage', 'code'],
+            })
+            .inc(1, { stage, code: errCode(e) });
+        throw e;
+    } finally {
+        metrics
+            .histogram('worker.stage_latency_ms', { labelNames: ['stage'] })
+            .observe(performance.now() - start, { stage });
+    }
+}
+```
+
+### ExternalCallWrapper
+
+Generic function adding timing + outcome classification (success, error, timeout).
+
+### ResourceSampler
+
+Interval collects: process.rss, event loop lag (setImmediate vs Date diff), scratch disk usage via fs.statvfs (if available; fallback manual). Updates gauges.
+
+### /metrics Endpoint
+
+Returns JSON snapshot, plus queue metrics merged. Example:
+
+```json
+{
+    "timestamp": "ISO",
+    "counters": {
+        "http.requests_total|method=GET,route=/api/jobs,code_class=2xx": 123
+    },
+    "gauges": { "proc.memory_rss_mb": 128.5 },
+    "histograms": {
+        "http.request_latency_ms": {
+            "count": 120,
+            "sum": 5321,
+            "buckets": { "50": 12, "90": 40, "99": 80 }
+        }
+    }
+}
+```
+
+Histogram export: compute quantiles on-demand from internal reservoir (CKMS or simple fixed bucket). Simpler: fixed bucket boundaries array and counts per bucket.
+
+## Tracing Hooks (Phase 3)
+
+Define interface:
+
+```ts
+interface Tracer {
+    startSpan(name: string, attrs?: Record<string, any>): Span;
+}
+interface Span {
+    end(err?: Error): void;
+}
+export const tracer: Tracer = new NoopTracer();
+```
+
+Later swapped with real OTel tracer.
+
+## Error Handling
+
+Metrics operations MUST NOT throw. Wrap in try/catch; on failure log once per name (circuit suppression).
+
+## Testing Strategy
+
+-   Unit: registry creation, label duplication prevention, histogram bucket aggregation.
+-   Integration: HTTP middleware increments metrics; worker stage wrapper records durations; external call wrapper classification.
+-   Load test script verifying overhead <5% (baseline vs instrumented).
+
+## Security Considerations
+
+-   Redact signed URLs before labeling.
+-   Ensure no raw API keys in metrics (never put tokens in labels).
+
+## Rollout Phases
+
+1. Core registry + HTTP + job lifecycle
+2. Worker stage + external wrappers
+3. Resource sampler + recovery metrics
+4. Tracing hooks + SSE event metrics
+
+## Open Questions
+
+-   Do we need Prometheus exposition format soon? (Defer until multi-instance scaling).
+-   Use quantile algorithm vs fixed buckets? (Start with fixed buckets.)
+````
+
+## File: planning/observability/requirements.md
+````markdown
+# Observability Improvements Requirements
+
+artifact_id: 1c6f4f3c-0c5f-4a6c-9f6b-2c6c8f3c1e01
+
+## Introduction
+
+Define and implement comprehensive observability (metrics, logging enhancements, tracing readiness, health diagnostics) to enable tuning performance, capacity planning, SLO monitoring, and rapid incident response. Current state: minimal ad-hoc counters, no standardized histograms, limited worker stage visibility, no alerting semantics.
+
+## Roles
+
+-   Operator / SRE – monitors health and performance, responds to incidents
+-   Developer – uses metrics & traces for debugging latency/failures
+-   Product/Stakeholder – views high-level throughput & success rates
+
+## Functional Requirements
+
+1. Metric Registry & Naming
+
+-   Story: As an operator I want a consistent metrics namespace so I can build reliable dashboards.
+-   Acceptance:
+    -   WHEN the service boots THEN it SHALL register a fixed set of metric instruments (counters, histograms, gauges) without dynamic per-ID label creation.
+    -   IF a new domain metric is added THEN its name SHALL follow `<domain>.<action>[_<unit>]` and be documented in metrics reference.
+
+2. HTTP Request Metrics
+
+-   Story: As an operator I want latency & outcome visibility for every API endpoint.
+-   Acceptance:
+    -   WHEN any HTTP request completes THEN counters SHALL increment: `http.requests_total{method,route,code}` and latency SHALL observe in `http.request_latency_ms{route}` histogram.
+    -   IF an unhandled error occurs THEN `http.errors_total{route,code}` SHALL increment.
+
+3. Job Lifecycle Metrics
+
+-   Story: As an operator I want to understand job flow and queue health.
+-   Acceptance:
+    -   WHEN a job is created THEN increment `jobs.created_total`.
+    -   WHEN status transitions occur THEN increment `jobs.status_transition_total{from,to}`.
+    -   WHEN a job finishes THEN observe total processing time in `jobs.total_latency_ms`.
+    -   Queue snapshot endpoint `/metrics/queue` SHALL include depth, active, oldestAgeSec.
+
+4. Worker Stage Timings
+
+-   Story: As a developer I need per-stage breakdown (resolve, probe, download, clip, upload, asr) to locate bottlenecks.
+-   Acceptance:
+    -   WHEN a stage starts/ends THEN the duration SHALL be observed in `worker.stage_latency_ms{stage}`.
+    -   IF a stage fails THEN increment `worker.stage_failures_total{stage,code}`.
+
+5. External Dependency Metrics
+
+-   Story: As an operator I want to know if upstream (yt-dlp, ffmpeg, storage, ASR) cause latency/errors.
+-   Acceptance:
+    -   Each external call SHALL record `external.call_latency_ms{service,op}` histogram and `external.calls_total{service,op,outcome}` counter.
+    -   Failures SHALL include sanitized error classification labels (`timeout|error|not_found|blocked`).
+
+6. Resource Utilization Probes
+
+-   Story: As an operator I want basic runtime resource telemetry without heavyweight agents.
+-   Acceptance:
+    -   A sampler every 15s SHALL update gauges: `proc.memory_rss_mb`, `proc.open_fds` (best-effort), `scratch.disk_used_pct`, `event_loop.lag_ms`.
+
+7. Structured Logging Consistency
+
+-   Story: As a developer I want every request log to contain correlationId for traceability.
+-   Acceptance:
+    -   WHEN an HTTP request starts THEN a correlationId SHALL be generated (or reused) and included in all subsequent log entries for that request and job events.
+    -   Sensitive fields SHALL be redacted using existing redact utilities.
+
+8. Event Emission & Persistence
+
+-   Story: As an operator I want durable job event timelines for post-mortem analysis.
+-   Acceptance:
+    -   WHEN job events are emitted they SHALL be appended to `job_events` repository and (optionally) streamed out; failures to persist SHALL surface metrics `events.persist_failures_total`.
+
+9. Health & Readiness
+
+-   Story: As an operator I need clear health signals for orchestration.
+-   Acceptance:
+    -   GET /healthz SHALL return queue connectivity, DB ping latency, worker active status summary.<br>
+    -   IF DB or queue is unreachable THEN health SHALL be `ok:false` with code.
+
+10. SLO Definition & Burn Rate Indicators
+
+-   Story: As an operator I need automated alert thresholds.
+-   Acceptance:
+    -   SLOs SHALL be documented: (a) 99% jobs success; (b) P95 clip latency bound; (c) Error budget 1% failures.
+    -   Derived metrics (recorded or query-level) for 5m, 1h error rates SHALL be feasible without additional code changes.
+
+11. Metrics Endpoint Stability
+
+-   Story: As an operator I want the metrics endpoint to avoid heavy allocation under load.
+-   Acceptance:
+    -   /metrics serialization SHALL execute within <50ms for 95th percentile under 10k instruments.
+
+12. Tracing Readiness (Optional Flag)
+
+-   Story: As an engineer I want to enable tracing without refactoring core logic.
+-   Acceptance:
+    -   Code SHALL include abstractions (startSpan/endSpan) no-ops when tracing disabled.
+
+## Non-Functional Requirements
+
+-   Label Cardinality: Max 10 distinct values per label; route placeholders merged (e.g. /api/jobs/:id).
+-   Overhead: Observability instrumentation MUST add <5% CPU overhead at P95 typical workload.
+-   Security: Logs & metrics SHALL NOT contain raw secrets, signed URLs, full tokens.
+-   Reliability: Metrics updates SHALL not throw; failures degrade silently (warn log once per interval).
+
+## Constraints
+
+-   No persistent metrics store beyond in-memory snapshot (Prometheus style future). JSON snapshot retained.
+-   Bun runtime; avoid native deps beyond existing.
+
+## Out of Scope (Phase 1)
+
+-   Full distributed tracing backend integration
+-   Alert manager configuration
+-   Persistent historical metrics storage
+
+## Acceptance Validation
+
+-   Load test script demonstrates metrics non-zero and SLO calculations; unit tests for metric registry naming; integration test ensures /metrics returns expected shape.
+````
+
+## File: planning/worker-resilience/design.md
+````markdown
+# Worker Runtime Resilience Design
+
+artifact_id: d4f71dcb-3d05-4d61-9bf0-0f6f2d4826a4
+
+## Overview
+
+Implement reliable processing through heartbeats, lease recovery, idempotent artifact generation, concurrency management, graceful shutdown, and retry classification. Target minimal coupling to queue implementation (pg-boss) while using Postgres for authoritative job state.
+
+## Architecture
+
+```mermaid
+graph TD
+  Q[pg-boss Queue] --> W[Worker Dispatcher]
+  W -->|acquire| DB[(Jobs Table)]
+  W -->|process stages| S[Scratch FS]
+  W -->|upload| ST[Storage]
+  W -->|events| E[Job Events]
+  HB[Heartbeat Loop] --> DB
+  RC[Recovery Scanner] --> DB
+```
+
+## Data Model Changes
+
+```sql
+ALTER TABLE jobs ADD COLUMN last_heartbeat_at timestamptz;
+ALTER TABLE jobs ADD COLUMN attempt_count int NOT NULL DEFAULT 0;
+ALTER TABLE jobs ADD COLUMN processing_started_at timestamptz;
+```
+
+(If columns already exist, ensure indexes: CREATE INDEX ON jobs (status, last_heartbeat_at);
+)
+
+## Job Acquisition
+
+Atomic transition SQL (if not relying solely on pg-boss):
+
+```sql
+UPDATE jobs SET status='processing', processing_started_at=now(), last_heartbeat_at=now()
+WHERE id=$1 AND status='queued'
+RETURNING id;
+```
+
+If rowCount=0 -> someone else acquired.
+
+## Heartbeat
+
+Loop every HEARTBEAT_INTERVAL_SEC:
+
+```sql
+UPDATE jobs SET last_heartbeat_at=now() WHERE id IN ($activeIds);
+```
+
+Batch update for all active jobs. On failure log once and backoff.
+
+## Recovery Scanner
+
+Interval RECOVERY_SCAN_INTERVAL_SEC executes:
+
+```sql
+UPDATE jobs SET status='queued', attempt_count=attempt_count+1
+WHERE status='processing'
+  AND now()-last_heartbeat_at > (LEASE_TIMEOUT_SEC || ' seconds')::interval
+  AND attempt_count < MAX_ATTEMPTS
+RETURNING id, attempt_count;
+```
+
+Emit job_events row `requeued:stale` for each.
+If attempt_count hits MAX_ATTEMPTS -> mark failed with code RETRIES_EXHAUSTED.
+
+## Stage Execution Wrapper
+
+Use withStage() (see observability) to wrap phases: resolve, clip, upload, asr, finalize.
+Errors bubble to classify & decide retry.
+
+## Retry Classification
+
+```ts
+function classify(err: Error): 'retryable' | 'fatal' {
+    if (
+        ServiceError &&
+        code in
+            [
+                'STORAGE_UPLOAD_FAILED',
+                'YTDLP_TIMEOUT',
+                'CLIP_TIMEOUT',
+                'UPSTREAM_FAILURE',
+                'INTERNAL_TRANSIENT',
+            ]
+    )
+        return 'retryable';
+    return 'fatal';
+}
+```
+
+Fatal -> status=failed immediately. Retryable -> if attempt_count+1 < MAX_ATTEMPTS set queued.
+
+## Idempotent Output
+
+-   Temp file: `${SCRATCH_DIR}/jobs/<jobId>/<jobId>-work.mp4`.
+-   After successful clip, fs.rename to `<jobId>-final.mp4` then upload.
+-   Before processing check storage/head if result already exists (optional HEAD) -> if exists + integrity ok -> emit uploaded + done without re-clipping.
+
+## Concurrency Control
+
+Semaphore limiting number of active jobs to MAX_CONCURRENCY. Acquire before dequeue; release after terminal stage.
+Queue prefetch: fetch up to MAX_CONCURRENCY - active.
+
+## Progress Emission
+
+Ffmpeg progress parser triggers event emission throttled by delta≥1 or 500ms. Maintain lastPct map per job.
+
+## Graceful Shutdown
+
+On SIGTERM:
+
+1. Set shuttingDown flag.
+2. Stop pulling new messages.
+3. Wait for active jobs with Promise.race(cancelAfterTimeout, allJobsDone).
+4. Jobs still active after timeout: record event aborted:shutdown (no status change) rely on recovery.
+
+## Metrics
+
+-   worker.heartbeats_total (increment per batch update)
+-   worker.heartbeat_failures_total
+-   worker.recovered_jobs_total{reason='stale'}
+-   worker.retry_attempts_total{code}
+-   worker.concurrent_jobs gauge
+-   worker.acquire_conflicts_total (failed UPDATE due to another worker)
+
+## Testing Plan
+
+-   Unit: classify retryable/fatal mapping.
+-   Integration: simulate crash (kill process) mid-job -> restart -> recovery scanner picks up.
+-   Concurrency: run >MAX_CONCURRENCY inflight requests -> ensure cap.
+-   Idempotency: rerun job with existing final artifact -> skip processing.
+-   Graceful shutdown: send SIGTERM -> ensure no new jobs started and active job completes.
+
+## Failure Scenarios & Handling
+
+| Scenario                        | Handling                                      |
+| ------------------------------- | --------------------------------------------- |
+| Worker crash                    | Recovery scanner requeues after lease timeout |
+| Upload transient error          | Retry attempt until MAX_ATTEMPTS              |
+| Ffmpeg hard failure             | Mark failed (fatal)                           |
+| Data corruption (0-byte output) | Treat as retryable (requeue)                  |
+| Duplicate queue delivery        | Acquire logic prevents double processing      |
+
+## Security Considerations
+
+-   Scratch directories isolated per job (no shared path traversal).
+-   On failure, logs do not expose file paths outside scratch root.
+
+## Rollout
+
+1. Add columns + migration.
+2. Implement heartbeat batch update
+3. Implement recovery scanner
+4. Add retry classification & attempt counting
+5. Add concurrency semaphore
+6. Add graceful shutdown hook
+7. Add idempotent artifact check
+
+## Open Questions
+
+-   Should lease timeout adjust dynamically based on clip duration? (Future enhancement.)
+-   Include jitter in recovery scan interval? (Yes small ±10% to avoid thundering herd.)
+````
+
+## File: planning/worker-resilience/requirements.md
+````markdown
+# Worker Runtime Resilience Requirements
+
+artifact_id: 4e5f0d2c-62a8-476d-a0f4-f3f6c5c41d0e
+
+## Introduction
+
+Harden worker execution against crashes, duplicates, and partial progress loss by implementing heartbeats, lease recovery, controlled concurrency, idempotent processing, and safe artifact publication. Current gaps: conceptual heartbeat mention but no implemented lease reclamation or duplicate suppression.
+
+## Roles
+
+-   Worker Process – executes jobs
+-   Operator – monitors stuck/failed jobs
+-   Developer – relies on deterministic state transitions for debugging
+
+## Functional Requirements
+
+1. Heartbeat Mechanism
+
+-   Story: As an operator I want to detect stuck jobs.
+-   Acceptance:
+    -   WHILE worker processes a job it SHALL update `jobs.lastHeartbeatAt` every HEARTBEAT_INTERVAL_SEC (default 10).
+    -   IF a heartbeat update fails consecutively >3 times THEN a warning log emitted with code HEARTBEAT_DEGRADED.
+
+2. Lease Expiration & Recovery
+
+-   Story: As a system I must reclaim orphaned jobs when a worker dies.
+-   Acceptance:
+    -   A recovery loop SHALL scan for jobs status=processing with lastHeartbeatAt older than LEASE_TIMEOUT_SEC (default 3 \* heartbeat interval) and set status=queued with attemptCount+1 if attemptCount < MAX_ATTEMPTS.
+    -   Recovered jobs SHALL emit event `requeued:stale`.
+
+3. Concurrency Control
+
+-   Story: As an operator I want to bound resource usage.
+-   Acceptance:
+    -   Worker SHALL respect MAX_CONCURRENCY (env) and not start more simultaneous clip tasks than limit.
+    -   In-flight count exposed via metric worker.inflight_jobs.
+
+4. Backpressure & Queue Depth Awareness
+
+-   Story: As a system I want to adapt to load spikes.
+-   Acceptance:
+    -   IF queue depth > HIGH_WATERMARK AND CPU load > LOAD_THRESHOLD THEN worker SHALL pause dequeuing new jobs for PAUSE_INTERVAL_SEC.
+    -   Metric worker.pauses_total increments on each pause.
+
+5. Idempotent Job Processing
+
+-   Story: As an operator I want repeatable outcomes after restarts.
+-   Acceptance:
+    -   Output storage key SHALL be deterministic: results/{jobId}/clip.mp4.
+    -   Processing SHALL use a temp file path then atomic move to final, ensuring partial writes never appear at final key.
+    -   On retry for same jobId pre-existing successful artifact SHALL short-circuit and mark done if integrity validated.
+
+6. Duplicate Start Suppression
+
+-   Story: As a system I must prevent two workers from processing same job concurrently.
+-   Acceptance:
+    -   Job acquisition SHALL perform atomic transition queued->processing (e.g., UPDATE ... WHERE status='queued') and only proceed if rowCount=1.
+    -   If a job already processing and within lease (fresh heartbeat) second worker SHALL skip.
+
+7. Attempt Limits & Failure Classification
+
+-   Story: As an operator I want bounded retries and clear error states.
+-   Acceptance:
+    -   Transient errors (storage upload timeout, network failures) SHALL be retried up to MAX_ATTEMPTS (default 3) then marked failed with code RETRIES_EXHAUSTED.
+    -   Non-retryable errors (validation, INPUT_TOO_LARGE) SHALL immediately mark failed (no further retries) attemptCount remains.
+
+8. Progress Tracking & Throttling
+
+-   Story: As a client I want timely but not noisy progress.
+-   Acceptance:
+    -   Progress events SHALL be emitted only if pct increased by >=1 OR ≥500ms since last event OR final 100.
+    -   Worker SHALL persist last progress percent for status endpoint.
+
+9. Safe Cleanup & Scratch Management
+
+-   Story: As an operator I want no unbounded disk growth.
+-   Acceptance:
+    -   On success worker SHALL delete scratch job directory unless KEEP_SCRATCH_ON_SUCCESS=1.
+    -   On failure scratch preserved for inspection with size logged; cleanup script handles old failure dirs.
+
+10. Graceful Shutdown
+
+-   Story: As an operator I want zero lost jobs during redeploy.
+-   Acceptance:
+    -   On SIGTERM worker SHALL stop dequeuing new jobs, wait (shutdownTimeout) for active jobs to finish or reach safe checkpoint, then exit.
+    -   Active jobs exceeding shutdown timeout SHALL record event `aborted:shutdown` and rely on lease recovery.
+
+11. Observability Integration
+
+-   Story: As an operator I want visibility into resilience behavior.
+-   Acceptance:
+    -   Metrics: worker.heartbeats_total, worker.recovered_jobs_total{reason}, worker.retry_attempts_total{code}, worker.duplicate_skips_total, worker.atomic_acquire_fail_total.
+
+12. Consistent Event Emission
+
+-   Story: As a developer I want a deterministic event timeline.
+-   Acceptance:
+    -   Event order for successful job: created -> processing -> source:ready -> progress\* -> uploaded -> done.
+    -   Recovery path inserts `requeued:stale` before processing (again).
+
+## Non-Functional Requirements
+
+-   Robustness: Single worker crash recovery within <= lease timeout + queue dispatch latency.
+-   Performance: Heartbeat updates batched or lightweight (<1ms each).
+-   Safety: No partial artifacts published; idempotent retries safe to re-run.
+
+## Constraints
+
+-   Use existing Postgres and pg-boss; no new infra for locking.
+-   Assume monotonic system clock (drift <1s across workers) for heartbeat validity.
+
+## Out of Scope
+
+-   Cross-region failover
+-   Dynamic autoscaling controller (basic env-based scaling only)
+
+## Acceptance Validation
+
+-   Tests simulate crash mid-clip -> verify requeue & eventual success.
+-   Duplicate worker simulation ensures only one processes job concurrently.
+-   Attempt exhaustion path yields RETRIES_EXHAUSTED.
+````
+
+## File: planning/worker-resilience/tasks.md
+````markdown
+# Worker Runtime Resilience Tasks
+
+artifact_id: a7e5c1d2-3b4f-45c6-8d17-9f1e2d3c4b5a
+
+## 1. Schema Migration
+
+-   [ ] 1.1 Add last_heartbeat_at, attempt_count, processing_started_at columns (Req 1/2/7)
+-   [ ] 1.2 Add index (status, last_heartbeat_at) (Req 2)
+
+## 2. Heartbeat Implementation
+
+-   [ ] 2.1 Track active job IDs list (Req 1)
+-   [ ] 2.2 Batch update heartbeat loop (Req 1)
+-   [ ] 2.3 Warning log on >3 consecutive failures (Req 1)
+
+## 3. Recovery Scanner
+
+-   [ ] 3.1 Implement recovery scan SQL (Req 2)
+-   [ ] 3.2 Emit requeued:stale events (Req 2)
+-   [ ] 3.3 Attempt limit fail path RETRIES_EXHAUSTED (Req 7)
+
+## 4. Concurrency Control
+
+-   [ ] 4.1 Implement semaphore (Req 3)
+-   [ ] 4.2 Prefetch logic constrained by available slots (Req 3)
+-   [ ] 4.3 Gauge worker.concurrent_jobs (Req 3)
+
+## 5. Backpressure Pause
+
+-   [ ] 5.1 Monitor queue depth + CPU load (Req 4)
+-   [ ] 5.2 Pause dequeuing under high watermark (Req 4)
+-   [ ] 5.3 Metric worker.pauses_total (Req 4)
+
+## 6. Idempotent Output Handling
+
+-   [ ] 6.1 Implement temp -> atomic move pattern (Req 5)
+-   [ ] 6.2 Pre-check existing artifact skip path (Req 5)
+-   [ ] 6.3 Integrity validation (size > 0) (Req 5)
+
+## 7. Duplicate Suppression
+
+-   [ ] 7.1 Atomic queued->processing update (Req 6)
+-   [ ] 7.2 Track acquire conflicts metric (Req 6)
+
+## 8. Retry Classification
+
+-   [ ] 8.1 Implement classify(err) (Req 7)
+-   [ ] 8.2 Update attempt_count on retry (Req 7)
+-   [ ] 8.3 Fail fast on fatal (Req 7)
+
+## 9. Progress Throttling
+
+-   [ ] 9.1 Implement delta/time based throttler (Req 8)
+-   [ ] 9.2 Persist last progress percent (Req 8)
+
+## 10. Scratch Management
+
+-   [ ] 10.1 Delete scratch on success (Req 9)
+-   [ ] 10.2 Preserve on failure with size log (Req 9)
+
+## 11. Graceful Shutdown
+
+-   [ ] 11.1 SIGTERM handler: stop dequeue (Req 10)
+-   [ ] 11.2 Wait for active jobs with timeout (Req 10)
+-   [ ] 11.3 Abort events for timed out jobs (Req 10)
+
+## 12. Observability Metrics
+
+-   [ ] 12.1 heartbeats_total, heartbeat_failures_total (Req 11)
+-   [ ] 12.2 recovered_jobs_total{reason} (Req 11)
+-   [ ] 12.3 retry_attempts_total{code} (Req 11)
+-   [ ] 12.4 duplicate_skips_total & acquire_conflicts_total (Req 6/11)
+
+## 13. Event Timeline Consistency
+
+-   [ ] 13.1 Ensure event ordering logic (Req 12)
+-   [ ] 13.2 Test normal + recovery sequences (Req 12)
+
+## 14. Testing & Simulation
+
+-   [ ] 14.1 Integration test simulated crash (Req 2)
+-   [ ] 14.2 Concurrency limit test (Req 3)
+-   [ ] 14.3 Retry exhaustion test (Req 7)
+-   [ ] 14.4 Idempotent artifact skip test (Req 5)
+
+## 15. Rollout
+
+-   [ ] 15.1 Deploy migration only
+-   [ ] 15.2 Enable heartbeat & logging (observe only)
+-   [ ] 15.3 Enable recovery scanner (low frequency)
+-   [ ] 15.4 Increase scan frequency & enable attempt limits
+
+## 16. Future Enhancements
+
+-   [ ] 16.1 Dynamic lease timeout based on clip duration
+-   [ ] 16.2 Per-stage adaptive concurrency
 ````
 
 ## File: planning/design.md
@@ -2212,74 +3609,80 @@ export function fromException(e: unknown, correlationId?: string): Err {
 }
 ````
 
-## File: src/common/index.ts
+## File: src/common/external.ts
 ````typescript
-export * from './config';
-export * from './logger';
-export * from './errors';
-export * from './time';
-export * from './state';
-export * from './env';
-export * from './metrics';
-export * from './redact';
-````
+import { MetricsRegistry } from './metrics';
 
-## File: src/common/logger.ts
-````typescript
-import { redactSecrets } from './redact';
-export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
-
-export interface Logger {
-    level: LogLevel;
-    with(fields: Record<string, unknown>): Logger;
-    debug(msg: string, fields?: Record<string, unknown>): void;
-    info(msg: string, fields?: Record<string, unknown>): void;
-    warn(msg: string, fields?: Record<string, unknown>): void;
-    error(msg: string, fields?: Record<string, unknown>): void;
+export interface ExternalCallOptions {
+    dep: 'yt_dlp' | 'ffprobe' | 'storage' | 'asr';
+    op: string; // short operation label
+    classifyError?: (err: any) => string | undefined;
+    timeoutMs?: number; // optional hard timeout
 }
 
-function emit(
-    level: LogLevel,
-    base: Record<string, unknown>,
-    msg: string,
-    fields?: Record<string, unknown>
-) {
-    const line = {
-        level,
-        ts: new Date().toISOString(),
-        msg: redactSecrets(msg),
-        ...redactSecrets(base),
-        ...redactSecrets(fields ?? {}),
-    };
-    // eslint-disable-next-line no-console
-    console[level === 'debug' ? 'log' : level](JSON.stringify(line));
+export async function withExternal<T>(
+    metrics: MetricsRegistry,
+    opts: ExternalCallOptions,
+    fn: (signal: AbortSignal) => Promise<T>
+): Promise<T> {
+    const { dep, op } = opts;
+    const start = performance.now();
+    const controller = new AbortController();
+    let timeout: any;
+    if (opts.timeoutMs && opts.timeoutMs > 0) {
+        timeout = setTimeout(
+            () => controller.abort(),
+            opts.timeoutMs
+        ).unref?.();
+    }
+    try {
+        const res = await fn(controller.signal);
+        metrics.inc('external.calls_total', 1, { dep, op, status: 'ok' });
+        metrics.observe('external.call_latency_ms', performance.now() - start, {
+            dep,
+            op,
+        });
+        return res;
+    } catch (e) {
+        const code = classifyExternalError(e, opts.classifyError);
+        metrics.inc('external.calls_total', 1, {
+            dep,
+            op,
+            status: 'err',
+            code,
+        });
+        metrics.observe('external.call_latency_ms', performance.now() - start, {
+            dep,
+            op,
+        });
+        throw e;
+    } finally {
+        if (timeout) clearTimeout(timeout);
+    }
 }
 
-export function createLogger(
-    level: LogLevel = 'info',
-    base: Record<string, unknown> = {}
-): Logger {
-    return {
-        level,
-        with(additional) {
-            return createLogger(level, { ...base, ...additional });
-        },
-        debug(msg, fields) {
-            if (['debug'].includes(level)) emit('debug', base, msg, fields);
-        },
-        info(msg, fields) {
-            if (['debug', 'info'].includes(level))
-                emit('info', base, msg, fields);
-        },
-        warn(msg, fields) {
-            if (['debug', 'info', 'warn'].includes(level))
-                emit('warn', base, msg, fields);
-        },
-        error(msg, fields) {
-            emit('error', base, msg, fields);
-        },
-    };
+function classifyExternalError(
+    e: any,
+    custom?: (err: any) => string | undefined
+): string {
+    try {
+        if (custom) {
+            const c = custom(e);
+            if (c) return c;
+        }
+        const msg = String(e?.message || e || '').toLowerCase();
+        if (/timeout|etimedout|abort/.test(msg)) return 'timeout';
+        if (/not.?found|enoent|404/.test(msg)) return 'not_found';
+        if (/unauth|forbidden|401|403/.test(msg)) return 'auth';
+        if (/network|econn|eai_again|enotfound/.test(msg)) return 'network';
+        if (/too large|payload|413/.test(msg)) return 'too_large';
+        return 'error';
+    } catch {
+        return 'error';
+    }
 }
+
+export { classifyExternalError };
 ````
 
 ## File: src/common/redact.ts
@@ -2348,6 +3751,159 @@ export function redactSecrets<T = unknown>(value: T): T {
 // Convenience for explicit string redaction when needed
 export function redactText(text: string): string {
     return redactString(text);
+}
+````
+
+## File: src/common/resource-sampler.ts
+````typescript
+import { MetricsRegistry } from './metrics';
+import { readEnv } from './env';
+
+export interface ResourceSamplerOptions {
+    metrics: MetricsRegistry;
+    intervalMs?: number; // default 5000
+    scratchDir?: string; // default from SCRATCH_DIR or /tmp/ytc
+    getScratchUsage?: () => Promise<{
+        usedBytes: number;
+        capacityBytes?: number;
+    }>; // test override
+    now?: () => number; // test clock
+}
+
+/**
+ * ResourceSampler periodically records process & system level metrics:
+ *  - proc.memory_rss_mb (gauge)
+ *  - scratch.disk_used_pct (gauge)   ( -1 when capacity unknown )
+ *  - event_loop.lag_ms (histogram)
+ */
+export class ResourceSampler {
+    private readonly metrics: MetricsRegistry;
+    private readonly intervalMs: number;
+    private readonly scratchDir: string;
+    private timer: any = null;
+    private lastTick: number | null = null;
+    private readonly getScratchUsage?: () => Promise<{
+        usedBytes: number;
+        capacityBytes?: number;
+    }>;
+    private readonly now: () => number;
+
+    constructor(opts: ResourceSamplerOptions) {
+        this.metrics = opts.metrics;
+        this.intervalMs = Math.max(1000, opts.intervalMs ?? 5000);
+        this.scratchDir = (
+            opts.scratchDir ||
+            readEnv('SCRATCH_DIR') ||
+            '/tmp/ytc'
+        ).replace(/\/$/, '');
+        this.getScratchUsage = opts.getScratchUsage;
+        this.now = opts.now || (() => performance.now());
+    }
+
+    start() {
+        if (this.timer) return;
+        this.lastTick = this.now();
+        this.timer = setInterval(
+            () => this.tick().catch(() => {}),
+            this.intervalMs
+        );
+        (this.timer as any).unref?.();
+    }
+
+    stop() {
+        if (this.timer) clearInterval(this.timer);
+        this.timer = null;
+    }
+
+    async tick() {
+        const now = this.now();
+        if (this.lastTick != null) {
+            const expected = this.lastTick + this.intervalMs;
+            let lag = now - expected;
+            if (lag < 0) lag = 0;
+            this.metrics.observe('event_loop.lag_ms', lag);
+        }
+        this.lastTick = now;
+        this.sampleMemory();
+        await this.sampleScratch();
+    }
+
+    private sampleMemory() {
+        try {
+            const rss = (process.memoryUsage?.().rss ?? 0) / (1024 * 1024);
+            this.metrics.setGauge('proc.memory_rss_mb', Number(rss.toFixed(2)));
+        } catch {}
+    }
+
+    private async sampleScratch() {
+        try {
+            const usage = this.getScratchUsage
+                ? await this.getScratchUsage()
+                : await defaultScratchUsage(this.scratchDir);
+            const { usedBytes, capacityBytes } = usage;
+            if (capacityBytes && capacityBytes > 0) {
+                const pct = (usedBytes / capacityBytes) * 100;
+                this.metrics.setGauge(
+                    'scratch.disk_used_pct',
+                    Number(pct.toFixed(2))
+                );
+            } else {
+                this.metrics.setGauge('scratch.disk_used_pct', -1);
+            }
+        } catch {
+            this.metrics.setGauge('scratch.disk_used_pct', -1);
+        }
+    }
+}
+
+async function defaultScratchUsage(
+    dir: string
+): Promise<{ usedBytes: number; capacityBytes?: number }> {
+    // Fast path: if directory doesn't exist, treat as empty
+    let usedBytes = 0;
+    try {
+        const proc = Bun.spawn(
+            ['find', dir, '-type', 'f', '-maxdepth', '4', '-printf', '%s\n'],
+            { stdout: 'pipe', stderr: 'ignore' }
+        );
+        const out = await new Response(proc.stdout).text();
+        await proc.exited;
+        usedBytes = out
+            .split(/\n+/)
+            .filter(Boolean)
+            .reduce(
+                (a, s) => (Number.isFinite(Number(s)) ? a + Number(s) : a),
+                0
+            );
+    } catch {}
+    let capacityBytes: number | undefined;
+    try {
+        const proc = Bun.spawn(['df', '-k', dir], {
+            stdout: 'pipe',
+            stderr: 'ignore',
+        });
+        const out = await new Response(proc.stdout).text();
+        await proc.exited;
+        const lines = out.trim().split(/\n+/);
+        if (lines.length >= 2) {
+            const second = lines[1] || '';
+            const parts = second.split(/\s+/);
+            if (parts.length >= 2) {
+                const sizeKb = Number(parts[1]);
+                if (Number.isFinite(sizeKb)) capacityBytes = sizeKb * 1024;
+            }
+        }
+    } catch {}
+    return { usedBytes, capacityBytes };
+}
+
+export function startResourceSampler(
+    metrics: MetricsRegistry,
+    opts: Partial<ResourceSamplerOptions> = {}
+) {
+    const sampler = new ResourceSampler({ metrics, ...opts });
+    sampler.start();
+    return sampler;
 }
 ````
 
@@ -2861,93 +4417,6 @@ export interface JobRecord {
     "tables": {}
   }
 }
-````
-
-## File: src/data/drizzle/0000_tense_yellow_claw.sql
-````sql
-CREATE TYPE "public"."job_status" AS ENUM('queued', 'processing', 'done', 'failed');--> statement-breakpoint
-CREATE TYPE "public"."source_type" AS ENUM('upload', 'youtube');--> statement-breakpoint
-CREATE TABLE "api_keys" (
-	"id" uuid PRIMARY KEY NOT NULL,
-	"name" text NOT NULL,
-	"key_hash" text NOT NULL,
-	"revoked" boolean DEFAULT false NOT NULL,
-	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
-	"last_used_at" timestamp with time zone
-);
---> statement-breakpoint
-CREATE TABLE "job_events" (
-	"job_id" uuid NOT NULL,
-	"ts" timestamp with time zone DEFAULT now() NOT NULL,
-	"type" text NOT NULL,
-	"data" jsonb
-);
---> statement-breakpoint
-CREATE TABLE "jobs" (
-	"id" uuid PRIMARY KEY NOT NULL,
-	"status" "job_status" DEFAULT 'queued' NOT NULL,
-	"progress" integer DEFAULT 0 NOT NULL,
-	"source_type" "source_type" NOT NULL,
-	"source_key" text,
-	"source_url" text,
-	"start_sec" integer NOT NULL,
-	"end_sec" integer NOT NULL,
-	"with_subtitles" boolean DEFAULT false NOT NULL,
-	"burn_subtitles" boolean DEFAULT false NOT NULL,
-	"subtitle_lang" text,
-	"result_video_key" text,
-	"result_srt_key" text,
-	"error_code" text,
-	"error_message" text,
-	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
-	"updated_at" timestamp with time zone DEFAULT now() NOT NULL,
-	"expires_at" timestamp with time zone
-);
---> statement-breakpoint
-ALTER TABLE "job_events" ADD CONSTRAINT "job_events_job_id_jobs_id_fk" FOREIGN KEY ("job_id") REFERENCES "public"."jobs"("id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
-CREATE INDEX "idx_job_events_job_id_ts" ON "job_events" USING btree ("job_id","ts");--> statement-breakpoint
-CREATE INDEX "idx_jobs_status_created_at" ON "jobs" USING btree ("status","created_at");--> statement-breakpoint
-CREATE INDEX "idx_jobs_expires_at" ON "jobs" USING btree ("expires_at");
-````
-
-## File: src/data/drizzle/0001_asr_jobs.sql
-````sql
--- ASR tables migration
-CREATE TYPE "public"."asr_job_status" AS ENUM('queued','processing','done','failed');
-
-CREATE TABLE "asr_jobs" (
-    "id" uuid PRIMARY KEY NOT NULL,
-    "clip_job_id" uuid,
-    "source_type" text NOT NULL,
-    "source_key" text,
-    "media_hash" text NOT NULL,
-    "model_version" text NOT NULL,
-    "language_hint" text,
-    "detected_language" text,
-    "duration_sec" integer,
-    "status" "asr_job_status" DEFAULT 'queued' NOT NULL,
-    "error_code" text,
-    "error_message" text,
-    "created_at" timestamp with time zone DEFAULT now() NOT NULL,
-    "updated_at" timestamp with time zone DEFAULT now() NOT NULL,
-    "completed_at" timestamp with time zone,
-    "expires_at" timestamp with time zone
-);
-ALTER TABLE "asr_jobs" ADD CONSTRAINT "asr_jobs_clip_job_id_jobs_id_fk" FOREIGN KEY ("clip_job_id") REFERENCES "public"."jobs"("id") ON DELETE no action ON UPDATE no action;
-CREATE INDEX "idx_asr_jobs_status_created_at" ON "asr_jobs" USING btree ("status","created_at");
-CREATE INDEX "idx_asr_jobs_expires_at" ON "asr_jobs" USING btree ("expires_at");
--- unique reuse index (partial)
-CREATE UNIQUE INDEX "uq_asr_jobs_media_model_done" ON "asr_jobs" ("media_hash","model_version") WHERE status = 'done';
-
-CREATE TABLE "asr_artifacts" (
-    "asr_job_id" uuid NOT NULL,
-    "kind" text NOT NULL,
-    "storage_key" text NOT NULL,
-    "size_bytes" integer,
-    "created_at" timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT asr_artifacts_pk PRIMARY KEY ("asr_job_id","kind"),
-    CONSTRAINT asr_artifacts_asr_job_id_asr_jobs_id_fk FOREIGN KEY ("asr_job_id") REFERENCES "public"."asr_jobs"("id") ON DELETE cascade ON UPDATE no action
-);
 ````
 
 ## File: src/data/drizzle/0002_add_last_heartbeat.sql
@@ -3599,6 +5068,61 @@ if (!(globalThis as any).Bun) {
 }
 ````
 
+## File: src/worker/stage.ts
+````typescript
+import { MetricsRegistry } from '@clipper/common/metrics';
+
+export type StageErrorCode = 'timeout' | 'not_found' | 'network' | 'error';
+
+function classifyError(e: any, custom?: (err: any) => string): StageErrorCode {
+    try {
+        if (custom) return (custom(e) as StageErrorCode) || 'error';
+        const msg = String(e?.message || e || '').toLowerCase();
+        if (/timeout/.test(msg)) return 'timeout';
+        if (/not.?found|enoent/.test(msg)) return 'not_found';
+        if (/network|econn|eai_again|enotfound/.test(msg)) return 'network';
+        return 'error';
+    } catch {
+        return 'error';
+    }
+}
+
+export interface WithStageOptions {
+    classify?: (err: any) => string;
+}
+
+/**
+ * Executes an async stage fn, recording latency & failures.
+ * Metrics:
+ *  - worker.stage_latency_ms{stage}
+ *  - worker.stage_failures_total{stage,code}
+ */
+export async function withStage<T>(
+    metrics: MetricsRegistry,
+    stage: string,
+    fn: () => Promise<T>,
+    opts: WithStageOptions = {}
+): Promise<T> {
+    const start = performance.now();
+    try {
+        const res = await fn();
+        metrics.observe('worker.stage_latency_ms', performance.now() - start, {
+            stage,
+        });
+        return res;
+    } catch (e) {
+        metrics.observe('worker.stage_latency_ms', performance.now() - start, {
+            stage,
+        });
+        const code = classifyError(e, opts.classify);
+        metrics.inc('worker.stage_failures_total', 1, { stage, code });
+        throw e;
+    }
+}
+
+export { classifyError };
+````
+
 ## File: .env.example
 ````
 ## Example .env for yt-clipper
@@ -4087,6 +5611,105 @@ curl http://localhost:3000/api/jobs/<jobId>/result
 ```
 ````
 
+## File: docs/metrics.md
+````markdown
+# Metrics Reference
+
+Endpoint: `GET /metrics` returns a JSON snapshot (simple counters + observed distributions). Names below indicate intent.
+
+## Job Lifecycle
+
+-   jobs.created (counter) — Number of clip jobs created.
+-   jobs.enqueue_latency_ms (histogram/summary) — Latency from job creation to queue publish.
+-   jobs.status_fetch (counter) — Status endpoint hits.
+-   jobs.result_fetch (counter) — Result endpoint hits.
+
+## Cleanup
+
+-   cleanup.jobs.deleted (counter) — Expired clip jobs removed.
+-   cleanup.asrJobs.deleted (counter) — Expired ASR jobs removed.
+
+## Media IO (Download / Probe / Resolve)
+
+-   mediaio.download.bytes (counter) — Bytes streamed for uploaded media (labels include maybe source/type).
+-   mediaio.ytdlp.duration_ms (histogram) — Time spent running yt-dlp.
+-   mediaio.ffprobe.duration_ms (histogram) — Time spent running ffprobe.
+-   mediaio.resolve.duration_ms (histogram) — End-to-end resolve (download + probe) time.
+
+## Repository (Database) Operations
+
+-   repo.op.duration_ms (histogram) — Duration of repository operations; has label `op` (e.g., jobs.create, jobs.get, asrJobs.create, asrArtifacts.put)
+
+## Clip Worker
+
+-   clip.upload_ms (histogram) — Time to upload generated clip to storage.
+-   clip.total_ms (histogram) — Overall clip processing duration.
+-   clip.failures (counter) — Clip processing failures.
+
+## ASR Pipeline
+
+-   asr.duration_ms (histogram) — Time for ASR transcription per job.
+-   asr.completed (counter) — Successful ASR jobs.
+-   asr.failures (counter) — Failed ASR jobs.
+
+## Queue
+
+-   (From /metrics/queue) Implementation-specific fields (depth, active, etc.) produced by PgBoss adapter.
+
+## Usage Guidance
+
+Counters monotonically increase until process restart. Histograms/observations are aggregated in-memory; scrape interval should be frequent (`15s-60s`) for real-time dashboards.
+
+## Event Persistence
+
+-   events.persist_failures_total (counter) — Number of failed attempts to persist job events (foreign key violations, DB errors).
+
+## Health Endpoint Fields (GET /healthz)
+
+-   ok (boolean) — Composite readiness (queue.ok && db.ok)
+-   queue.ok (boolean) — Queue adapter health
+-   queue.error (string?) — Present when queue.ok is false
+-   db.ok (boolean) — Database ping success flag
+-   db.ping_ms (number) — Measured latency of lightweight DB call
+
+## SLOs & Example Queries
+
+### Proposed SLOs
+
+1. API Availability: 99.5% of requests succeed (non-5xx) over 30d.
+2. Job Completion Latency: 95% of clip jobs finish (queued -> done) within 5 minutes.
+3. ASR Success Rate: 99% of ASR jobs succeed (no failure) over 7d.
+4. Event Persistence Reliability: 99.99% of job events persist (failure rate < 0.01%).
+5. External Dependency Budget: < 2% of external operations (yt-dlp, ffprobe, storage, asr) fail.
+
+### Derived Metrics (PromQL-style Pseudocode)
+
+Assume counters are exposed to a Prometheus scraper via future adapter (Task 15.1). Replace `rate` windows as desired.
+
+-   Availability: 1 - (sum(rate(http.errors_total{code=~"5.."}[5m])) / sum(rate(http.requests_total[5m])))
+-   Job Completion Latency (burn alert): histogram_quantile(0.95, sum(rate(jobs.total_latency_ms_bucket[5m])) by (le)) < 300000
+-   ASR Success Rate: sum(rate(asr.completed[5m])) / (sum(rate(asr.completed[5m])) + sum(rate(asr.failures[5m])))
+-   Event Persistence Failure Ratio: sum(rate(events.persist_failures_total[5m])) / sum(rate(events.persist_failures_total[5m]) + 1) (Alert when > 0.0001)
+-   External Failure Ratio: sum(rate(external.failures_total[5m])) / sum(rate(external.calls_total[5m])) (Naming illustrative; actual labels depend on wrapper implementation)
+
+### Burn Rate Alert Examples (Pseudo)
+
+-   Fast burn (15m): availability_error_ratio > (1 - 0.995) \* 14
+-   Slow burn (6h): availability_error_ratio > (1 - 0.995) \* 6
+
+Where availability_error_ratio = sum(rate(http.errors_total{code=~"5.."}[window])) / sum(rate(http.requests_total[window]))
+
+### Troubleshooting Pointers
+
+-   Elevated http.request_latency_ms on a single route + increase in external.\* duration: investigate downstream service.
+-   Rising events.persist_failures_total: check DB connectivity, FK integrity; may indicate race where job row not yet committed.
+-   Spike in clip.failures with stable external metrics: likely ffmpeg local issue or invalid input parameters.
+
+## Adding New Metrics
+
+Follow naming: `<domain>.<action>[_<unit>]` with `_ms` for millisecond durations, plural nouns for counts (e.g., `jobs.created`). Keep domain sets small & stable.
+````
+
 ## File: planning/tasks.md
 ````markdown
 # Tasks
@@ -4344,88 +5967,80 @@ async function sha256File(filePath: string): Promise<string> {
 }
 ````
 
-## File: src/common/metrics.ts
+## File: src/common/logger.ts
 ````typescript
-export type MetricLabels = Record<string, string | number>;
+import { redactSecrets } from './redact';
+export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
 
-export interface Metrics {
-    inc(name: string, value?: number, labels?: MetricLabels): void;
-    observe(name: string, value: number, labels?: MetricLabels): void;
-    snapshot(): MetricsSnapshot;
+export interface Logger {
+    level: LogLevel;
+    with(fields: Record<string, unknown>): Logger;
+    debug(msg: string, fields?: Record<string, unknown>): void;
+    info(msg: string, fields?: Record<string, unknown>): void;
+    warn(msg: string, fields?: Record<string, unknown>): void;
+    error(msg: string, fields?: Record<string, unknown>): void;
 }
 
-export interface MetricsSnapshot {
-    counters: Record<string, number>;
-    histograms: Record<
+function emit(
+    level: LogLevel,
+    base: Record<string, unknown>,
+    msg: string,
+    fields?: Record<string, unknown>
+) {
+    // Apply redaction to message & structured fields
+    const redactedBase = redactSecrets(base) as Record<string, unknown>;
+    const redactedFields = redactSecrets(fields ?? ({} as any)) as Record<
         string,
-        {
-            count: number;
-            sum: number;
-            min: number;
-            max: number;
-            p50: number;
-            p90: number;
-            p99: number;
-        }
+        unknown
     >;
-}
-
-export class InMemoryMetrics implements Metrics {
-    counters = new Map<string, number>();
-    histograms = new Map<string, number[]>();
-    inc(name: string, value = 1, labels?: MetricLabels) {
-        const key = keyWithLabels(name, labels);
-        this.counters.set(key, (this.counters.get(key) ?? 0) + value);
+    // Ensure correlationId (if present) not accidentally redacted
+    const correlationId =
+        (fields as any)?.correlationId || (base as any)?.correlationId;
+    if (correlationId) {
+        redactedBase.correlationId = correlationId;
+        redactedFields.correlationId = correlationId;
     }
-    observe(name: string, value: number, labels?: MetricLabels) {
-        const key = keyWithLabels(name, labels);
-        const arr = this.histograms.get(key) ?? [];
-        arr.push(value);
-        this.histograms.set(key, arr);
-    }
-    snapshot(): MetricsSnapshot {
-        const counters: Record<string, number> = {};
-        for (const [k, v] of this.counters.entries()) counters[k] = v;
-        const histograms: MetricsSnapshot['histograms'] = {};
-        for (const [k, arr] of this.histograms.entries()) {
-            if (!arr.length) continue;
-            const sorted = [...arr].sort((a, b) => a - b);
-            const pct = (p: number): number => {
-                const idx = Math.min(
-                    sorted.length - 1,
-                    Math.max(0, Math.floor((p / 100) * sorted.length))
-                );
-                return sorted[idx] ?? sorted[sorted.length - 1] ?? 0;
-            };
-            histograms[k] = {
-                count: arr.length,
-                sum: arr.reduce((a, b) => a + b, 0),
-                min: sorted[0]!,
-                max: sorted[sorted.length - 1]!,
-                p50: pct(50),
-                p90: pct(90),
-                p99: pct(99),
-            };
-        }
-        return { counters, histograms };
+    const line = {
+        level,
+        ts: new Date().toISOString(),
+        msg: redactSecrets(msg),
+        ...redactedBase,
+        ...redactedFields,
+    };
+    try {
+        console[level === 'debug' ? 'log' : level](JSON.stringify(line));
+    } catch {
+        // Fallback minimal log on serialization error
+        try {
+            console.error('{"level":"error","msg":"log serialization failed"}');
+        } catch {}
     }
 }
 
-export const noopMetrics: Metrics = {
-    inc() {},
-    observe() {},
-    snapshot() {
-        return { counters: {}, histograms: {} };
-    },
-};
-
-function keyWithLabels(name: string, labels?: MetricLabels) {
-    if (!labels) return name;
-    const parts = Object.entries(labels)
-        .sort(([a], [b]) => a.localeCompare(b))
-        .map(([k, v]) => `${k}=${v}`)
-        .join(',');
-    return `${name}{${parts}}`;
+export function createLogger(
+    level: LogLevel = 'info',
+    base: Record<string, unknown> = {}
+): Logger {
+    return {
+        level,
+        with(additional) {
+            return createLogger(level, { ...base, ...additional });
+        },
+        debug(msg, fields) {
+            if (['debug'].includes(level)) emit('debug', base, msg, fields);
+        },
+        info(msg, fields) {
+            if (['debug', 'info'].includes(level))
+                emit('info', base, msg, fields);
+        },
+        warn(msg, fields) {
+            if (['debug', 'info', 'warn'].includes(level))
+                emit('warn', base, msg, fields);
+        },
+        error(msg, fields) {
+            emit('error', base, msg, fields);
+        },
+    };
 }
 ````
 
@@ -4500,6 +6115,109 @@ export function createDb(url = readEnv('DATABASE_URL')): DB {
 }
 ````
 
+## File: src/data/drizzle/0000_tense_yellow_claw.sql
+````sql
+-- Wrapped enum creations in DO blocks for idempotence. If the type already
+-- exists (e.g. database reused between runs), the duplicate_object exception
+-- is swallowed so the migration can proceed. NOTE: This does NOT reconcile
+-- differences in enum members; if you need to add new values later, create a
+-- new migration using ALTER TYPE ... ADD VALUE.
+DO $$ BEGIN
+	CREATE TYPE "public"."job_status" AS ENUM('queued', 'processing', 'done', 'failed');
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;--> statement-breakpoint
+DO $$ BEGIN
+	CREATE TYPE "public"."source_type" AS ENUM('upload', 'youtube');
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;--> statement-breakpoint
+CREATE TABLE IF NOT EXISTS "api_keys" (
+	"id" uuid PRIMARY KEY NOT NULL,
+	"name" text NOT NULL,
+	"key_hash" text NOT NULL,
+	"revoked" boolean DEFAULT false NOT NULL,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"last_used_at" timestamp with time zone
+);
+--> statement-breakpoint
+CREATE TABLE IF NOT EXISTS "job_events" (
+	"job_id" uuid NOT NULL,
+	"ts" timestamp with time zone DEFAULT now() NOT NULL,
+	"type" text NOT NULL,
+	"data" jsonb
+);
+--> statement-breakpoint
+CREATE TABLE IF NOT EXISTS "jobs" (
+	"id" uuid PRIMARY KEY NOT NULL,
+	"status" "job_status" DEFAULT 'queued' NOT NULL,
+	"progress" integer DEFAULT 0 NOT NULL,
+	"source_type" "source_type" NOT NULL,
+	"source_key" text,
+	"source_url" text,
+	"start_sec" integer NOT NULL,
+	"end_sec" integer NOT NULL,
+	"with_subtitles" boolean DEFAULT false NOT NULL,
+	"burn_subtitles" boolean DEFAULT false NOT NULL,
+	"subtitle_lang" text,
+	"result_video_key" text,
+	"result_srt_key" text,
+	"error_code" text,
+	"error_message" text,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"updated_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"expires_at" timestamp with time zone
+);
+--> statement-breakpoint
+DO $$ BEGIN
+	ALTER TABLE "job_events" ADD CONSTRAINT "job_events_job_id_jobs_id_fk" FOREIGN KEY ("job_id") REFERENCES "public"."jobs"("id") ON DELETE cascade ON UPDATE no action;
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "idx_job_events_job_id_ts" ON "job_events" USING btree ("job_id","ts");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "idx_jobs_status_created_at" ON "jobs" USING btree ("status","created_at");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "idx_jobs_expires_at" ON "jobs" USING btree ("expires_at");
+````
+
+## File: src/data/drizzle/0001_asr_jobs.sql
+````sql
+-- ASR tables migration
+-- Make enum creation idempotent for local/dev reruns.
+DO $$ BEGIN
+    CREATE TYPE "public"."asr_job_status" AS ENUM('queued','processing','done','failed');
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+CREATE TABLE IF NOT EXISTS "asr_jobs" (
+    "id" uuid PRIMARY KEY NOT NULL,
+    "clip_job_id" uuid,
+    "source_type" text NOT NULL,
+    "source_key" text,
+    "media_hash" text NOT NULL,
+    "model_version" text NOT NULL,
+    "language_hint" text,
+    "detected_language" text,
+    "duration_sec" integer,
+    "status" "asr_job_status" DEFAULT 'queued' NOT NULL,
+    "error_code" text,
+    "error_message" text,
+    "created_at" timestamp with time zone DEFAULT now() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT now() NOT NULL,
+    "completed_at" timestamp with time zone,
+    "expires_at" timestamp with time zone
+);
+DO $$ BEGIN
+    ALTER TABLE "asr_jobs" ADD CONSTRAINT "asr_jobs_clip_job_id_jobs_id_fk" FOREIGN KEY ("clip_job_id") REFERENCES "public"."jobs"("id") ON DELETE no action ON UPDATE no action;
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+CREATE INDEX IF NOT EXISTS "idx_asr_jobs_status_created_at" ON "asr_jobs" USING btree ("status","created_at");
+CREATE INDEX IF NOT EXISTS "idx_asr_jobs_expires_at" ON "asr_jobs" USING btree ("expires_at");
+-- unique reuse index (partial)
+CREATE UNIQUE INDEX IF NOT EXISTS "uq_asr_jobs_media_model_done" ON "asr_jobs" ("media_hash","model_version") WHERE status = 'done';
+
+CREATE TABLE IF NOT EXISTS "asr_artifacts" (
+    "asr_job_id" uuid NOT NULL,
+    "kind" text NOT NULL,
+    "storage_key" text NOT NULL,
+    "size_bytes" integer,
+    "created_at" timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT asr_artifacts_pk PRIMARY KEY ("asr_job_id","kind"),
+    CONSTRAINT asr_artifacts_asr_job_id_asr_jobs_id_fk FOREIGN KEY ("asr_job_id") REFERENCES "public"."asr_jobs"("id") ON DELETE cascade ON UPDATE no action
+);
+````
+
 ## File: src/data/scripts/cleanup.ts
 ````typescript
 import { cleanupExpiredJobs, cleanupExpiredAsrJobs } from '../cleanup';
@@ -4547,134 +6265,6 @@ if (import.meta.main) {
         console.error(err);
         process.exit(1);
     });
-}
-````
-
-## File: src/data/media-io-upload.ts
-````typescript
-import { createSupabaseStorageRepo } from './storage';
-import {
-    readEnv,
-    readIntEnv,
-    createLogger,
-    noopMetrics,
-    type Metrics,
-} from '../common';
-import type { ResolveResult as SharedResolveResult } from './media-io';
-
-type ResolveJob = {
-    id: string;
-    sourceType: 'upload';
-    sourceKey: string; // required for upload path
-};
-
-export type FfprobeMeta = {
-    durationSec: number;
-    sizeBytes: number;
-    container?: string;
-};
-
-export type UploadResolveResult = SharedResolveResult;
-
-async function streamToFile(
-    url: string,
-    outPath: string,
-    metrics: Metrics,
-    labels: Record<string, string>
-) {
-    const res = await fetch(url);
-    if (!res.ok || !res.body) {
-        throw new Error(`DOWNLOAD_FAILED: status=${res.status}`);
-    }
-    const counting = new TransformStream<Uint8Array, Uint8Array>({
-        transform(chunk, controller) {
-            metrics.inc('mediaio.download.bytes', chunk.byteLength, labels);
-            controller.enqueue(chunk);
-        },
-    });
-    const stream = res.body.pipeThrough(counting);
-    await Bun.write(outPath, new Response(stream));
-}
-
-async function ffprobe(localPath: string): Promise<FfprobeMeta> {
-    const args = [
-        '-v',
-        'error',
-        '-print_format',
-        'json',
-        '-show_format',
-        '-show_streams',
-        localPath,
-    ];
-    const proc = Bun.spawn(['ffprobe', ...args], {
-        stdout: 'pipe',
-        stderr: 'pipe',
-    });
-    const stdout = await new Response(proc.stdout).text();
-    const exit = await proc.exited;
-    if (exit !== 0) throw new Error('FFPROBE_FAILED');
-    const json = JSON.parse(stdout);
-    const durationSec = json?.format?.duration
-        ? Number(json.format.duration)
-        : 0;
-    const sizeBytes = json?.format?.size
-        ? Number(json.format.size)
-        : Bun.file(localPath).size;
-    const container = json?.format?.format_name as string | undefined;
-    return { durationSec, sizeBytes, container };
-}
-
-export async function resolveUploadSource(
-    job: ResolveJob,
-    deps: { metrics?: Metrics } = {}
-): Promise<UploadResolveResult> {
-    const logger = createLogger((readEnv('LOG_LEVEL') as any) ?? 'info').with({
-        comp: 'mediaio',
-        jobId: job.id,
-    });
-    const metrics = deps.metrics ?? noopMetrics;
-
-    const SCRATCH_DIR = readEnv('SCRATCH_DIR') ?? '/tmp/ytc';
-    const MAX_MB = readIntEnv('MAX_INPUT_MB', 1024)!;
-    const MAX_DUR = readIntEnv('MAX_CLIP_INPUT_DURATION_SEC', 7200)!;
-
-    const m = job.sourceKey.match(/\.([A-Za-z0-9]+)$/);
-    const ext = m ? `.${m[1]}` : '.mp4';
-    const baseDir = `${SCRATCH_DIR.replace(/\/$/, '')}/sources/${job.id}`;
-    const localPath = `${baseDir}/source${ext}`;
-
-    logger.info('resolving upload to local path');
-    {
-        const p = Bun.spawn(['mkdir', '-p', baseDir]);
-        const code = await p.exited;
-        if (code !== 0) throw new Error('MKDIR_FAILED');
-    }
-
-    // Sign and stream download
-    const storage = createSupabaseStorageRepo();
-    const signedUrl = await storage.sign(job.sourceKey);
-    await streamToFile(signedUrl, localPath, metrics, { jobId: job.id });
-
-    // ffprobe validation
-    const meta = await ffprobe(localPath);
-
-    if (meta.durationSec > MAX_DUR || meta.sizeBytes > MAX_MB * 1024 * 1024) {
-        // cleanup on violation
-        const p = Bun.spawn(['rm', '-rf', baseDir]);
-        await p.exited;
-        throw new Error('INPUT_TOO_LARGE');
-    }
-
-    const cleanup = async () => {
-        const p = Bun.spawn(['rm', '-rf', baseDir]);
-        await p.exited;
-    };
-
-    logger.info('upload resolved', {
-        durationSec: meta.durationSec,
-        sizeBytes: meta.sizeBytes,
-    });
-    return { localPath, cleanup, meta };
 }
 ````
 
@@ -5125,6 +6715,20 @@ This document breaks down the work required to implement the FFmpeg Service (Cli
     -   [x] Update the main `README.md` or other relevant docs if necessary to mention that `ffmpeg` is now a required dependency.
 ````
 
+## File: src/common/index.ts
+````typescript
+export * from './config';
+export * from './logger';
+export * from './errors';
+export * from './time';
+export * from './state';
+export * from './env';
+export * from './metrics';
+export * from './redact';
+export * from './external';
+export * from './resource-sampler';
+````
+
 ## File: src/data/db/schema.ts
 ````typescript
 import {
@@ -5492,269 +7096,150 @@ function sleep(ms: number) {
 }
 ````
 
-## File: src/data/media-io-youtube.ts
+## File: src/data/media-io-upload.ts
 ````typescript
-// Clean YouTube resolver (yt-dlp) with SSRF protections, binary fallback & debug logging
+import { createSupabaseStorageRepo } from './storage';
 import {
     readEnv,
     readIntEnv,
     createLogger,
     noopMetrics,
     type Metrics,
-} from '../common/index';
+    withExternal,
+} from '../common';
 import type { ResolveResult as SharedResolveResult } from './media-io';
-import { readdir } from 'node:fs/promises';
-import { lookup } from 'node:dns/promises';
 
-export type ResolveJob = {
+type ResolveJob = {
     id: string;
-    sourceType: 'youtube';
-    sourceUrl: string;
+    sourceType: 'upload';
+    sourceKey: string; // required for upload path
 };
+
 export type FfprobeMeta = {
     durationSec: number;
     sizeBytes: number;
     container?: string;
 };
-export type YouTubeResolveResult = SharedResolveResult;
 
-function isPrivateIPv4(ip: string): boolean {
-    if (!/^[0-9.]+$/.test(ip)) return false;
-    const parts = ip.split('.').map(Number);
-    if (parts.length !== 4) return false;
-    const a = parts[0];
-    const b = parts[1];
-    return !!(
-        a === 10 ||
-        (a === 172 && b !== undefined && b >= 16 && b <= 31) ||
-        (a === 192 && b === 168) ||
-        a === 127 ||
-        (a === 169 && b === 254) ||
-        a === 0
-    );
-}
-function isPrivateIPv6(ip: string): boolean {
-    const v = ip.toLowerCase();
-    return (
-        v === '::1' ||
-        v.startsWith('fc') ||
-        v.startsWith('fd') ||
-        v.startsWith('fe80:') ||
-        v === '::' ||
-        v === '::0'
-    );
-}
+export type UploadResolveResult = SharedResolveResult;
 
-async function assertSafeUrl(raw: string) {
-    let u: URL;
-    try {
-        u = new URL(raw);
-    } catch {
-        throw new Error('SSRF_BLOCKED');
+async function streamToFile(
+    url: string,
+    outPath: string,
+    metrics: Metrics,
+    labels: Record<string, string>
+) {
+    const res = await fetch(url);
+    if (!res.ok || !res.body) {
+        throw new Error(`DOWNLOAD_FAILED: status=${res.status}`);
     }
-    if (!/^https?:$/.test(u.protocol)) throw new Error('SSRF_BLOCKED');
-    const allow = (readEnv('ALLOWLIST_HOSTS') || '')
-        .split(',')
-        .map((s) => s.trim().toLowerCase())
-        .filter(Boolean);
-    if (allow.length) {
-        const host = u.hostname.toLowerCase();
-        if (!allow.some((h) => host === h || host.endsWith(`.${h}`)))
-            throw new Error('SSRF_BLOCKED');
-    }
-    try {
-        const res = await lookup(u.hostname, { all: true });
-        for (const { address, family } of res) {
-            if (
-                (family === 4 && isPrivateIPv4(address)) ||
-                (family === 6 && isPrivateIPv6(address))
-            )
-                throw new Error('SSRF_BLOCKED');
-        }
-    } catch {
-        throw new Error('SSRF_BLOCKED');
-    }
-}
-
-async function ffprobe(localPath: string): Promise<FfprobeMeta> {
-    const args = [
-        '-v',
-        'error',
-        '-print_format',
-        'json',
-        '-show_format',
-        '-show_streams',
-        localPath,
-    ];
-    const proc = Bun.spawn(['ffprobe', ...args], {
-        stdout: 'pipe',
-        stderr: 'pipe',
+    const counting = new TransformStream<Uint8Array, Uint8Array>({
+        transform(chunk, controller) {
+            metrics.inc('mediaio.download.bytes', chunk.byteLength, labels);
+            controller.enqueue(chunk);
+        },
     });
-    const stdout = await new Response(proc.stdout).text();
-    if ((await proc.exited) !== 0) throw new Error('FFPROBE_FAILED');
-    const json = JSON.parse(stdout);
-    const durationSec = json?.format?.duration
-        ? Number(json.format.duration)
-        : 0;
-    const sizeBytes = json?.format?.size
-        ? Number(json.format.size)
-        : Bun.file(localPath).size;
-    const container = json?.format?.format_name as string | undefined;
-    return { durationSec, sizeBytes, container };
+    const stream = res.body.pipeThrough(counting);
+    await Bun.write(outPath, new Response(stream));
 }
 
-async function findDownloadedFile(dir: string): Promise<string | null> {
-    const files = await readdir(dir).catch(() => []);
-    const candidates = files.filter((f) => f.startsWith('source.'));
-    if (!candidates.length) return null;
-    const mp4 = candidates.find((f) => f.endsWith('.mp4'));
-    return `${dir}/${mp4 ?? candidates[0]}`;
+async function ffprobe(
+    localPath: string,
+    metrics: Metrics
+): Promise<FfprobeMeta> {
+    return withExternal(
+        metrics as any,
+        { dep: 'ffprobe', op: 'probe' },
+        async () => {
+            const args = [
+                '-v',
+                'error',
+                '-print_format',
+                'json',
+                '-show_format',
+                '-show_streams',
+                localPath,
+            ];
+            const proc = Bun.spawn(['ffprobe', ...args], {
+                stdout: 'pipe',
+                stderr: 'pipe',
+            });
+            const stdout = await new Response(proc.stdout).text();
+            const exit = await proc.exited;
+            if (exit !== 0) throw new Error('FFPROBE_FAILED');
+            const json = JSON.parse(stdout);
+            const durationSec = json?.format?.duration
+                ? Number(json.format.duration)
+                : 0;
+            const sizeBytes = json?.format?.size
+                ? Number(json.format.size)
+                : Bun.file(localPath).size;
+            const container = json?.format?.format_name as string | undefined;
+            return { durationSec, sizeBytes, container };
+        }
+    );
 }
 
-export async function resolveYouTubeSource(
+export async function resolveUploadSource(
     job: ResolveJob,
     deps: { metrics?: Metrics } = {}
-): Promise<YouTubeResolveResult> {
-    const logger = createLogger((readEnv('LOG_LEVEL') as any) || 'info').with({
+): Promise<UploadResolveResult> {
+    const logger = createLogger((readEnv('LOG_LEVEL') as any) ?? 'info').with({
         comp: 'mediaio',
         jobId: job.id,
     });
     const metrics = deps.metrics ?? noopMetrics;
-    const SCRATCH = readEnv('SCRATCH_DIR') || '/tmp/ytc';
+
+    const SCRATCH_DIR = readEnv('SCRATCH_DIR') ?? '/tmp/ytc';
     const MAX_MB = readIntEnv('MAX_INPUT_MB', 1024)!;
     const MAX_DUR = readIntEnv('MAX_CLIP_INPUT_DURATION_SEC', 7200)!;
-    const ENABLE = (readEnv('ENABLE_YTDLP') || 'false') === 'true';
-    const DEBUG = (readEnv('YTDLP_DEBUG') || 'false').toLowerCase() === 'true';
-    const BIN_OVERRIDE = readEnv('YTDLP_BIN');
 
-    logger.info('resolving youtube to local path');
-    if (!ENABLE) throw new Error('YTDLP_DISABLED');
-    await assertSafeUrl(job.sourceUrl);
+    const m = job.sourceKey.match(/\.([A-Za-z0-9]+)$/);
+    const ext = m ? `.${m[1]}` : '.mp4';
+    const baseDir = `${SCRATCH_DIR.replace(/\/$/, '')}/sources/${job.id}`;
+    const localPath = `${baseDir}/source${ext}`;
 
-    const baseDir = `${SCRATCH.replace(/\/$/, '')}/sources/${job.id}`;
-    await Bun.spawn(['mkdir', '-p', baseDir]).exited;
-    const outTemplate = `${baseDir}/source.%(ext)s`;
-    const format = readEnv('YTDLP_FORMAT') || 'bv*+ba/b';
-    const ytdlpArgs = [
-        '-f',
-        format,
-        '-o',
-        outTemplate,
-        '--quiet',
-        '--no-progress',
-        '--no-cache-dir',
-        '--no-part',
-        '--retries',
-        '3',
-        '--merge-output-format',
-        'mp4',
-    ];
-    if (MAX_MB > 0) ytdlpArgs.push('--max-filesize', `${MAX_MB}m`);
-    const sections = readEnv('YTDLP_SECTIONS');
-    if (sections) {
-        // Expect comma-separated list like "*00:01:00-00:02:00,*00:10:00-00:10:30"
-        for (const sec of sections
-            .split(',')
-            .map((s) => s.trim())
-            .filter(Boolean)) {
-            ytdlpArgs.push('--download-sections', sec);
-        }
+    logger.info('resolving upload to local path');
+    {
+        const p = Bun.spawn(['mkdir', '-p', baseDir]);
+        const code = await p.exited;
+        if (code !== 0) throw new Error('MKDIR_FAILED');
     }
-    ytdlpArgs.push(job.sourceUrl);
 
-    const candidates = Array.from(
-        new Set([
-            BIN_OVERRIDE || 'yt-dlp',
-            '/opt/homebrew/bin/yt-dlp',
-            '/usr/local/bin/yt-dlp',
-            '/usr/bin/yt-dlp',
-        ])
+    // Sign and stream download
+    const storage = createSupabaseStorageRepo();
+    const signedUrl = await withExternal(
+        metrics as any,
+        { dep: 'storage', op: 'sign' },
+        async () => storage.sign(job.sourceKey)
     );
-    let bin: string | undefined;
-    for (const b of candidates) {
-        try {
-            const t = Bun.spawn([b, '--version'], {
-                stdout: 'ignore',
-                stderr: 'ignore',
+    await withExternal(
+        metrics as any,
+        { dep: 'storage', op: 'download' },
+        async () => {
+            await streamToFile(signedUrl, localPath, metrics, {
+                jobId: job.id,
             });
-            if ((await t.exited) === 0) {
-                bin = b;
-                break;
-            }
-        } catch {}
-    }
-    if (!bin) throw new Error('YTDLP_NOT_FOUND');
-    if (DEBUG)
-        logger.info('yt-dlp starting', { bin, args: ytdlpArgs.join(' ') });
+            return null;
+        }
+    );
 
-    const timeoutMs = Math.min(MAX_DUR * 1000, 15 * 60 * 1000);
-    const dlStart = Date.now();
-    let timedOut = false;
-    const proc = Bun.spawn([bin, ...ytdlpArgs], {
-        stdout: 'pipe',
-        stderr: 'pipe',
-        env: { PATH: (process as any).env?.PATH || '' },
-    });
-    const timer = setTimeout(() => {
-        try {
-            proc.kill('SIGKILL');
-            timedOut = true;
-        } catch {}
-    }, timeoutMs);
-    const stderrP = new Response(proc.stderr).text();
-    const stdoutP = new Response(proc.stdout).text();
-    const exitCode = await proc.exited;
-    const [stderrText, stdoutText] = await Promise.all([
-        stderrP.catch(() => ''),
-        stdoutP.catch(() => ''),
-    ]);
-    clearTimeout(timer);
-    metrics.observe('mediaio.ytdlp.duration_ms', Date.now() - dlStart, {
-        jobId: job.id,
-    });
-    if (timedOut) {
-        await Bun.spawn(['rm', '-rf', baseDir]).exited;
-        throw new Error('YTDLP_TIMEOUT');
-    }
-    if (exitCode !== 0) {
-        if (DEBUG)
-            logger.error('yt-dlp failed', {
-                exitCode,
-                stderr: stderrText.slice(0, 800),
-            });
-        await Bun.spawn(['rm', '-rf', baseDir]).exited;
-        throw new Error(`YTDLP_FAILED:${exitCode}`);
-    }
-    if (DEBUG)
-        logger.info('yt-dlp succeeded', {
-            exitCode,
-            stderrPreview: stderrText.slice(0, 200),
-            stdoutPreview: stdoutText.slice(0, 200),
-        });
+    // ffprobe validation
+    const meta = await ffprobe(localPath, metrics);
 
-    const localPath = await findDownloadedFile(baseDir);
-    if (!localPath) {
-        await Bun.spawn(['rm', '-rf', baseDir]).exited;
-        throw new Error('YTDLP_FAILED');
-    }
-
-    const ffStart = Date.now();
-    const meta = await ffprobe(localPath);
-    metrics.observe('mediaio.ffprobe.duration_ms', Date.now() - ffStart, {
-        jobId: job.id,
-    });
     if (meta.durationSec > MAX_DUR || meta.sizeBytes > MAX_MB * 1024 * 1024) {
-        await Bun.spawn(['rm', '-rf', baseDir]).exited;
+        // cleanup on violation
+        const p = Bun.spawn(['rm', '-rf', baseDir]);
+        await p.exited;
         throw new Error('INPUT_TOO_LARGE');
     }
 
     const cleanup = async () => {
-        await Bun.spawn(['rm', '-rf', baseDir]).exited;
+        const p = Bun.spawn(['rm', '-rf', baseDir]);
+        await p.exited;
     };
-    metrics.observe('mediaio.resolve.duration_ms', Date.now() - dlStart, {
-        jobId: job.id,
-    });
-    logger.info('youtube resolved', {
+
+    logger.info('upload resolved', {
         durationSec: meta.durationSec,
         sizeBytes: meta.sizeBytes,
     });
@@ -6011,256 +7496,6 @@ export class BunClipper implements Clipper {
         const msg = `ffmpeg failed (copy code=${copyResult.attempt.code}, reencode code=${reResult.attempt.code})`;
         throw new ServiceError('BAD_REQUEST', msg); // using existing code enum; adjust if more codes added later
     }
-}
-````
-
-## File: src/worker/asr.ts
-````typescript
-import {
-    DrizzleAsrJobsRepo,
-    DrizzleJobsRepo,
-    DrizzleAsrArtifactsRepo,
-    createDb,
-    storageKeys,
-    createSupabaseStorageRepo,
-} from '@clipper/data';
-import {
-    buildArtifacts,
-    GroqWhisperProvider,
-    ProviderHttpError,
-} from '@clipper/asr';
-import { InMemoryMetrics } from '@clipper/common/metrics';
-import { QUEUE_TOPIC_ASR } from '@clipper/queue';
-import {
-    AsrQueuePayloadSchema,
-    type AsrQueuePayload,
-} from '@clipper/queue/asr';
-import { createLogger, readEnv, fromException } from '@clipper/common';
-
-export interface AsrWorkerDeps {
-    asrJobs?: DrizzleAsrJobsRepo;
-    clipJobs?: DrizzleJobsRepo;
-    artifacts?: DrizzleAsrArtifactsRepo;
-    provider?: GroqWhisperProvider;
-    storage?: ReturnType<typeof createSupabaseStorageRepo>;
-    queue: {
-        consumeFrom: (
-            topic: string,
-            handler: (msg: any) => Promise<void>
-        ) => Promise<void>;
-    };
-}
-
-const log = createLogger((readEnv('LOG_LEVEL') as any) || 'info').with({
-    mod: 'asrWorker',
-});
-
-export async function startAsrWorker(deps: AsrWorkerDeps) {
-    const metrics = new InMemoryMetrics();
-    const asrJobs = deps?.asrJobs ?? new DrizzleAsrJobsRepo(createDb());
-    const clipJobs = deps?.clipJobs ?? new DrizzleJobsRepo(createDb());
-    const artifacts =
-        deps?.artifacts ?? new DrizzleAsrArtifactsRepo(createDb());
-    const storage =
-        deps?.storage ??
-        (() => {
-            try {
-                return createSupabaseStorageRepo();
-            } catch {
-                return null as any;
-            }
-        })();
-    const provider = deps?.provider ?? new GroqWhisperProvider();
-
-    const timeoutMs = Number(readEnv('ASR_REQUEST_TIMEOUT_MS') || 120_000);
-    const includeJson =
-        (readEnv('ASR_JSON_SEGMENTS') || 'false').toLowerCase() === 'true';
-    const mergeGapMs = Number(readEnv('MERGE_GAP_MS') || 150);
-
-    await deps.queue.consumeFrom(QUEUE_TOPIC_ASR, async (msg: any) => {
-        const parse = AsrQueuePayloadSchema.safeParse(msg as AsrQueuePayload);
-        if (!parse.success) {
-            log.warn('invalid asr payload', { issues: parse.error.issues });
-            return; // drop invalid messages
-        }
-        const { asrJobId, clipJobId, languageHint } = parse.data;
-        const startedAt = Date.now();
-        let tmpLocal: string | null = null;
-        try {
-            // Load and claim job
-            const job = await asrJobs.get(asrJobId);
-            if (!job) {
-                log.warn('asr job not found', { asrJobId });
-                return;
-            }
-            if (job.status === 'done') return; // idempotent
-            if (job.status === 'queued') {
-                await asrJobs.patch(asrJobId, { status: 'processing' });
-            }
-
-            // Locate media: prefer clip resultVideoKey
-            let inputLocal: string;
-            if (clipJobId) {
-                const clip = await clipJobs.get(clipJobId);
-                if (!clip?.resultVideoKey) throw new Error('NO_CLIP_RESULT');
-                if (!storage) throw new Error('STORAGE_NOT_AVAILABLE');
-                inputLocal = await storage.download(clip.resultVideoKey);
-                tmpLocal = inputLocal;
-            } else {
-                throw new Error('NO_INPUT_PROVIDED');
-            }
-
-            // Transcribe
-            let res;
-            try {
-                res = await provider.transcribe(inputLocal, {
-                    timeoutMs,
-                    languageHint,
-                });
-            } catch (err: any) {
-                // Map provider errors to internal codes
-                if (err?.name === 'AbortError') throw new Error('TIMEOUT');
-                if (err instanceof ProviderHttpError) {
-                    if (err.status === 0) throw new Error('UPSTREAM_FAILURE');
-                    if (err.status >= 500) throw new Error('UPSTREAM_FAILURE');
-                    if (err.status === 400)
-                        throw new Error('VALIDATION_FAILED');
-                    // treat others as upstream
-                    throw new Error('UPSTREAM_FAILURE');
-                }
-                throw err;
-            }
-
-            // Build artifacts
-            const built = buildArtifacts(res.segments, {
-                includeJson,
-                mergeGapMs,
-            });
-
-            // Upload artifacts
-            if (!storage) throw new Error('STORAGE_NOT_AVAILABLE');
-            const owner = clipJobId ?? asrJobId;
-            const srtKey = storageKeys.transcriptSrt(owner);
-            const txtKey = storageKeys.transcriptText(owner);
-            const jsonKey = includeJson
-                ? storageKeys.transcriptJson(owner)
-                : null;
-            const srtPath = `/tmp/${owner}.srt`;
-            const txtPath = `/tmp/${owner}.txt`;
-            await Bun.write(srtPath, built.srt);
-            await Bun.write(txtPath, built.text);
-            await storage.upload(srtPath, srtKey, 'application/x-subrip');
-            await storage.upload(txtPath, txtKey, 'text/plain; charset=utf-8');
-            if (includeJson && jsonKey) {
-                const jsonPath = `/tmp/${owner}.json`;
-                await Bun.write(
-                    jsonPath,
-                    JSON.stringify(built.json || [], null, 0)
-                );
-                await storage.upload(jsonPath, jsonKey, 'application/json');
-            }
-
-            // Persist artifacts
-            await artifacts.put({
-                asrJobId,
-                kind: 'srt',
-                storageKey: srtKey,
-                createdAt: new Date().toISOString(),
-            });
-            await artifacts.put({
-                asrJobId,
-                kind: 'text',
-                storageKey: txtKey,
-                createdAt: new Date().toISOString(),
-            });
-            if (includeJson && jsonKey)
-                await artifacts.put({
-                    asrJobId,
-                    kind: 'json',
-                    storageKey: jsonKey,
-                    createdAt: new Date().toISOString(),
-                });
-
-            // Finalize job
-            await asrJobs.patch(asrJobId, {
-                status: 'done',
-                detectedLanguage: res.detectedLanguage,
-                durationSec: Math.round(res.durationSec),
-                completedAt: new Date().toISOString(),
-            });
-            metrics.observe('asr.duration_ms', Date.now() - startedAt);
-            metrics.inc('asr.completed');
-
-            // Update originating clip job with transcript key if available
-            if (clipJobId) {
-                try {
-                    await clipJobs.update(clipJobId, {
-                        resultSrtKey: srtKey,
-                    } as any);
-                } catch {}
-            }
-
-            // Burn-in subtitles if the originating clip requested it
-            if (clipJobId && includeJson) {
-                try {
-                    const clip = await clipJobs.get(clipJobId);
-                    if (clip?.burnSubtitles && clip?.resultVideoKey) {
-                        const burnedKey =
-                            storageKeys.resultVideoBurned(clipJobId);
-                        const clipLocal = await storage.download(
-                            clip.resultVideoKey
-                        );
-                        const srtLocal = await storage.download(srtKey);
-                        // Simple ffmpeg burn-in (assumes ffmpeg installed in env)
-                        const burnedPath = `/tmp/${clipJobId}.subbed.mp4`;
-                        const ff = Bun.spawn([
-                            'ffmpeg',
-                            '-y',
-                            '-i',
-                            clipLocal,
-                            '-vf',
-                            `subtitles=${srtLocal}:force_style='Fontsize=18'`,
-                            '-c:a',
-                            'copy',
-                            burnedPath,
-                        ]);
-                        await ff.exited;
-                        await storage.upload(
-                            burnedPath,
-                            burnedKey,
-                            'video/mp4'
-                        );
-                        await clipJobs.update(clipJobId, {
-                            resultVideoKey: burnedKey,
-                        } as any);
-                    }
-                } catch (e) {
-                    log.warn('burn-in failed (non-fatal)', {
-                        asrJobId,
-                        e: String(e),
-                    });
-                }
-            }
-        } catch (e) {
-            const err = fromException(e, asrJobId);
-            log.error('asr job failed', { asrJobId, err });
-            metrics.inc('asr.failures');
-            try {
-                await asrJobs.patch(asrJobId, {
-                    status: 'failed',
-                    errorCode:
-                        (err.error && (err.error as any).code) || 'INTERNAL',
-                    errorMessage:
-                        (err.error && (err.error as any).message) || String(e),
-                });
-            } catch {}
-            throw e; // let PgBoss retry
-        } finally {
-            try {
-                if (tmpLocal) await Bun.spawn(['rm', '-f', tmpLocal]).exited;
-            } catch {}
-        }
-    });
 }
 ````
 
@@ -6774,843 +8009,286 @@ interface Storage {
 -   Docs published; minimal UI demo works end-to-end.
 ````
 
-## File: src/api/index.ts
+## File: src/common/metrics.ts
 ````typescript
-import { Elysia } from 'elysia';
-// Some test environments may not set internal Elysia globals; ensure placeholder
-// to prevent TypeError when constructing Elysia during Vitest runs.
-// @ts-ignore
-if (typeof (globalThis as any).ELYSIA_AOT === 'undefined') {
-    // @ts-ignore
-    (globalThis as any).ELYSIA_AOT = false;
+// Core metrics primitives & registry
+export type MetricLabels = Record<string, string | number>;
+
+export interface MetricsSnapshot {
+    counters: Record<string, number>;
+    histograms: Record<string, HistogramSnapshot>;
+    gauges?: Record<string, number>;
 }
-import cors from '@elysiajs/cors';
-import { Schemas, type CreateJobInputType } from '@clipper/contracts';
-import {
-    createLogger,
-    readEnv,
-    readIntEnv,
-    requireEnv,
-    fromException,
-} from '@clipper/common';
-import {
-    DrizzleJobsRepo,
-    DrizzleJobEventsRepo,
-    DrizzleApiKeysRepo,
-    createDb,
-    createSupabaseStorageRepo,
-} from '@clipper/data';
-import { InMemoryMetrics } from '@clipper/common/metrics';
-import { PgBossQueueAdapter } from '@clipper/queue';
 
-const metrics = new InMemoryMetrics();
-const log = createLogger((readEnv('LOG_LEVEL') as any) || 'info').with({
-    mod: 'api',
-});
-
-// Simple in-memory API key cache & rate limiter (sufficient for single-instance / test)
-type ApiKeyCacheEntry = { record: any; expiresAt: number };
-const apiKeyCache = new Map<string, ApiKeyCacheEntry>();
-const API_KEY_CACHE_TTL_MS = 5 * 60_000; // 5 minutes
-
-interface RateBucket {
+export interface HistogramSnapshot {
     count: number;
-    windowStart: number;
-}
-const rateBuckets = new Map<string, RateBucket>();
-function rateLimitHit(key: string, max: number, windowMs: number) {
-    const now = Date.now();
-    const b = rateBuckets.get(key);
-    if (!b || now - b.windowStart >= windowMs) {
-        rateBuckets.set(key, { count: 1, windowStart: now });
-        return false; // first hit
-    }
-    if (b.count >= max) return true;
-    b.count++;
-    return false;
+    sum: number;
+    min: number;
+    max: number;
+    p50: number;
+    p90: number;
+    p99: number;
+    buckets: { le: number; count: number }[]; // cumulative counts per bucket (incl +Inf)
 }
 
-function buildDeps() {
-    let queue: any;
-    try {
-        const cs = requireEnv('DATABASE_URL');
-        queue = new PgBossQueueAdapter({ connectionString: cs });
-        queue.start?.();
-    } catch {
-        queue = {
-            publish: async () => {},
-            publishTo: async () => {},
-            health: async () => ({ ok: true }),
-            getMetrics: () => ({}),
-        };
+interface RegistryOpts {
+    maxLabelSetsPerMetric?: number; // cardinality guardrail
+    defaultHistogramBuckets?: number[]; // ascending, excludes +Inf
+}
+
+// Internal helpers
+function keyWithLabels(name: string, labels?: MetricLabels) {
+    if (!labels) return name;
+    const parts = Object.entries(labels)
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([k, v]) => `${k}=${v}`)
+        .join(',');
+    return `${name}{${parts}}`;
+}
+
+function labelsKey(labels?: MetricLabels) {
+    if (!labels) return '__no_labels__';
+    return Object.entries(labels)
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([k, v]) => `${k}=${v}`)
+        .join('|');
+}
+
+class Counter {
+    private values = new Map<string, number>();
+    constructor(
+        private readonly name: string,
+        private readonly maxLabelSets: number
+    ) {}
+    inc(by: number, labels?: MetricLabels) {
+        const k = labelsKey(labels);
+        if (!this.values.has(k) && this.values.size >= this.maxLabelSets)
+            return; // enforce limit silently
+        this.values.set(k, (this.values.get(k) ?? 0) + by);
     }
-    const db = createDb();
-    const jobsRepo = new DrizzleJobsRepo(db);
-    const eventsRepo = new DrizzleJobEventsRepo(db);
-    const storage = (() => {
-        try {
-            return createSupabaseStorageRepo();
-        } catch (e) {
-            log.warn('storage init failed (signing disabled)', {
-                error: String(e),
-            });
-            return null as any;
+    snapshot() {
+        const out: Record<string, number> = {};
+        for (const [lk, v] of this.values) {
+            const labelObj: MetricLabels | undefined =
+                lk === '__no_labels__'
+                    ? undefined
+                    : Object.fromEntries(
+                          lk.split('|').map((kv) => kv.split('='))
+                      );
+            out[keyWithLabels(this.name, labelObj)] = v;
         }
-    })();
-    const apiKeys = new DrizzleApiKeysRepo(db);
-    return { queue, jobsRepo, eventsRepo, storage, apiKeys };
+        return out;
+    }
 }
-const { queue, jobsRepo, eventsRepo, storage, apiKeys } = buildDeps();
 
-function tcToSec(tc: string) {
-    const [hh, mm, rest] = tc.split(':');
-    const [ss, ms] = rest?.split('.') || [rest || '0', undefined];
+class Gauge {
+    private values = new Map<string, number>();
+    constructor(
+        private readonly name: string,
+        private readonly maxLabelSets: number
+    ) {}
+    set(value: number, labels?: MetricLabels) {
+        const k = labelsKey(labels);
+        if (!this.values.has(k) && this.values.size >= this.maxLabelSets)
+            return;
+        this.values.set(k, value);
+    }
+    snapshot() {
+        const out: Record<string, number> = {};
+        for (const [lk, v] of this.values) {
+            const labelObj: MetricLabels | undefined =
+                lk === '__no_labels__'
+                    ? undefined
+                    : Object.fromEntries(
+                          lk.split('|').map((kv) => kv.split('='))
+                      );
+            out[keyWithLabels(this.name, labelObj)] = v;
+        }
+        return out;
+    }
+}
+
+class Histogram {
+    private labelSets = new Map<
+        string,
+        {
+            values: number[]; // retain raw for quantiles (small scale ok)
+            buckets: number[]; // cumulative counts (length = bucketBounds.length + 1)
+        }
+    >();
+    constructor(
+        private readonly name: string,
+        private readonly bounds: number[], // ascending, excludes +Inf
+        private readonly maxLabelSets: number
+    ) {}
+    observe(value: number, labels?: MetricLabels) {
+        const lk = labelsKey(labels);
+        let set = this.labelSets.get(lk);
+        if (!set) {
+            if (this.labelSets.size >= this.maxLabelSets) return; // enforce limit
+            set = {
+                values: [],
+                buckets: new Array(this.bounds.length + 1).fill(0),
+            };
+            this.labelSets.set(lk, set);
+        }
+        set.values.push(value);
+        // find bucket index
+        let idx = this.bounds.findIndex((b) => value <= b);
+        if (idx === -1) idx = this.bounds.length; // +Inf bucket
+        for (let i = idx; i < set.buckets.length; i++) {
+            // cumulative increments from bucket idx to end
+            set.buckets[i] = (set.buckets[i] || 0) + 1;
+        }
+    }
+    snapshot(): Record<string, HistogramSnapshot> {
+        const out: Record<string, HistogramSnapshot> = {};
+        for (const [lk, data] of this.labelSets) {
+            if (!data.values.length) continue;
+            const sorted = [...data.values].sort((a, b) => a - b);
+            const pick = (p: number): number => {
+                if (!sorted.length) return 0;
+                const idx = Math.min(
+                    sorted.length - 1,
+                    Math.max(0, Math.floor((p / 100) * sorted.length))
+                );
+                return sorted[idx] ?? sorted[sorted.length - 1] ?? 0;
+            };
+            const labelObj: MetricLabels | undefined =
+                lk === '__no_labels__'
+                    ? undefined
+                    : Object.fromEntries(
+                          lk.split('|').map((kv) => kv.split('='))
+                      );
+            const buckets = this.bounds.map((b, i) => ({
+                le: b,
+                count: data.buckets[i] || 0,
+            }));
+            buckets.push({
+                le: Infinity,
+                count: data.buckets[data.buckets.length - 1] || 0,
+            });
+            out[keyWithLabels(this.name, labelObj)] = {
+                count: data.values.length,
+                sum: data.values.reduce((a, b) => a + b, 0),
+                min: sorted[0]!,
+                max: sorted[sorted.length - 1]!,
+                p50: pick(50),
+                p90: pick(90),
+                p99: pick(99),
+                buckets,
+            };
+        }
+        return out;
+    }
+}
+
+export class MetricsRegistry {
+    private counters = new Map<string, Counter>();
+    private histograms = new Map<string, Histogram>();
+    private gauges = new Map<string, Gauge>();
+    private maxLabelSetsPerMetric: number;
+    private defaultHistogramBuckets: number[];
+    constructor(opts: RegistryOpts = {}) {
+        this.maxLabelSetsPerMetric = opts.maxLabelSetsPerMetric ?? 50;
+        this.defaultHistogramBuckets = opts.defaultHistogramBuckets ?? [
+            5, 10, 25, 50, 100, 250, 500, 1000,
+        ];
+    }
+    counter(name: string) {
+        let c = this.counters.get(name);
+        if (!c) {
+            c = new Counter(name, this.maxLabelSetsPerMetric);
+            this.counters.set(name, c);
+        }
+        return c;
+    }
+    histogram(name: string, buckets?: number[]) {
+        let h = this.histograms.get(name);
+        if (!h) {
+            h = new Histogram(
+                name,
+                [...(buckets ?? this.defaultHistogramBuckets)].sort(
+                    (a, b) => a - b
+                ),
+                this.maxLabelSetsPerMetric
+            );
+            this.histograms.set(name, h);
+        }
+        return h;
+    }
+    gauge(name: string) {
+        let g = this.gauges.get(name);
+        if (!g) {
+            g = new Gauge(name, this.maxLabelSetsPerMetric);
+            this.gauges.set(name, g);
+        }
+        return g;
+    }
+    // Convenience pass-throughs for legacy style usage
+    inc(name: string, value = 1, labels?: MetricLabels) {
+        this.counter(name).inc(value, labels);
+    }
+    observe(name: string, value: number, labels?: MetricLabels) {
+        this.histogram(name).observe(value, labels);
+    }
+    setGauge(name: string, value: number, labels?: MetricLabels) {
+        this.gauge(name).set(value, labels);
+    }
+    snapshot(): MetricsSnapshot {
+        const counters: Record<string, number> = {};
+        for (const [, c] of this.counters)
+            Object.assign(counters, c.snapshot());
+        const histograms: Record<string, HistogramSnapshot> = {};
+        for (const [, h] of this.histograms)
+            Object.assign(histograms, h.snapshot());
+        const gauges: Record<string, number> = {};
+        for (const [, g] of this.gauges) Object.assign(gauges, g.snapshot());
+        return { counters, histograms, gauges };
+    }
+}
+
+// Backwards-compatible export used across codebase
+export class InMemoryMetrics extends MetricsRegistry {}
+
+export const noopMetrics = new (class extends MetricsRegistry {
+    override inc() {}
+    override observe() {}
+    override setGauge() {}
+    override snapshot(): MetricsSnapshot {
+        return { counters: {}, histograms: {}, gauges: {} };
+    }
+})();
+
+// Lightweight interface type used by higher-level modules to allow dependency injection
+// Accept any implementation that matches the core surface (inc/observe/setGauge/snapshot)
+export type Metrics = {
+    inc(name: string, value?: number, labels?: MetricLabels): void;
+    observe(name: string, value: number, labels?: MetricLabels): void;
+    setGauge(name: string, value: number, labels?: MetricLabels): void;
+    snapshot(): MetricsSnapshot;
+};
+
+// Route normalization helper (/:id placeholder for dynamic segments)
+// Replaces UUID v4 and purely numeric path segments with :id
+export function normalizeRoute(path: string) {
+    const pathname = path.split('?')[0] || '/';
     return (
-        Number(hh) * 3600 +
-        Number(mm) * 60 +
-        Number(ss) +
-        (ms ? Number(`0.${ms}`) : 0)
-    );
-}
-
-// Simple correlation id + uniform error envelope middleware
-interface ApiErrorEnvelope {
-    error: { code: string; message: string; correlationId: string };
-}
-function buildError(
-    set: any,
-    code: number,
-    errCode: string,
-    message: string,
-    correlationId: string
-): ApiErrorEnvelope {
-    set.status = code;
-    return { error: { code: errCode, message, correlationId } };
-}
-
-const ENABLE_API_KEYS =
-    (readEnv('ENABLE_API_KEYS') || 'false').toLowerCase() === 'true';
-const RATE_WINDOW_SEC = Number(readEnv('RATE_LIMIT_WINDOW_SEC') || '60');
-const RATE_MAX = Number(readEnv('RATE_LIMIT_MAX') || '30');
-
-async function resolveApiKey(request: Request) {
-    if (!ENABLE_API_KEYS) return null;
-    const auth = request.headers.get('authorization') || '';
-    let token: string | null = null;
-    if (/^bearer /i.test(auth)) token = auth.slice(7).trim();
-    else token = request.headers.get('x-api-key');
-    if (!token) return null; // absence handled separately (auth required?)
-    const cached = apiKeyCache.get(token);
-    if (cached && cached.expiresAt > Date.now()) return cached.record;
-    const rec = await apiKeys.verify(token);
-    if (rec)
-        apiKeyCache.set(token, {
-            record: rec,
-            expiresAt: Date.now() + API_KEY_CACHE_TTL_MS,
-        });
-    return rec;
-}
-
-function clientIdentity(request: Request, apiKeyId?: string | null): string {
-    if (apiKeyId) return `key:${apiKeyId}`;
-    const xf = request.headers.get('x-forwarded-for');
-    if (xf) return `ip:${xf.split(',')[0]!.trim()}`;
-    const xr = request.headers.get('x-real-ip');
-    if (xr) return `ip:${xr}`;
-    return 'ip:anon';
-}
-
-export const app = new Elysia()
-    .use(cors())
-    .onRequest(({ request, store }) => {
-        const cid = request.headers.get('x-request-id') || crypto.randomUUID();
-        (store as any).correlationId = cid;
-    })
-    .state('correlationId', '')
-    // Attach auth info (if enabled) early
-    .onBeforeHandle(async ({ request, store, set, path }) => {
-        if (!ENABLE_API_KEYS) return; // feature disabled
-        // exempt health & metrics endpoints
-        if (/^\/(healthz|metrics)/.test(path)) return;
-        const rec = await resolveApiKey(request);
-        if (!rec) {
-            set.status = 401;
-            return {
-                error: {
-                    code: 'UNAUTHORIZED',
-                    message: 'API key required or invalid',
-                    correlationId: (store as any).correlationId,
-                },
-            } satisfies ApiErrorEnvelope;
-        }
-        (store as any).apiKeyId = rec.id;
-    })
-    .get('/healthz', async ({ store }) => {
-        const h = await queue.health();
-        return {
-            ok: h.ok,
-            queue: h,
-            correlationId: (store as any).correlationId,
-        };
-    })
-    .get('/metrics/queue', ({ store }) => ({
-        metrics: queue.getMetrics(),
-        correlationId: (store as any).correlationId,
-    }))
-    .get('/metrics', () => {
-        const snap = metrics.snapshot();
-        return snap;
-    })
-    .post('/api/jobs', async ({ body, set, store, request }) => {
-        const correlationId = (store as any).correlationId;
-        // Rate limit (only on creation endpoint)
-        try {
-            const keyId = (store as any).apiKeyId || null;
-            const ident = clientIdentity(request, keyId);
-            const windowMs = RATE_WINDOW_SEC * 1000;
-            if (rateLimitHit(ident, RATE_MAX, windowMs)) {
-                return buildError(
-                    set,
-                    429,
-                    'RATE_LIMITED',
-                    'Rate limit exceeded',
-                    correlationId
-                );
-            }
-        } catch (e) {
-            // Ignore limiter internal errors
-        }
-        try {
-            const parsed = Schemas.CreateJobInput.safeParse(body);
-            if (!parsed.success) {
-                return buildError(
-                    set,
-                    400,
-                    'VALIDATION_FAILED',
-                    parsed.error.message,
-                    correlationId
-                );
-            }
-            const input = parsed.data as CreateJobInputType;
-            const id = crypto.randomUUID();
-            const startSec = tcToSec(input.start);
-            const endSec = tcToSec(input.end);
-            if (
-                endSec - startSec >
-                Number(readIntEnv('MAX_CLIP_SECONDS', 120))
-            ) {
-                return buildError(
-                    set,
-                    400,
-                    'CLIP_TOO_LONG',
-                    'Clip exceeds MAX_CLIP_SECONDS',
-                    correlationId
-                );
-            }
-            const retentionHours = Number(readIntEnv('RETENTION_HOURS', 72));
-            const expiresAt = new Date(Date.now() + retentionHours * 3600_000);
-            const row = await jobsRepo.create({
-                id,
-                status: 'queued',
-                progress: 0,
-                sourceType: input.sourceType,
-                sourceKey: input.uploadKey,
-                sourceUrl: input.youtubeUrl,
-                startSec,
-                endSec,
-                withSubtitles: input.withSubtitles,
-                burnSubtitles: input.burnSubtitles,
-                subtitleLang: input.subtitleLang,
-                resultVideoKey: undefined,
-                resultSrtKey: undefined,
-                errorCode: undefined,
-                errorMessage: undefined,
-                expiresAt: expiresAt.toISOString(),
-            });
-            await eventsRepo.add({
-                jobId: id,
-                ts: new Date().toISOString(),
-                type: 'created',
-            });
-            const publishedAt = Date.now();
-            await queue.publish({ jobId: id, priority: 'normal' });
-            metrics.inc('jobs.created');
-            metrics.observe(
-                'jobs.enqueue_latency_ms',
-                Date.now() - publishedAt
-            );
-            log.info('job enqueued', {
-                jobId: id,
-                correlationId,
-                apiKeyId: (store as any).apiKeyId,
-            });
-            return {
-                correlationId,
-                job: {
-                    id: row.id,
-                    status: row.status,
-                    progress: row.progress,
-                    expiresAt: expiresAt.toISOString(),
-                },
-            };
-        } catch (e) {
-            const err = fromException(e, correlationId);
-            return buildError(
-                set,
-                500,
-                err.error.code,
-                err.error.message,
-                correlationId
-            );
-        }
-    })
-    .get('/api/jobs/:id', async ({ params, set, store }) => {
-        const correlationId = (store as any).correlationId;
-        const { id } = params as any;
-        try {
-            const job = await jobsRepo.get(id);
-            if (!job) {
-                return buildError(
-                    set,
-                    404,
-                    'NOT_FOUND',
-                    'Job not found',
-                    correlationId
-                );
-            }
-            if (job.expiresAt && new Date(job.expiresAt) < new Date()) {
-                return buildError(
-                    set,
-                    410,
-                    'GONE',
-                    'Job expired',
-                    correlationId
-                );
-            }
-            // recent events (last 10)
-            const ev =
-                (await (eventsRepo as any).listRecent?.(job.id, 10)) ||
-                (await (eventsRepo as any).list(job.id, 10, 0));
-            metrics.inc('jobs.status_fetch');
-            return {
-                correlationId,
-                job: {
-                    id: job.id,
-                    status: job.status,
-                    progress: job.progress,
-                    resultVideoKey: job.resultVideoKey ?? undefined,
-                    resultSrtKey: job.resultSrtKey ?? undefined,
-                    expiresAt: job.expiresAt ?? undefined,
-                },
-                events: ev.map((e: any) => ({
-                    ts: e.ts,
-                    type: e.type,
-                    data: e.data,
-                })),
-            };
-        } catch (e) {
-            const err = fromException(e, correlationId);
-            return buildError(
-                set,
-                500,
-                err.error.code,
-                err.error.message,
-                correlationId
-            );
-        }
-    })
-    .get('/api/jobs/:id/result', async ({ params, set, store }) => {
-        const correlationId = (store as any).correlationId;
-        const { id } = params as any;
-        try {
-            const job = await jobsRepo.get(id);
-            if (!job) {
-                return buildError(
-                    set,
-                    404,
-                    'NOT_FOUND',
-                    'Job not found',
-                    correlationId
-                );
-            }
-            if (job.expiresAt && new Date(job.expiresAt) < new Date()) {
-                return buildError(
-                    set,
-                    410,
-                    'GONE',
-                    'Job expired',
-                    correlationId
-                );
-            }
-            if (!job.resultVideoKey || job.status !== 'done') {
-                return buildError(
-                    set,
-                    404,
-                    'NOT_READY',
-                    'Result not available yet',
-                    correlationId
-                );
-            }
-            if (!storage) {
-                return buildError(
-                    set,
-                    500,
-                    'STORAGE_UNAVAILABLE',
-                    'Storage not configured',
-                    correlationId
-                );
-            }
-            const videoUrl = await storage.sign(job.resultVideoKey);
-            let srtUrl: string | undefined;
-            if (job.resultSrtKey) {
-                try {
-                    srtUrl = await storage.sign(job.resultSrtKey);
-                } catch {}
-            }
-            metrics.inc('jobs.result_fetch');
-            return {
-                correlationId,
-                result: {
-                    id: job.id,
-                    video: { key: job.resultVideoKey, url: videoUrl },
-                    srt:
-                        job.resultSrtKey && srtUrl
-                            ? { key: job.resultSrtKey, url: srtUrl }
-                            : undefined,
-                },
-            };
-        } catch (e) {
-            const err = fromException(e, correlationId);
-            return buildError(
-                set,
-                500,
-                err.error.code,
-                err.error.message,
-                correlationId
-            );
-        }
-    });
-
-if (import.meta.main) {
-    const port = Number(readIntEnv('PORT', 3000));
-    const server = Bun.serve({ fetch: app.fetch, port });
-    log.info('API started', { port });
-    const stop = async () => {
-        log.info('API stopping');
-        server.stop(true);
-        await queue.shutdown();
-        process.exit(0);
-    };
-    process.on('SIGINT', stop);
-    process.on('SIGTERM', stop);
-}
-````
-
-## File: src/data/db/repos.ts
-````typescript
-import { desc, eq, and } from 'drizzle-orm';
-import { createDb } from './connection';
-import { jobEvents, jobs, asrJobs, asrArtifacts } from './schema';
-import type { JobStatus } from '@clipper/contracts';
-import { createLogger, noopMetrics, type Metrics } from '../../common/index';
-import type {
-    JobEvent as RepoJobEvent,
-    JobRow,
-    JobEventsRepository,
-    JobsRepository,
-} from '../repo';
-import type {
-    AsrJobRow,
-    AsrArtifactRow,
-    AsrJobsRepository,
-    AsrArtifactsRepository,
-} from '../repo';
-
-export class DrizzleJobsRepo implements JobsRepository {
-    private readonly logger = createLogger('info').with({ comp: 'jobsRepo' });
-    constructor(
-        private readonly db = createDb(),
-        private readonly metrics: Metrics = noopMetrics
-    ) {}
-
-    async create(
-        row: Omit<JobRow, 'createdAt' | 'updatedAt'>
-    ): Promise<JobRow> {
-        const start = Date.now();
-        const [rec] = await this.db
-            .insert(jobs)
-            .values({
-                id: row.id,
-                status: row.status,
-                progress: row.progress,
-                sourceType: row.sourceType,
-                sourceKey: row.sourceKey,
-                sourceUrl: row.sourceUrl,
-                startSec: row.startSec,
-                endSec: row.endSec,
-                withSubtitles: row.withSubtitles,
-                burnSubtitles: row.burnSubtitles,
-                subtitleLang: row.subtitleLang,
-                resultVideoKey: row.resultVideoKey,
-                resultSrtKey: row.resultSrtKey,
-                errorCode: row.errorCode,
-                errorMessage: row.errorMessage,
-                expiresAt: row.expiresAt ? new Date(row.expiresAt) : null,
-            })
-            .returning();
-        const out = toJobRow(rec);
-        this.metrics.observe('repo.op.duration_ms', Date.now() - start, {
-            op: 'jobs.create',
-        });
-        this.logger.info('job created', { jobId: out.id });
-        return out;
-    }
-
-    async get(id: string): Promise<JobRow | null> {
-        const start = Date.now();
-        const [rec] = await this.db
-            .select()
-            .from(jobs)
-            .where(eq(jobs.id, id))
-            .limit(1);
-        const out = rec ? toJobRow(rec) : null;
-        this.metrics.observe('repo.op.duration_ms', Date.now() - start, {
-            op: 'jobs.get',
-        });
-        return out;
-    }
-
-    async update(id: string, patch: Partial<JobRow>): Promise<JobRow> {
-        const start = Date.now();
-        const [rec] = await this.db
-            .update(jobs)
-            .set(toJobsPatch(patch))
-            .where(eq(jobs.id, id))
-            .returning();
-        if (!rec) throw new Error('NOT_FOUND');
-        const row = toJobRow(rec);
-        this.metrics.observe('repo.op.duration_ms', Date.now() - start, {
-            op: 'jobs.update',
-        });
-        this.logger.info('job updated', { jobId: row.id });
-        return row;
-    }
-
-    async listByStatus(
-        status: JobStatus,
-        limit = 50,
-        offset = 0
-    ): Promise<JobRow[]> {
-        const start = Date.now();
-        const rows = await this.db
-            .select()
-            .from(jobs)
-            .where(eq(jobs.status, status))
-            .orderBy(desc(jobs.createdAt))
-            .limit(limit)
-            .offset(offset);
-        const out = rows.map(toJobRow);
-        this.metrics.observe('repo.op.duration_ms', Date.now() - start, {
-            op: 'jobs.listByStatus',
-        });
-        return out;
-    }
-
-    async transition(
-        id: string,
-        next: JobStatus,
-        event?: { type?: string; data?: Record<string, unknown> }
-    ): Promise<JobRow> {
-        const start = Date.now();
-        const res = await this.db.transaction(async (tx) => {
-            const [updated] = await tx
-                .update(jobs)
-                .set({ status: next, updatedAt: new Date() })
-                .where(eq(jobs.id, id))
-                .returning();
-            if (!updated) throw new Error('NOT_FOUND');
-
-            if (event) {
-                await tx.insert(jobEvents).values({
-                    jobId: id,
-                    type: event.type ?? `status:${next}`,
-                    data: event.data ?? null,
-                });
-            }
-            return toJobRow(updated);
-        });
-        this.metrics.observe('repo.op.duration_ms', Date.now() - start, {
-            op: 'jobs.transition',
-        });
-        this.logger.info('job transitioned', { jobId: id, next });
-        return res;
-    }
-}
-
-export class DrizzleJobEventsRepo implements JobEventsRepository {
-    constructor(
-        private readonly db = createDb(),
-        private readonly metrics: Metrics = noopMetrics
-    ) {}
-
-    async add(evt: RepoJobEvent): Promise<void> {
-        const start = Date.now();
-        await this.db.insert(jobEvents).values({
-            jobId: evt.jobId,
-            ts: new Date(evt.ts),
-            type: evt.type,
-            data: evt.data ?? null,
-        });
-        this.metrics.observe('repo.op.duration_ms', Date.now() - start, {
-            op: 'events.add',
-        });
-    }
-
-    async list(
-        jobId: string,
-        limit = 100,
-        offset = 0
-    ): Promise<RepoJobEvent[]> {
-        const start = Date.now();
-        const rows = await this.db
-            .select()
-            .from(jobEvents)
-            .where(eq(jobEvents.jobId, jobId))
-            .orderBy(desc(jobEvents.ts))
-            .limit(limit)
-            .offset(offset);
-        const out = rows.map((r) => ({
-            jobId: r.jobId,
-            ts: r.ts.toISOString(),
-            type: r.type,
-            data: (r.data as Record<string, unknown> | null) ?? undefined,
-        }));
-        this.metrics.observe('repo.op.duration_ms', Date.now() - start, {
-            op: 'events.list',
-        });
-        return out;
-    }
-}
-
-// ASR Repositories
-export class DrizzleAsrJobsRepo implements AsrJobsRepository {
-    private readonly logger = createLogger('info').with({
-        comp: 'asrJobsRepo',
-    });
-    constructor(
-        private readonly db = createDb(),
-        private readonly metrics: Metrics = noopMetrics
-    ) {}
-
-    async create(
-        row: Omit<AsrJobRow, 'createdAt' | 'updatedAt' | 'status'> &
-            Partial<Pick<AsrJobRow, 'status'>>
-    ): Promise<AsrJobRow> {
-        const start = Date.now();
-        const [rec] = await this.db
-            .insert(asrJobs)
-            .values({
-                id: row.id,
-                clipJobId: row.clipJobId,
-                sourceType: row.sourceType,
-                sourceKey: row.sourceKey,
-                mediaHash: row.mediaHash,
-                modelVersion: row.modelVersion,
-                languageHint: row.languageHint,
-                detectedLanguage: row.detectedLanguage,
-                durationSec: row.durationSec,
-                status: row.status ?? 'queued',
-                errorCode: row.errorCode,
-                errorMessage: row.errorMessage,
-                completedAt: row.completedAt ? new Date(row.completedAt) : null,
-                expiresAt: row.expiresAt ? new Date(row.expiresAt) : null,
-            })
-            .returning();
-        const out = toAsrJobRow(rec);
-        this.metrics.observe('repo.op.duration_ms', Date.now() - start, {
-            op: 'asrJobs.create',
-        });
-        this.logger.info('asr job created', { asrJobId: out.id });
-        return out;
-    }
-
-    async get(id: string): Promise<AsrJobRow | null> {
-        const start = Date.now();
-        const [rec] = await this.db
-            .select()
-            .from(asrJobs)
-            .where(eq(asrJobs.id, id))
-            .limit(1);
-        this.metrics.observe('repo.op.duration_ms', Date.now() - start, {
-            op: 'asrJobs.get',
-        });
-        return rec ? toAsrJobRow(rec) : null;
-    }
-
-    async getReusable(
-        mediaHash: string,
-        modelVersion: string
-    ): Promise<(AsrJobRow & { artifacts: AsrArtifactRow[] }) | null> {
-        const start = Date.now();
-        const [rec] = await this.db
-            .select()
-            .from(asrJobs)
-            .where(
-                and(
-                    eq(asrJobs.mediaHash, mediaHash),
-                    eq(asrJobs.modelVersion, modelVersion),
-                    eq(asrJobs.status, 'done')
+        (pathname || '/')
+            .split('/')
+            .map((seg) => {
+                if (!seg) return seg; // preserve leading ''
+                if (/^[0-9]+$/.test(seg)) return ':id';
+                if (
+                    /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$/.test(
+                        seg
+                    )
                 )
-            )
-            .limit(1);
-        if (!rec) return null;
-        const artifacts = await this.db
-            .select()
-            .from(asrArtifacts)
-            .where(eq(asrArtifacts.asrJobId, rec.id));
-        this.metrics.observe('repo.op.duration_ms', Date.now() - start, {
-            op: 'asrJobs.getReusable',
-        });
-        return {
-            ...toAsrJobRow(rec),
-            artifacts: artifacts.map(toAsrArtifactRow),
-        };
-    }
-
-    async patch(id: string, patch: Partial<AsrJobRow>): Promise<AsrJobRow> {
-        const start = Date.now();
-        const [rec] = await this.db
-            .update(asrJobs)
-            .set(toAsrJobsPatch(patch))
-            .where(eq(asrJobs.id, id))
-            .returning();
-        if (!rec) throw new Error('NOT_FOUND');
-        const row = toAsrJobRow(rec);
-        this.metrics.observe('repo.op.duration_ms', Date.now() - start, {
-            op: 'asrJobs.patch',
-        });
-        this.logger.info('asr job patched', { asrJobId: row.id });
-        return row;
-    }
-}
-
-export class DrizzleAsrArtifactsRepo implements AsrArtifactsRepository {
-    constructor(
-        private readonly db = createDb(),
-        private readonly metrics: Metrics = noopMetrics
-    ) {}
-
-    async put(artifact: AsrArtifactRow): Promise<void> {
-        const start = Date.now();
-        await this.db
-            .insert(asrArtifacts)
-            .values({
-                asrJobId: artifact.asrJobId,
-                kind: artifact.kind,
-                storageKey: artifact.storageKey,
-                sizeBytes: artifact.sizeBytes,
+                    return ':id';
+                return seg;
             })
-            .onConflictDoUpdate({
-                target: [asrArtifacts.asrJobId, asrArtifacts.kind],
-                set: {
-                    storageKey: artifact.storageKey,
-                    sizeBytes: artifact.sizeBytes,
-                },
-            });
-        this.metrics.observe('repo.op.duration_ms', Date.now() - start, {
-            op: 'asrArtifacts.put',
-        });
-    }
-
-    async list(asrJobId: string): Promise<AsrArtifactRow[]> {
-        const start = Date.now();
-        const rows = await this.db
-            .select()
-            .from(asrArtifacts)
-            .where(eq(asrArtifacts.asrJobId, asrJobId));
-        this.metrics.observe('repo.op.duration_ms', Date.now() - start, {
-            op: 'asrArtifacts.list',
-        });
-        return rows.map(toAsrArtifactRow);
-    }
-}
-
-function toJobRow(j: any): JobRow {
-    return {
-        id: j.id,
-        status: j.status,
-        progress: j.progress,
-        sourceType: j.sourceType,
-        sourceKey: j.sourceKey ?? undefined,
-        sourceUrl: j.sourceUrl ?? undefined,
-        startSec: j.startSec,
-        endSec: j.endSec,
-        withSubtitles: j.withSubtitles,
-        burnSubtitles: j.burnSubtitles,
-        subtitleLang: j.subtitleLang ?? undefined,
-        resultVideoKey: j.resultVideoKey ?? undefined,
-        resultSrtKey: j.resultSrtKey ?? undefined,
-        errorCode: j.errorCode ?? undefined,
-        errorMessage: j.errorMessage ?? undefined,
-        createdAt: j.createdAt.toISOString(),
-        updatedAt: j.updatedAt.toISOString(),
-        expiresAt: j.expiresAt ? j.expiresAt.toISOString() : undefined,
-        lastHeartbeatAt: j.lastHeartbeatAt
-            ? j.lastHeartbeatAt.toISOString()
-            : undefined,
-    };
-}
-
-function toJobsPatch(patch: Partial<JobRow>) {
-    const out: any = { updatedAt: new Date() };
-    for (const [k, v] of Object.entries(patch)) {
-        if (v === undefined) continue;
-        if (k === 'expiresAt' && v) out[k] = new Date(v as string);
-        else if (k === 'lastHeartbeatAt' && v) out[k] = new Date(v as string);
-        else out[k] = v as any;
-    }
-    return out;
-}
-
-function toAsrJobRow(j: any): AsrJobRow {
-    return {
-        id: j.id,
-        clipJobId: j.clipJobId ?? undefined,
-        sourceType: j.sourceType,
-        sourceKey: j.sourceKey ?? undefined,
-        mediaHash: j.mediaHash,
-        modelVersion: j.modelVersion,
-        languageHint: j.languageHint ?? undefined,
-        detectedLanguage: j.detectedLanguage ?? undefined,
-        durationSec: j.durationSec ?? undefined,
-        status: j.status,
-        errorCode: j.errorCode ?? undefined,
-        errorMessage: j.errorMessage ?? undefined,
-        createdAt: j.createdAt.toISOString(),
-        updatedAt: j.updatedAt.toISOString(),
-        completedAt: j.completedAt ? j.completedAt.toISOString() : undefined,
-        expiresAt: j.expiresAt ? j.expiresAt.toISOString() : undefined,
-    };
-}
-
-function toAsrJobsPatch(patch: Partial<AsrJobRow>) {
-    const out: any = { updatedAt: new Date() };
-    for (const [k, v] of Object.entries(patch)) {
-        if (v === undefined) continue;
-        if (k.endsWith('At') && v) out[k] = new Date(v as string);
-        else out[k] = v as any;
-    }
-    return out;
-}
-
-function toAsrArtifactRow(a: any): AsrArtifactRow {
-    return {
-        asrJobId: a.asrJobId,
-        kind: a.kind,
-        storageKey: a.storageKey,
-        sizeBytes: a.sizeBytes ?? undefined,
-        createdAt: a.createdAt.toISOString(),
-    };
+            .join('/') || '/'
+    );
 }
 ````
 
@@ -7915,6 +8593,285 @@ function guessContentType(key: string): string {
 }
 ````
 
+## File: src/worker/asr.ts
+````typescript
+import {
+    DrizzleAsrJobsRepo,
+    DrizzleJobsRepo,
+    DrizzleAsrArtifactsRepo,
+    createDb,
+    storageKeys,
+    createSupabaseStorageRepo,
+} from '@clipper/data';
+import {
+    buildArtifacts,
+    GroqWhisperProvider,
+    ProviderHttpError,
+} from '@clipper/asr';
+import { InMemoryMetrics } from '@clipper/common/metrics';
+import { QUEUE_TOPIC_ASR } from '@clipper/queue';
+import {
+    AsrQueuePayloadSchema,
+    type AsrQueuePayload,
+} from '@clipper/queue/asr';
+import {
+    createLogger,
+    readEnv,
+    fromException,
+    withExternal,
+} from '@clipper/common';
+
+export interface AsrWorkerDeps {
+    asrJobs?: DrizzleAsrJobsRepo;
+    clipJobs?: DrizzleJobsRepo;
+    artifacts?: DrizzleAsrArtifactsRepo;
+    provider?: GroqWhisperProvider;
+    storage?: ReturnType<typeof createSupabaseStorageRepo>;
+    queue: {
+        consumeFrom: (
+            topic: string,
+            handler: (msg: any) => Promise<void>
+        ) => Promise<void>;
+    };
+}
+
+const log = createLogger((readEnv('LOG_LEVEL') as any) || 'info').with({
+    mod: 'asrWorker',
+});
+
+export async function startAsrWorker(deps: AsrWorkerDeps) {
+    const metrics = new InMemoryMetrics();
+    const asrJobs = deps?.asrJobs ?? new DrizzleAsrJobsRepo(createDb());
+    const clipJobs = deps?.clipJobs ?? new DrizzleJobsRepo(createDb());
+    const artifacts =
+        deps?.artifacts ?? new DrizzleAsrArtifactsRepo(createDb());
+    const storage =
+        deps?.storage ??
+        (() => {
+            try {
+                return createSupabaseStorageRepo();
+            } catch {
+                return null as any;
+            }
+        })();
+    const provider = deps?.provider ?? new GroqWhisperProvider();
+
+    const timeoutMs = Number(readEnv('ASR_REQUEST_TIMEOUT_MS') || 120_000);
+    const includeJson =
+        (readEnv('ASR_JSON_SEGMENTS') || 'false').toLowerCase() === 'true';
+    const mergeGapMs = Number(readEnv('MERGE_GAP_MS') || 150);
+
+    await deps.queue.consumeFrom(QUEUE_TOPIC_ASR, async (msg: any) => {
+        const parse = AsrQueuePayloadSchema.safeParse(msg as AsrQueuePayload);
+        if (!parse.success) {
+            log.warn('invalid asr payload', { issues: parse.error.issues });
+            return; // drop invalid messages
+        }
+        const { asrJobId, clipJobId, languageHint } = parse.data;
+        const startedAt = Date.now();
+        let tmpLocal: string | null = null;
+        try {
+            // Load and claim job
+            const job = await asrJobs.get(asrJobId);
+            if (!job) {
+                log.warn('asr job not found', { asrJobId });
+                return;
+            }
+            if (job.status === 'done') return; // idempotent
+            if (job.status === 'queued') {
+                await asrJobs.patch(asrJobId, { status: 'processing' });
+            }
+
+            // Locate media: prefer clip resultVideoKey
+            let inputLocal: string;
+            if (clipJobId) {
+                const clip = await clipJobs.get(clipJobId);
+                if (!clip?.resultVideoKey) throw new Error('NO_CLIP_RESULT');
+                if (!storage) throw new Error('STORAGE_NOT_AVAILABLE');
+                inputLocal = await storage.download(clip.resultVideoKey);
+                tmpLocal = inputLocal;
+            } else {
+                throw new Error('NO_INPUT_PROVIDED');
+            }
+
+            // Transcribe
+            const res = await withExternal(
+                metrics as any,
+                {
+                    dep: 'asr',
+                    op: 'transcribe',
+                    timeoutMs,
+                    classifyError: (e) => {
+                        const msg = String(e?.message || e);
+                        if (msg === 'TIMEOUT' || /abort/i.test(msg))
+                            return 'timeout';
+                        if (msg === 'VALIDATION_FAILED') return 'validation';
+                        if (msg === 'UPSTREAM_FAILURE') return 'upstream';
+                        if (e instanceof ProviderHttpError) {
+                            if (e.status === 400) return 'validation';
+                            if (e.status === 0) return 'network';
+                            if (e.status >= 500) return 'upstream';
+                        }
+                        return undefined;
+                    },
+                },
+                async (signal) => {
+                    try {
+                        return await provider.transcribe(inputLocal, {
+                            timeoutMs,
+                            languageHint,
+                            signal,
+                        });
+                    } catch (err: any) {
+                        if (err?.name === 'AbortError')
+                            throw new Error('TIMEOUT');
+                        if (err instanceof ProviderHttpError) {
+                            if (err.status === 0)
+                                throw new Error('UPSTREAM_FAILURE');
+                            if (err.status >= 500)
+                                throw new Error('UPSTREAM_FAILURE');
+                            if (err.status === 400)
+                                throw new Error('VALIDATION_FAILED');
+                            throw new Error('UPSTREAM_FAILURE');
+                        }
+                        throw err;
+                    }
+                }
+            );
+
+            // Build artifacts
+            const built = buildArtifacts(res.segments, {
+                includeJson,
+                mergeGapMs,
+            });
+
+            // Upload artifacts
+            if (!storage) throw new Error('STORAGE_NOT_AVAILABLE');
+            const owner = clipJobId ?? asrJobId;
+            const srtKey = storageKeys.transcriptSrt(owner);
+            const txtKey = storageKeys.transcriptText(owner);
+            const jsonKey = includeJson
+                ? storageKeys.transcriptJson(owner)
+                : null;
+            const srtPath = `/tmp/${owner}.srt`;
+            const txtPath = `/tmp/${owner}.txt`;
+            await Bun.write(srtPath, built.srt);
+            await Bun.write(txtPath, built.text);
+            await storage.upload(srtPath, srtKey, 'application/x-subrip');
+            await storage.upload(txtPath, txtKey, 'text/plain; charset=utf-8');
+            if (includeJson && jsonKey) {
+                const jsonPath = `/tmp/${owner}.json`;
+                await Bun.write(
+                    jsonPath,
+                    JSON.stringify(built.json || [], null, 0)
+                );
+                await storage.upload(jsonPath, jsonKey, 'application/json');
+            }
+
+            // Persist artifacts
+            await artifacts.put({
+                asrJobId,
+                kind: 'srt',
+                storageKey: srtKey,
+                createdAt: new Date().toISOString(),
+            });
+            await artifacts.put({
+                asrJobId,
+                kind: 'text',
+                storageKey: txtKey,
+                createdAt: new Date().toISOString(),
+            });
+            if (includeJson && jsonKey)
+                await artifacts.put({
+                    asrJobId,
+                    kind: 'json',
+                    storageKey: jsonKey,
+                    createdAt: new Date().toISOString(),
+                });
+
+            // Finalize job
+            await asrJobs.patch(asrJobId, {
+                status: 'done',
+                detectedLanguage: res.detectedLanguage,
+                durationSec: Math.round(res.durationSec),
+                completedAt: new Date().toISOString(),
+            });
+            metrics.observe('asr.duration_ms', Date.now() - startedAt);
+            metrics.inc('asr.completed');
+
+            // Update originating clip job with transcript key if available
+            if (clipJobId) {
+                try {
+                    await clipJobs.update(clipJobId, {
+                        resultSrtKey: srtKey,
+                    } as any);
+                } catch {}
+            }
+
+            // Burn-in subtitles if the originating clip requested it
+            if (clipJobId && includeJson) {
+                try {
+                    const clip = await clipJobs.get(clipJobId);
+                    if (clip?.burnSubtitles && clip?.resultVideoKey) {
+                        const burnedKey =
+                            storageKeys.resultVideoBurned(clipJobId);
+                        const clipLocal = await storage.download(
+                            clip.resultVideoKey
+                        );
+                        const srtLocal = await storage.download(srtKey);
+                        // Simple ffmpeg burn-in (assumes ffmpeg installed in env)
+                        const burnedPath = `/tmp/${clipJobId}.subbed.mp4`;
+                        const ff = Bun.spawn([
+                            'ffmpeg',
+                            '-y',
+                            '-i',
+                            clipLocal,
+                            '-vf',
+                            `subtitles=${srtLocal}:force_style='Fontsize=18'`,
+                            '-c:a',
+                            'copy',
+                            burnedPath,
+                        ]);
+                        await ff.exited;
+                        await storage.upload(
+                            burnedPath,
+                            burnedKey,
+                            'video/mp4'
+                        );
+                        await clipJobs.update(clipJobId, {
+                            resultVideoKey: burnedKey,
+                        } as any);
+                    }
+                } catch (e) {
+                    log.warn('burn-in failed (non-fatal)', {
+                        asrJobId,
+                        e: String(e),
+                    });
+                }
+            }
+        } catch (e) {
+            const err = fromException(e, asrJobId);
+            log.error('asr job failed', { asrJobId, err });
+            metrics.inc('asr.failures');
+            try {
+                await asrJobs.patch(asrJobId, {
+                    status: 'failed',
+                    errorCode:
+                        (err.error && (err.error as any).code) || 'INTERNAL',
+                    errorMessage:
+                        (err.error && (err.error as any).message) || String(e),
+                });
+            } catch {}
+            throw e; // let PgBoss retry
+        } finally {
+            try {
+                if (tmpLocal) await Bun.spawn(['rm', '-f', tmpLocal]).exited;
+            } catch {}
+        }
+    });
+}
+````
+
 ## File: package.json
 ````json
 {
@@ -7949,6 +8906,309 @@ function guessContentType(key: string): string {
         "zod": "^4.0.17",
         "zod-to-openapi": "^0.2.1"
     }
+}
+````
+
+## File: src/data/media-io-youtube.ts
+````typescript
+// Clean YouTube resolver (yt-dlp) with SSRF protections, binary fallback & debug logging
+import {
+    readEnv,
+    readIntEnv,
+    createLogger,
+    noopMetrics,
+    type Metrics,
+    withExternal,
+} from '../common/index';
+import type { ResolveResult as SharedResolveResult } from './media-io';
+import { readdir } from 'node:fs/promises';
+import { lookup } from 'node:dns/promises';
+
+export type ResolveJob = {
+    id: string;
+    sourceType: 'youtube';
+    sourceUrl: string;
+};
+export type FfprobeMeta = {
+    durationSec: number;
+    sizeBytes: number;
+    container?: string;
+};
+export type YouTubeResolveResult = SharedResolveResult;
+
+function isPrivateIPv4(ip: string): boolean {
+    if (!/^[0-9.]+$/.test(ip)) return false;
+    const parts = ip.split('.').map(Number);
+    if (parts.length !== 4) return false;
+    const a = parts[0];
+    const b = parts[1];
+    return !!(
+        a === 10 ||
+        (a === 172 && b !== undefined && b >= 16 && b <= 31) ||
+        (a === 192 && b === 168) ||
+        a === 127 ||
+        (a === 169 && b === 254) ||
+        a === 0
+    );
+}
+function isPrivateIPv6(ip: string): boolean {
+    const v = ip.toLowerCase();
+    return (
+        v === '::1' ||
+        v.startsWith('fc') ||
+        v.startsWith('fd') ||
+        v.startsWith('fe80:') ||
+        v === '::' ||
+        v === '::0'
+    );
+}
+
+async function assertSafeUrl(raw: string) {
+    let u: URL;
+    try {
+        u = new URL(raw);
+    } catch {
+        throw new Error('SSRF_BLOCKED');
+    }
+    if (!/^https?:$/.test(u.protocol)) throw new Error('SSRF_BLOCKED');
+    const allow = (readEnv('ALLOWLIST_HOSTS') || '')
+        .split(',')
+        .map((s) => s.trim().toLowerCase())
+        .filter(Boolean);
+    if (allow.length) {
+        const host = u.hostname.toLowerCase();
+        if (!allow.some((h) => host === h || host.endsWith(`.${h}`)))
+            throw new Error('SSRF_BLOCKED');
+    }
+    try {
+        const res = await lookup(u.hostname, { all: true });
+        for (const { address, family } of res) {
+            if (
+                (family === 4 && isPrivateIPv4(address)) ||
+                (family === 6 && isPrivateIPv6(address))
+            )
+                throw new Error('SSRF_BLOCKED');
+        }
+    } catch {
+        throw new Error('SSRF_BLOCKED');
+    }
+}
+
+async function ffprobe(
+    localPath: string,
+    metrics: Metrics
+): Promise<FfprobeMeta> {
+    return withExternal(
+        metrics as any,
+        { dep: 'ffprobe', op: 'probe' },
+        async () => {
+            const args = [
+                '-v',
+                'error',
+                '-print_format',
+                'json',
+                '-show_format',
+                '-show_streams',
+                localPath,
+            ];
+            const proc = Bun.spawn(['ffprobe', ...args], {
+                stdout: 'pipe',
+                stderr: 'pipe',
+            });
+            const stdout = await new Response(proc.stdout).text();
+            if ((await proc.exited) !== 0) throw new Error('FFPROBE_FAILED');
+            const json = JSON.parse(stdout);
+            const durationSec = json?.format?.duration
+                ? Number(json.format.duration)
+                : 0;
+            const sizeBytes = json?.format?.size
+                ? Number(json.format.size)
+                : Bun.file(localPath).size;
+            const container = json?.format?.format_name as string | undefined;
+            return { durationSec, sizeBytes, container };
+        }
+    );
+}
+
+async function findDownloadedFile(dir: string): Promise<string | null> {
+    const files = await readdir(dir).catch(() => []);
+    const candidates = files.filter((f) => f.startsWith('source.'));
+    if (!candidates.length) return null;
+    const mp4 = candidates.find((f) => f.endsWith('.mp4'));
+    return `${dir}/${mp4 ?? candidates[0]}`;
+}
+
+export async function resolveYouTubeSource(
+    job: ResolveJob,
+    deps: { metrics?: Metrics } = {}
+): Promise<YouTubeResolveResult> {
+    const logger = createLogger((readEnv('LOG_LEVEL') as any) || 'info').with({
+        comp: 'mediaio',
+        jobId: job.id,
+    });
+    const metrics = deps.metrics ?? noopMetrics;
+    const SCRATCH = readEnv('SCRATCH_DIR') || '/tmp/ytc';
+    const MAX_MB = readIntEnv('MAX_INPUT_MB', 1024)!;
+    const MAX_DUR = readIntEnv('MAX_CLIP_INPUT_DURATION_SEC', 7200)!;
+    const ENABLE = (readEnv('ENABLE_YTDLP') || 'false') === 'true';
+    const DEBUG = (readEnv('YTDLP_DEBUG') || 'false').toLowerCase() === 'true';
+    const BIN_OVERRIDE = readEnv('YTDLP_BIN');
+
+    logger.info('resolving youtube to local path');
+    if (!ENABLE) throw new Error('YTDLP_DISABLED');
+    await assertSafeUrl(job.sourceUrl);
+
+    const baseDir = `${SCRATCH.replace(/\/$/, '')}/sources/${job.id}`;
+    await Bun.spawn(['mkdir', '-p', baseDir]).exited;
+    const outTemplate = `${baseDir}/source.%(ext)s`;
+    const format = readEnv('YTDLP_FORMAT') || 'bv*+ba/b';
+    const ytdlpArgs = [
+        '-f',
+        format,
+        '-o',
+        outTemplate,
+        '--quiet',
+        '--no-progress',
+        '--no-cache-dir',
+        '--no-part',
+        '--retries',
+        '3',
+        '--merge-output-format',
+        'mp4',
+    ];
+    if (MAX_MB > 0) ytdlpArgs.push('--max-filesize', `${MAX_MB}m`);
+    const sections = readEnv('YTDLP_SECTIONS');
+    if (sections) {
+        // Expect comma-separated list like "*00:01:00-00:02:00,*00:10:00-00:10:30"
+        for (const sec of sections
+            .split(',')
+            .map((s) => s.trim())
+            .filter(Boolean)) {
+            ytdlpArgs.push('--download-sections', sec);
+        }
+    }
+    ytdlpArgs.push(job.sourceUrl);
+
+    const candidates = Array.from(
+        new Set([
+            BIN_OVERRIDE || 'yt-dlp',
+            '/opt/homebrew/bin/yt-dlp',
+            '/usr/local/bin/yt-dlp',
+            '/usr/bin/yt-dlp',
+        ])
+    );
+    let bin: string | undefined;
+    for (const b of candidates) {
+        try {
+            const t = Bun.spawn([b, '--version'], {
+                stdout: 'ignore',
+                stderr: 'ignore',
+            });
+            if ((await t.exited) === 0) {
+                bin = b;
+                break;
+            }
+        } catch {}
+    }
+    if (!bin) throw new Error('YTDLP_NOT_FOUND');
+    if (DEBUG)
+        logger.info('yt-dlp starting', { bin, args: ytdlpArgs.join(' ') });
+
+    const timeoutMs = Math.min(MAX_DUR * 1000, 15 * 60 * 1000);
+    const dlStart = Date.now();
+    let stderrText = '';
+    let stdoutText = '';
+    await withExternal(
+        metrics as any,
+        {
+            dep: 'yt_dlp',
+            op: 'download',
+            timeoutMs,
+            classifyError: (e) => {
+                const msg = String(e?.message || e);
+                if (msg === 'YTDLP_TIMEOUT') return 'timeout';
+                if (msg.startsWith('YTDLP_FAILED:')) {
+                    const code = msg.split(':')[1] || '1';
+                    return `exit_${code}`;
+                }
+                if (msg === 'YTDLP_NOT_FOUND') return 'not_found';
+                if (msg === 'YTDLP_DISABLED') return 'disabled';
+                return undefined;
+            },
+        },
+        async (signal) => {
+            let timedOut = false;
+            const proc = Bun.spawn([bin!, ...ytdlpArgs], {
+                stdout: 'pipe',
+                stderr: 'pipe',
+                env: { PATH: (process as any).env?.PATH || '' },
+            });
+            const onAbort = () => {
+                try {
+                    proc.kill('SIGKILL');
+                    timedOut = true;
+                } catch {}
+            };
+            signal.addEventListener('abort', onAbort, { once: true });
+            const stderrP = new Response(proc.stderr).text();
+            const stdoutP = new Response(proc.stdout).text();
+            const exitCode = await proc.exited;
+            stderrText = await stderrP.catch(() => '');
+            stdoutText = await stdoutP.catch(() => '');
+            signal.removeEventListener('abort', onAbort);
+            if (timedOut) {
+                await Bun.spawn(['rm', '-rf', baseDir]).exited;
+                throw new Error('YTDLP_TIMEOUT');
+            }
+            if (exitCode !== 0) {
+                if (DEBUG)
+                    logger.error('yt-dlp failed', {
+                        exitCode,
+                        stderr: stderrText.slice(0, 800),
+                    });
+                await Bun.spawn(['rm', '-rf', baseDir]).exited;
+                throw new Error(`YTDLP_FAILED:${exitCode}`);
+            }
+            if (DEBUG)
+                logger.info('yt-dlp succeeded', {
+                    exitCode,
+                    stderrPreview: stderrText.slice(0, 200),
+                    stdoutPreview: stdoutText.slice(0, 200),
+                });
+            return null;
+        }
+    );
+    metrics.observe('mediaio.ytdlp.duration_ms', Date.now() - dlStart, {
+        jobId: job.id,
+    });
+
+    const localPath = await findDownloadedFile(baseDir);
+    if (!localPath) {
+        await Bun.spawn(['rm', '-rf', baseDir]).exited;
+        throw new Error('YTDLP_FAILED');
+    }
+
+    const ffStart = Date.now();
+    const meta = await ffprobe(localPath, metrics);
+    metrics.observe('mediaio.ffprobe.duration_ms', Date.now() - ffStart, {
+        jobId: job.id,
+    });
+    if (meta.durationSec > MAX_DUR || meta.sizeBytes > MAX_MB * 1024 * 1024) {
+        await Bun.spawn(['rm', '-rf', baseDir]).exited;
+        throw new Error('INPUT_TOO_LARGE');
+    }
+
+    const cleanup = async () => {
+        await Bun.spawn(['rm', '-rf', baseDir]).exited;
+    };
+    metrics.observe('mediaio.resolve.duration_ms', Date.now() - dlStart, {
+        jobId: job.id,
+    });
+    logger.info('youtube resolved', {
+        durationSec: meta.durationSec,
+        sizeBytes: meta.sizeBytes,
+    });
+    return { localPath, cleanup, meta };
 }
 ````
 
@@ -8022,6 +9282,1126 @@ Only incomplete planned items from layers doc; excludes new/optional stretch fea
 Execution guidance: Finish 1–4 first, ship; then implement 5 with feature flag, immediately add 6 & 7, follow with 8–10.
 ````
 
+## File: src/data/db/repos.ts
+````typescript
+import { desc, eq, and } from 'drizzle-orm';
+import { createDb } from './connection';
+import { jobEvents, jobs, asrJobs, asrArtifacts } from './schema';
+import type { JobStatus } from '@clipper/contracts';
+import { createLogger, noopMetrics, MetricsRegistry } from '../../common/index';
+import type {
+    JobEvent as RepoJobEvent,
+    JobRow,
+    JobEventsRepository,
+    JobsRepository,
+} from '../repo';
+import type {
+    AsrJobRow,
+    AsrArtifactRow,
+    AsrJobsRepository,
+    AsrArtifactsRepository,
+} from '../repo';
+
+export class DrizzleJobsRepo implements JobsRepository {
+    private readonly logger = createLogger('info').with({ comp: 'jobsRepo' });
+    constructor(
+        private readonly db = createDb(),
+        private readonly metrics: MetricsRegistry = noopMetrics
+    ) {}
+
+    async create(
+        row: Omit<JobRow, 'createdAt' | 'updatedAt'>
+    ): Promise<JobRow> {
+        const start = Date.now();
+        const [rec] = await this.db
+            .insert(jobs)
+            .values({
+                id: row.id,
+                status: row.status,
+                progress: row.progress,
+                sourceType: row.sourceType,
+                sourceKey: row.sourceKey,
+                sourceUrl: row.sourceUrl,
+                startSec: row.startSec,
+                endSec: row.endSec,
+                withSubtitles: row.withSubtitles,
+                burnSubtitles: row.burnSubtitles,
+                subtitleLang: row.subtitleLang,
+                resultVideoKey: row.resultVideoKey,
+                resultSrtKey: row.resultSrtKey,
+                errorCode: row.errorCode,
+                errorMessage: row.errorMessage,
+                expiresAt: row.expiresAt ? new Date(row.expiresAt) : null,
+            })
+            .returning();
+        const out = toJobRow(rec);
+        this.metrics.observe('repo.op.duration_ms', Date.now() - start, {
+            op: 'jobs.create',
+        });
+        // Job lifecycle metric (Req 3.1)
+        try {
+            (this.metrics as any).inc?.('jobs.created_total');
+        } catch {}
+        this.logger.info('job created', { jobId: out.id });
+        return out;
+    }
+
+    async get(id: string): Promise<JobRow | null> {
+        const start = Date.now();
+        const [rec] = await this.db
+            .select()
+            .from(jobs)
+            .where(eq(jobs.id, id))
+            .limit(1);
+        const out = rec ? toJobRow(rec) : null;
+        this.metrics.observe('repo.op.duration_ms', Date.now() - start, {
+            op: 'jobs.get',
+        });
+        return out;
+    }
+
+    async update(id: string, patch: Partial<JobRow>): Promise<JobRow> {
+        const start = Date.now();
+        // Fetch current status for transition metric & latency
+        let current: any = null;
+        try {
+            const [cur] = await this.db
+                .select({
+                    id: jobs.id,
+                    status: jobs.status,
+                    createdAt: jobs.createdAt,
+                })
+                .from(jobs)
+                .where(eq(jobs.id, id))
+                .limit(1);
+            current = cur;
+        } catch {}
+        const [rec] = await this.db
+            .update(jobs)
+            .set(toJobsPatch(patch))
+            .where(eq(jobs.id, id))
+            .returning();
+        if (!rec) throw new Error('NOT_FOUND');
+        const row = toJobRow(rec);
+        this.metrics.observe('repo.op.duration_ms', Date.now() - start, {
+            op: 'jobs.update',
+        });
+        // Status transition metric (Req 3.2)
+        try {
+            if (current && patch.status && patch.status !== current.status) {
+                (this.metrics as any).inc?.('jobs.status_transition_total', 1, {
+                    from: current.status,
+                    to: patch.status,
+                });
+                // Total latency on terminal states (Req 3.3)
+                if (
+                    (patch.status === 'done' || patch.status === 'failed') &&
+                    current.createdAt
+                ) {
+                    const createdAt = new Date(
+                        current.createdAt as any
+                    ).getTime();
+                    const latency = Date.now() - createdAt;
+                    (this.metrics as any).observe?.(
+                        'jobs.total_latency_ms',
+                        latency
+                    );
+                }
+            }
+        } catch {}
+        this.logger.info('job updated', { jobId: row.id });
+        return row;
+    }
+
+    async listByStatus(
+        status: JobStatus,
+        limit = 50,
+        offset = 0
+    ): Promise<JobRow[]> {
+        const start = Date.now();
+        const rows = await this.db
+            .select()
+            .from(jobs)
+            .where(eq(jobs.status, status))
+            .orderBy(desc(jobs.createdAt))
+            .limit(limit)
+            .offset(offset);
+        const out = rows.map(toJobRow);
+        this.metrics.observe('repo.op.duration_ms', Date.now() - start, {
+            op: 'jobs.listByStatus',
+        });
+        return out;
+    }
+
+    async transition(
+        id: string,
+        next: JobStatus,
+        event?: { type?: string; data?: Record<string, unknown> }
+    ): Promise<JobRow> {
+        const start = Date.now();
+        const res = await this.db.transaction(async (tx) => {
+            const [updated] = await tx
+                .update(jobs)
+                .set({ status: next, updatedAt: new Date() })
+                .where(eq(jobs.id, id))
+                .returning();
+            if (!updated) throw new Error('NOT_FOUND');
+
+            if (event) {
+                await tx.insert(jobEvents).values({
+                    jobId: id,
+                    type: event.type ?? `status:${next}`,
+                    data: event.data ?? null,
+                });
+            }
+            return toJobRow(updated);
+        });
+        this.metrics.observe('repo.op.duration_ms', Date.now() - start, {
+            op: 'jobs.transition',
+        });
+        this.logger.info('job transitioned', { jobId: id, next });
+        return res;
+    }
+}
+
+export class DrizzleJobEventsRepo implements JobEventsRepository {
+    constructor(
+        private readonly db = createDb(),
+        private readonly metrics: MetricsRegistry = noopMetrics
+    ) {}
+
+    async add(evt: RepoJobEvent): Promise<void> {
+        const start = Date.now();
+        try {
+            await this.db.insert(jobEvents).values({
+                jobId: evt.jobId,
+                ts: new Date(evt.ts),
+                type: evt.type,
+                data: evt.data ?? null,
+            });
+        } catch (e) {
+            // Increment persistence failure metric (Req 8.1)
+            try {
+                (this.metrics as any).inc?.('events.persist_failures_total');
+            } catch {}
+            throw e;
+        } finally {
+            this.metrics.observe('repo.op.duration_ms', Date.now() - start, {
+                op: 'events.add',
+            });
+        }
+    }
+
+    async list(
+        jobId: string,
+        limit = 100,
+        offset = 0
+    ): Promise<RepoJobEvent[]> {
+        const start = Date.now();
+        const rows = await this.db
+            .select()
+            .from(jobEvents)
+            .where(eq(jobEvents.jobId, jobId))
+            .orderBy(desc(jobEvents.ts))
+            .limit(limit)
+            .offset(offset);
+        const out = rows.map((r) => ({
+            jobId: r.jobId,
+            ts: r.ts.toISOString(),
+            type: r.type,
+            data: (r.data as Record<string, unknown> | null) ?? undefined,
+        }));
+        this.metrics.observe('repo.op.duration_ms', Date.now() - start, {
+            op: 'events.list',
+        });
+        return out;
+    }
+}
+
+// ASR Repositories
+export class DrizzleAsrJobsRepo implements AsrJobsRepository {
+    private readonly logger = createLogger('info').with({
+        comp: 'asrJobsRepo',
+    });
+    constructor(
+        private readonly db = createDb(),
+        private readonly metrics: MetricsRegistry = noopMetrics
+    ) {}
+
+    async create(
+        row: Omit<AsrJobRow, 'createdAt' | 'updatedAt' | 'status'> &
+            Partial<Pick<AsrJobRow, 'status'>>
+    ): Promise<AsrJobRow> {
+        const start = Date.now();
+        const [rec] = await this.db
+            .insert(asrJobs)
+            .values({
+                id: row.id,
+                clipJobId: row.clipJobId,
+                sourceType: row.sourceType,
+                sourceKey: row.sourceKey,
+                mediaHash: row.mediaHash,
+                modelVersion: row.modelVersion,
+                languageHint: row.languageHint,
+                detectedLanguage: row.detectedLanguage,
+                durationSec: row.durationSec,
+                status: row.status ?? 'queued',
+                errorCode: row.errorCode,
+                errorMessage: row.errorMessage,
+                completedAt: row.completedAt ? new Date(row.completedAt) : null,
+                expiresAt: row.expiresAt ? new Date(row.expiresAt) : null,
+            })
+            .returning();
+        const out = toAsrJobRow(rec);
+        this.metrics.observe('repo.op.duration_ms', Date.now() - start, {
+            op: 'asrJobs.create',
+        });
+        this.logger.info('asr job created', { asrJobId: out.id });
+        return out;
+    }
+
+    async get(id: string): Promise<AsrJobRow | null> {
+        const start = Date.now();
+        const [rec] = await this.db
+            .select()
+            .from(asrJobs)
+            .where(eq(asrJobs.id, id))
+            .limit(1);
+        this.metrics.observe('repo.op.duration_ms', Date.now() - start, {
+            op: 'asrJobs.get',
+        });
+        return rec ? toAsrJobRow(rec) : null;
+    }
+
+    async getReusable(
+        mediaHash: string,
+        modelVersion: string
+    ): Promise<(AsrJobRow & { artifacts: AsrArtifactRow[] }) | null> {
+        const start = Date.now();
+        const [rec] = await this.db
+            .select()
+            .from(asrJobs)
+            .where(
+                and(
+                    eq(asrJobs.mediaHash, mediaHash),
+                    eq(asrJobs.modelVersion, modelVersion),
+                    eq(asrJobs.status, 'done')
+                )
+            )
+            .limit(1);
+        if (!rec) return null;
+        const artifacts = await this.db
+            .select()
+            .from(asrArtifacts)
+            .where(eq(asrArtifacts.asrJobId, rec.id));
+        this.metrics.observe('repo.op.duration_ms', Date.now() - start, {
+            op: 'asrJobs.getReusable',
+        });
+        return {
+            ...toAsrJobRow(rec),
+            artifacts: artifacts.map(toAsrArtifactRow),
+        };
+    }
+
+    async patch(id: string, patch: Partial<AsrJobRow>): Promise<AsrJobRow> {
+        const start = Date.now();
+        const [rec] = await this.db
+            .update(asrJobs)
+            .set(toAsrJobsPatch(patch))
+            .where(eq(asrJobs.id, id))
+            .returning();
+        if (!rec) throw new Error('NOT_FOUND');
+        const row = toAsrJobRow(rec);
+        this.metrics.observe('repo.op.duration_ms', Date.now() - start, {
+            op: 'asrJobs.patch',
+        });
+        this.logger.info('asr job patched', { asrJobId: row.id });
+        return row;
+    }
+}
+
+export class DrizzleAsrArtifactsRepo implements AsrArtifactsRepository {
+    constructor(
+        private readonly db = createDb(),
+        private readonly metrics: MetricsRegistry = noopMetrics
+    ) {}
+
+    async put(artifact: AsrArtifactRow): Promise<void> {
+        const start = Date.now();
+        await this.db
+            .insert(asrArtifacts)
+            .values({
+                asrJobId: artifact.asrJobId,
+                kind: artifact.kind,
+                storageKey: artifact.storageKey,
+                sizeBytes: artifact.sizeBytes,
+            })
+            .onConflictDoUpdate({
+                target: [asrArtifacts.asrJobId, asrArtifacts.kind],
+                set: {
+                    storageKey: artifact.storageKey,
+                    sizeBytes: artifact.sizeBytes,
+                },
+            });
+        this.metrics.observe('repo.op.duration_ms', Date.now() - start, {
+            op: 'asrArtifacts.put',
+        });
+    }
+
+    async list(asrJobId: string): Promise<AsrArtifactRow[]> {
+        const start = Date.now();
+        const rows = await this.db
+            .select()
+            .from(asrArtifacts)
+            .where(eq(asrArtifacts.asrJobId, asrJobId));
+        this.metrics.observe('repo.op.duration_ms', Date.now() - start, {
+            op: 'asrArtifacts.list',
+        });
+        return rows.map(toAsrArtifactRow);
+    }
+}
+
+function toJobRow(j: any): JobRow {
+    return {
+        id: j.id,
+        status: j.status,
+        progress: j.progress,
+        sourceType: j.sourceType,
+        sourceKey: j.sourceKey ?? undefined,
+        sourceUrl: j.sourceUrl ?? undefined,
+        startSec: j.startSec,
+        endSec: j.endSec,
+        withSubtitles: j.withSubtitles,
+        burnSubtitles: j.burnSubtitles,
+        subtitleLang: j.subtitleLang ?? undefined,
+        resultVideoKey: j.resultVideoKey ?? undefined,
+        resultSrtKey: j.resultSrtKey ?? undefined,
+        errorCode: j.errorCode ?? undefined,
+        errorMessage: j.errorMessage ?? undefined,
+        createdAt: j.createdAt.toISOString(),
+        updatedAt: j.updatedAt.toISOString(),
+        expiresAt: j.expiresAt ? j.expiresAt.toISOString() : undefined,
+        lastHeartbeatAt: j.lastHeartbeatAt
+            ? j.lastHeartbeatAt.toISOString()
+            : undefined,
+    };
+}
+
+function toJobsPatch(patch: Partial<JobRow>) {
+    const out: any = { updatedAt: new Date() };
+    for (const [k, v] of Object.entries(patch)) {
+        if (v === undefined) continue;
+        if (k === 'expiresAt' && v) out[k] = new Date(v as string);
+        else if (k === 'lastHeartbeatAt' && v) out[k] = new Date(v as string);
+        else out[k] = v as any;
+    }
+    return out;
+}
+
+function toAsrJobRow(j: any): AsrJobRow {
+    return {
+        id: j.id,
+        clipJobId: j.clipJobId ?? undefined,
+        sourceType: j.sourceType,
+        sourceKey: j.sourceKey ?? undefined,
+        mediaHash: j.mediaHash,
+        modelVersion: j.modelVersion,
+        languageHint: j.languageHint ?? undefined,
+        detectedLanguage: j.detectedLanguage ?? undefined,
+        durationSec: j.durationSec ?? undefined,
+        status: j.status,
+        errorCode: j.errorCode ?? undefined,
+        errorMessage: j.errorMessage ?? undefined,
+        createdAt: j.createdAt.toISOString(),
+        updatedAt: j.updatedAt.toISOString(),
+        completedAt: j.completedAt ? j.completedAt.toISOString() : undefined,
+        expiresAt: j.expiresAt ? j.expiresAt.toISOString() : undefined,
+    };
+}
+
+function toAsrJobsPatch(patch: Partial<AsrJobRow>) {
+    const out: any = { updatedAt: new Date() };
+    for (const [k, v] of Object.entries(patch)) {
+        if (v === undefined) continue;
+        if (k.endsWith('At') && v) out[k] = new Date(v as string);
+        else out[k] = v as any;
+    }
+    return out;
+}
+
+function toAsrArtifactRow(a: any): AsrArtifactRow {
+    return {
+        asrJobId: a.asrJobId,
+        kind: a.kind,
+        storageKey: a.storageKey,
+        sizeBytes: a.sizeBytes ?? undefined,
+        createdAt: a.createdAt.toISOString(),
+    };
+}
+````
+
+## File: src/api/index.ts
+````typescript
+import { Elysia } from 'elysia';
+// Some test environments may not set internal Elysia globals; ensure placeholder
+// to prevent TypeError when constructing Elysia during Vitest runs.
+// @ts-ignore
+if (typeof (globalThis as any).ELYSIA_AOT === 'undefined') {
+    // @ts-ignore
+    (globalThis as any).ELYSIA_AOT = false;
+}
+import cors from '@elysiajs/cors';
+import { Schemas, type CreateJobInputType } from '@clipper/contracts';
+import {
+    createLogger,
+    readEnv,
+    readIntEnv,
+    requireEnv,
+    fromException,
+} from '@clipper/common';
+import {
+    DrizzleJobsRepo,
+    DrizzleJobEventsRepo,
+    DrizzleApiKeysRepo,
+    createDb,
+    createSupabaseStorageRepo,
+} from '@clipper/data';
+import { InMemoryMetrics, normalizeRoute } from '@clipper/common/metrics';
+import { PgBossQueueAdapter } from '@clipper/queue';
+
+export const metrics = new InMemoryMetrics();
+const log = createLogger((readEnv('LOG_LEVEL') as any) || 'info').with({
+    mod: 'api',
+});
+
+// Simple in-memory API key cache & rate limiter (sufficient for single-instance / test)
+type ApiKeyCacheEntry = { record: any; expiresAt: number };
+const apiKeyCache = new Map<string, ApiKeyCacheEntry>();
+const API_KEY_CACHE_TTL_MS = 5 * 60_000; // 5 minutes
+
+interface RateBucket {
+    count: number;
+    windowStart: number;
+}
+const rateBuckets = new Map<string, RateBucket>();
+function rateLimitHit(key: string, max: number, windowMs: number) {
+    const now = Date.now();
+    const b = rateBuckets.get(key);
+    if (!b || now - b.windowStart >= windowMs) {
+        rateBuckets.set(key, { count: 1, windowStart: now });
+        return false; // first hit
+    }
+    if (b.count >= max) return true;
+    b.count++;
+    return false;
+}
+
+function buildDeps() {
+    const db = createDb();
+    let queue: any;
+    try {
+        const cs = requireEnv('DATABASE_URL');
+        queue = new PgBossQueueAdapter({ connectionString: cs });
+        queue.start?.();
+    } catch {
+        queue = {
+            publish: async () => {},
+            publishTo: async () => {},
+            health: async () => ({ ok: true }),
+            getMetrics: () => ({}),
+        };
+    }
+    const jobsRepo = new DrizzleJobsRepo(db, metrics);
+    const eventsRepo = new DrizzleJobEventsRepo(db);
+    const storage = (() => {
+        try {
+            return createSupabaseStorageRepo();
+        } catch (e) {
+            log.warn('storage init failed (signing disabled)', {
+                error: String(e),
+            });
+            return null as any;
+        }
+    })();
+    const apiKeys = new DrizzleApiKeysRepo(db);
+    return { queue, jobsRepo, eventsRepo, storage, apiKeys };
+}
+const { queue, jobsRepo, eventsRepo, storage, apiKeys } = buildDeps();
+
+function tcToSec(tc: string) {
+    const [hh, mm, rest] = tc.split(':');
+    const [ss, ms] = rest?.split('.') || [rest || '0', undefined];
+    return (
+        Number(hh) * 3600 +
+        Number(mm) * 60 +
+        Number(ss) +
+        (ms ? Number(`0.${ms}`) : 0)
+    );
+}
+
+// Simple correlation id + uniform error envelope middleware
+interface ApiErrorEnvelope {
+    error: { code: string; message: string; correlationId: string };
+}
+function buildError(
+    set: any,
+    code: number,
+    errCode: string,
+    message: string,
+    correlationId: string
+): ApiErrorEnvelope {
+    set.status = code;
+    return { error: { code: errCode, message, correlationId } };
+}
+
+const ENABLE_API_KEYS =
+    (readEnv('ENABLE_API_KEYS') || 'false').toLowerCase() === 'true';
+const RATE_WINDOW_SEC = Number(readEnv('RATE_LIMIT_WINDOW_SEC') || '60');
+const RATE_MAX = Number(readEnv('RATE_LIMIT_MAX') || '30');
+
+// HTTP instrumentation middleware (Req 2)
+function addHttpInstrumentation(app: Elysia) {
+    app.onBeforeHandle(({ store, request, path }) => {
+        (store as any)._httpStart = performance.now();
+        (store as any)._httpRoute = normalizeRoute(path || '/');
+    });
+    app.onAfterHandle(({ store, request, set, response }) => {
+        try {
+            const route =
+                (store as any)._httpRoute || normalizeRoute(request.url);
+            const started = (store as any)._httpStart || performance.now();
+            const dur = performance.now() - started;
+            const method = request.method.toUpperCase();
+            const codeNum = Number(
+                set.status || (response as any)?.status || 200
+            );
+            const codeClass = `${Math.floor(codeNum / 100)}xx`;
+            metrics.inc('http.requests_total', 1, {
+                method,
+                route,
+                code_class: codeClass,
+            });
+            metrics.observe('http.request_latency_ms', dur, { route });
+            if (codeNum >= 400)
+                metrics.inc('http.errors_total', 1, { route, code: codeNum });
+        } catch {}
+    });
+    app.onError(({ store, request, set }) => {
+        try {
+            const route =
+                (store as any)._httpRoute || normalizeRoute(request.url);
+            const method = request.method.toUpperCase();
+            const codeNum = Number(set.status || 500);
+            const codeClass = `${Math.floor(codeNum / 100)}xx`;
+            metrics.inc('http.requests_total', 1, {
+                method,
+                route,
+                code_class: codeClass,
+            });
+            metrics.inc('http.errors_total', 1, { route, code: codeNum });
+        } catch {}
+    });
+    return app;
+}
+
+async function resolveApiKey(request: Request) {
+    if (!ENABLE_API_KEYS) return null;
+    const auth = request.headers.get('authorization') || '';
+    let token: string | null = null;
+    if (/^bearer /i.test(auth)) token = auth.slice(7).trim();
+    else token = request.headers.get('x-api-key');
+    if (!token) return null; // absence handled separately (auth required?)
+    const cached = apiKeyCache.get(token);
+    if (cached && cached.expiresAt > Date.now()) return cached.record;
+    const rec = await apiKeys.verify(token);
+    if (rec)
+        apiKeyCache.set(token, {
+            record: rec,
+            expiresAt: Date.now() + API_KEY_CACHE_TTL_MS,
+        });
+    return rec;
+}
+
+function clientIdentity(request: Request, apiKeyId?: string | null): string {
+    if (apiKeyId) return `key:${apiKeyId}`;
+    const xf = request.headers.get('x-forwarded-for');
+    if (xf) return `ip:${xf.split(',')[0]!.trim()}`;
+    const xr = request.headers.get('x-real-ip');
+    if (xr) return `ip:${xr}`;
+    return 'ip:anon';
+}
+
+// Correlation id middleware MUST be early (Req 7.1)
+const baseApp = new Elysia().onRequest(({ request, store, set }) => {
+    const cid = request.headers.get('x-request-id') || crypto.randomUUID();
+    (store as any).correlationId = cid;
+    (store as any).__reqStart = performance.now();
+    // propagate header
+    set.headers['x-correlation-id'] = cid;
+});
+
+// HTTP metrics names:
+// http.requests_total{method,route,code_class}
+// http.errors_total{route,code}
+// http.request_latency_ms{route}
+export const app = addHttpInstrumentation(baseApp)
+    .use(cors())
+    .state('correlationId', '')
+    // After each handler finalize metrics (onAfterHandle does not catch thrown errors w/ set? Use onResponse hook)
+    .onAfterHandle(({ store, path, request, set, response }) => {
+        try {
+            const started = (store as any).__reqStart as number | undefined;
+            if (started === undefined) return;
+            const rt = performance.now() - started;
+            const method = request.method;
+            const route = normalizeRoute(path);
+            const rawStatus: any =
+                set.status || (response as any)?.status || 200;
+            const code =
+                typeof rawStatus === 'number'
+                    ? rawStatus
+                    : Number(rawStatus) || 200;
+            const codeClass = `${Math.floor(code / 100)}xx`;
+            metrics.inc('http.requests_total', 1, {
+                method,
+                route,
+                code_class: codeClass,
+            });
+            metrics.observe('http.request_latency_ms', rt, { route });
+            if (code >= 400) {
+                metrics.inc('http.errors_total', 1, { route, code });
+            }
+        } catch {}
+    })
+    // onError hook catches exceptions & explicit error responses
+    .onError(({ store, error, path, request, set }) => {
+        try {
+            const method = request.method;
+            const route = normalizeRoute(path);
+            const rawStatus: any = set.status || 500;
+            const code =
+                typeof rawStatus === 'number'
+                    ? rawStatus
+                    : Number(rawStatus) || 500;
+            const codeClass = `${Math.floor(code / 100)}xx`;
+            // ensure request counter still increments on error (if not already)
+            metrics.inc('http.requests_total', 1, {
+                method,
+                route,
+                code_class: codeClass,
+            });
+            metrics.inc('http.errors_total', 1, { route, code });
+        } catch {}
+        return error;
+    })
+    // Attach auth info (if enabled) early
+    .onBeforeHandle(async ({ request, store, set, path }) => {
+        if (!ENABLE_API_KEYS) return; // feature disabled
+        // exempt health & metrics endpoints
+        if (/^\/(healthz|metrics)/.test(path)) return;
+        const rec = await resolveApiKey(request);
+        if (!rec) {
+            set.status = 401;
+            return {
+                error: {
+                    code: 'UNAUTHORIZED',
+                    message: 'API key required or invalid',
+                    correlationId: (store as any).correlationId,
+                },
+            } satisfies ApiErrorEnvelope;
+        }
+        (store as any).apiKeyId = rec.id;
+    })
+    .get('/healthz', async ({ store }) => {
+        const correlationId = (store as any).correlationId;
+        // Queue health
+        let queueHealth: any = { ok: false, error: 'uninitialized' };
+        try {
+            queueHealth = await queue.health();
+        } catch (e) {
+            queueHealth = {
+                ok: false,
+                error: e instanceof Error ? e.message : String(e),
+            };
+        }
+        // DB ping latency (simple SELECT 1)
+        let dbMs = -1;
+        let dbOk = false;
+        try {
+            const start = performance.now();
+            // Use jobsRepo (drizzle) low-level query; drizzle .execute needs a sql template.
+            // Use a raw query through the adapter's underlying client if available.
+            // Fallback: listByStatus with 0 limit as lightweight ping.
+            await jobsRepo.listByStatus('queued', 1, 0);
+            dbMs = performance.now() - start;
+            dbOk = true;
+        } catch (e) {
+            dbOk = false;
+        }
+        const ok = queueHealth.ok && dbOk;
+        return {
+            ok,
+            queue: queueHealth,
+            db: { ok: dbOk, ping_ms: dbMs },
+            correlationId,
+        };
+    })
+    .get('/metrics/queue', ({ store }) => ({
+        metrics: queue.getMetrics(),
+        correlationId: (store as any).correlationId,
+    }))
+    .get('/metrics', () => {
+        const snap = metrics.snapshot();
+        // merge queue metrics (Req 3.4)
+        const queueMetrics = queue.getMetrics?.() || {};
+        return { ...snap, queue: queueMetrics };
+    })
+    .post('/api/jobs', async ({ body, set, store, request }) => {
+        const correlationId = (store as any).correlationId;
+        // Rate limit (only on creation endpoint)
+        try {
+            const keyId = (store as any).apiKeyId || null;
+            const ident = clientIdentity(request, keyId);
+            const windowMs = RATE_WINDOW_SEC * 1000;
+            if (rateLimitHit(ident, RATE_MAX, windowMs)) {
+                return buildError(
+                    set,
+                    429,
+                    'RATE_LIMITED',
+                    'Rate limit exceeded',
+                    correlationId
+                );
+            }
+        } catch (e) {
+            // Ignore limiter internal errors
+        }
+        try {
+            const parsed = Schemas.CreateJobInput.safeParse(body);
+            if (!parsed.success) {
+                return buildError(
+                    set,
+                    400,
+                    'VALIDATION_FAILED',
+                    parsed.error.message,
+                    correlationId
+                );
+            }
+            const input = parsed.data as CreateJobInputType;
+            const id = crypto.randomUUID();
+            const startSec = tcToSec(input.start);
+            const endSec = tcToSec(input.end);
+            if (
+                endSec - startSec >
+                Number(readIntEnv('MAX_CLIP_SECONDS', 120))
+            ) {
+                return buildError(
+                    set,
+                    400,
+                    'CLIP_TOO_LONG',
+                    'Clip exceeds MAX_CLIP_SECONDS',
+                    correlationId
+                );
+            }
+            const retentionHours = Number(readIntEnv('RETENTION_HOURS', 72));
+            const expiresAt = new Date(Date.now() + retentionHours * 3600_000);
+            const row = await jobsRepo.create({
+                id,
+                status: 'queued',
+                progress: 0,
+                sourceType: input.sourceType,
+                sourceKey: input.uploadKey,
+                sourceUrl: input.youtubeUrl,
+                startSec,
+                endSec,
+                withSubtitles: input.withSubtitles,
+                burnSubtitles: input.burnSubtitles,
+                subtitleLang: input.subtitleLang,
+                resultVideoKey: undefined,
+                resultSrtKey: undefined,
+                errorCode: undefined,
+                errorMessage: undefined,
+                expiresAt: expiresAt.toISOString(),
+            });
+            await eventsRepo.add({
+                jobId: id,
+                ts: new Date().toISOString(),
+                type: 'created',
+                data: { correlationId },
+            });
+            const publishedAt = Date.now();
+            await queue.publish({ jobId: id, priority: 'normal' });
+            // jobs.created_total now incremented inside DrizzleJobsRepo.create()
+            metrics.inc('jobs.created'); // legacy metric (optional)
+            metrics.observe(
+                'jobs.enqueue_latency_ms',
+                Date.now() - publishedAt
+            );
+            log.info('job enqueued', {
+                jobId: id,
+                correlationId,
+                apiKeyId: (store as any).apiKeyId,
+            });
+            return {
+                correlationId,
+                job: {
+                    id: row.id,
+                    status: row.status,
+                    progress: row.progress,
+                    expiresAt: expiresAt.toISOString(),
+                },
+            };
+        } catch (e) {
+            const err = fromException(e, correlationId);
+            return buildError(
+                set,
+                500,
+                err.error.code,
+                err.error.message,
+                correlationId
+            );
+        }
+    })
+    .get('/api/jobs/:id', async ({ params, set, store }) => {
+        const correlationId = (store as any).correlationId;
+        const { id } = params as any;
+        try {
+            const job = await jobsRepo.get(id);
+            if (!job) {
+                return buildError(
+                    set,
+                    404,
+                    'NOT_FOUND',
+                    'Job not found',
+                    correlationId
+                );
+            }
+            if (job.expiresAt && new Date(job.expiresAt) < new Date()) {
+                return buildError(
+                    set,
+                    410,
+                    'GONE',
+                    'Job expired',
+                    correlationId
+                );
+            }
+            // recent events (last 10)
+            const ev =
+                (await (eventsRepo as any).listRecent?.(job.id, 10)) ||
+                (await (eventsRepo as any).list(job.id, 10, 0));
+            metrics.inc('jobs.status_fetch');
+            return {
+                correlationId,
+                job: {
+                    id: job.id,
+                    status: job.status,
+                    progress: job.progress,
+                    resultVideoKey: job.resultVideoKey ?? undefined,
+                    resultSrtKey: job.resultSrtKey ?? undefined,
+                    expiresAt: job.expiresAt ?? undefined,
+                },
+                events: ev.map((e: any) => ({
+                    ts: e.ts,
+                    type: e.type,
+                    data: e.data,
+                })),
+            };
+        } catch (e) {
+            const err = fromException(e, correlationId);
+            return buildError(
+                set,
+                500,
+                err.error.code,
+                err.error.message,
+                correlationId
+            );
+        }
+    })
+    .get('/api/jobs/:id/result', async ({ params, set, store }) => {
+        const correlationId = (store as any).correlationId;
+        const { id } = params as any;
+        try {
+            const job = await jobsRepo.get(id);
+            if (!job) {
+                return buildError(
+                    set,
+                    404,
+                    'NOT_FOUND',
+                    'Job not found',
+                    correlationId
+                );
+            }
+            if (job.expiresAt && new Date(job.expiresAt) < new Date()) {
+                return buildError(
+                    set,
+                    410,
+                    'GONE',
+                    'Job expired',
+                    correlationId
+                );
+            }
+            if (!job.resultVideoKey || job.status !== 'done') {
+                return buildError(
+                    set,
+                    404,
+                    'NOT_READY',
+                    'Result not available yet',
+                    correlationId
+                );
+            }
+            if (!storage) {
+                return buildError(
+                    set,
+                    500,
+                    'STORAGE_UNAVAILABLE',
+                    'Storage not configured',
+                    correlationId
+                );
+            }
+            const videoUrl = await storage.sign(job.resultVideoKey);
+            let srtUrl: string | undefined;
+            if (job.resultSrtKey) {
+                try {
+                    srtUrl = await storage.sign(job.resultSrtKey);
+                } catch {}
+            }
+            metrics.inc('jobs.result_fetch');
+            return {
+                correlationId,
+                result: {
+                    id: job.id,
+                    video: { key: job.resultVideoKey, url: videoUrl },
+                    srt:
+                        job.resultSrtKey && srtUrl
+                            ? { key: job.resultSrtKey, url: srtUrl }
+                            : undefined,
+                },
+            };
+        } catch (e) {
+            const err = fromException(e, correlationId);
+            return buildError(
+                set,
+                500,
+                err.error.code,
+                err.error.message,
+                correlationId
+            );
+        }
+    });
+
+if (import.meta.main) {
+    const port = Number(readIntEnv('PORT', 3000));
+    const server = Bun.serve({ fetch: app.fetch, port });
+    log.info('API started', { port });
+    const stop = async () => {
+        log.info('API stopping');
+        server.stop(true);
+        await queue.shutdown();
+        process.exit(0);
+    };
+    process.on('SIGINT', stop);
+    process.on('SIGTERM', stop);
+}
+````
+
+## File: planning/observability/tasks.md
+````markdown
+# Observability Improvements Tasks
+
+artifact_id: 8f5b7a3c-9d8a-4c1f-b2f9-3e6d2c1a7b90
+
+## Legend
+
+-   Req refs: Observability Requirements section numbers
+
+## 1. Metric Registry & Core Instruments
+
+-   [x] 1.1 Implement MetricsRegistry (counters, histograms fixed buckets, gauges) (Req 1)
+-   [x] 1.2 Add route normalization helper (/:id replacement) (Req 1)
+-   [x] 1.3 Unit tests: registry reuse, label limit enforcement (Req 1)
+
+## 2. HTTP Instrumentation
+
+-   [x] 2.1 Middleware wrap request lifecycle (start/end) (Req 2)
+-   [x] 2.2 Expose status code class label (2xx/4xx/5xx) (Req 2)
+-   [x] 2.3 Error path increments http.errors_total (Req 2)
+-   [x] 2.4 Integration test for GET /healthz + 404 path metrics (Req 2)
+
+## 3. Job Lifecycle Metrics
+
+-   [x] 3.1 Hook job creation path -> jobs.created_total (Req 3)
+-   [x] 3.2 Hook status transitions -> jobs.status_transition_total (Req 3)
+-   [x] 3.3 Observe total latency at done/failed -> jobs.total_latency_ms (Req 3)
+-   [x] 3.4 Queue metrics merge into /metrics snapshot (Req 3)
+
+## 4. Worker Stage Timings
+
+-   [x] 4.1 Implement withStage wrapper (Req 4)
+-   [x] 4.2 Instrument stages: resolve, clip, upload, asr (Req 4)
+-   [x] 4.3 Stage failure counter (Req 4)
+-   [x] 4.4 Unit tests simulate stage error classification (Req 4)
+
+## 5. External Dependency Wrappers
+
+-   [x] 5.1 Wrap yt-dlp invocation (Req 5)
+-   [x] 5.2 Wrap ffprobe (Req 5)
+-   [x] 5.3 Wrap storage signed URL & upload operations (Req 5)
+-   [x] 5.4 Wrap ASR provider call (Req 5)
+
+## 6. Resource Sampler
+
+-   [x] 6.1 Implement sampler loop (Req 6)
+-   [x] 6.2 Collect RSS, event loop lag (Req 6)
+-   [x] 6.3 Collect scratch usage (Req 6)
+-   [x] 6.4 Gauge updates + tests (mock fs) (Req 6)
+
+## 7. Structured Logging Enhancements
+
+-   [x] 7.1 Ensure correlationId middleware early (Req 7)
+-   [x] 7.2 Include correlationId in job events/logs (Req 7)
+-   [x] 7.3 Add redaction pass for log field serialization (Req 7)
+
+## 8. Event Persistence Reliability
+
+-   [x] 8.1 Add metric events.persist_failures_total (Req 8)
+-   [x] 8.2 Test DB failure path increments metric (Req 8)
+
+## 9. Health & Readiness Expansion
+
+-   [x] 9.1 Extend /healthz with queue status & db ping ms (Req 9)
+-   [x] 9.2 Failure path returns ok:false (Req 9)
+
+## 10. SLO Documentation & Burn Rate Queries
+
+-   [x] 10.1 Document SLOs in docs/metrics.md (Req 10)
+-   [x] 10.2 Provide example PromQL or pseudo queries (Req 10)
+
+## 11. Metrics Endpoint Performance
+
+-   [ ] 11.1 Benchmark /metrics under load (Req 11)
+-   [ ] 11.2 Optimize snapshot serialization (Req 11)
+
+## 12. Tracing Hooks
+
+-   [ ] 12.1 Define tracer interface (Req 12)
+-   [ ] 12.2 No-op implementation + usage in critical paths (Req 12)
+
+## 13. Documentation & Examples
+
+-   [ ] 13.1 Update docs/metrics.md with catalog (Req 1-6)
+-   [ ] 13.2 Add troubleshooting guide section for high latency diagnosis (Req 4/5)
+
+## 14. Rollout & Verification
+
+-   [ ] 14.1 Deploy Phase 1 (core metrics) -> validate
+-   [ ] 14.2 Deploy Phase 2 (stage/external) -> validate
+-   [ ] 14.3 Load test & record baseline dashboards
+
+## 15. Follow-ups (Deferred)
+
+-   [ ] 15.1 Prometheus exposition format adapter
+-   [ ] 15.2 Alerting rules commit (SLO burn rate)
+````
+
 ## File: src/worker/index.ts
 ````typescript
 import {
@@ -8044,6 +10424,7 @@ import { PgBossQueueAdapter } from '@clipper/queue';
 import { BunClipper } from '@clipper/ffmpeg';
 import { AsrFacade } from '@clipper/asr/facade';
 import { InMemoryMetrics } from '@clipper/common/metrics';
+import { withStage } from './stage';
 export * from './asr.ts';
 
 const log = createLogger((readEnv('LOG_LEVEL') as any) || 'info').with({
@@ -8051,8 +10432,9 @@ const log = createLogger((readEnv('LOG_LEVEL') as any) || 'info').with({
 });
 
 const metrics = new InMemoryMetrics();
-const jobs = new DrizzleJobsRepo(createDb());
-const events = new DrizzleJobEventsRepo(createDb());
+const sharedDb = createDb();
+const jobs = new DrizzleJobsRepo(sharedDb, metrics);
+const events = new DrizzleJobEventsRepo(sharedDb, metrics);
 const queue = new PgBossQueueAdapter({
     connectionString: requireEnv('DATABASE_URL'),
 });
@@ -8068,234 +10450,286 @@ const storage = (() => {
     }
 })();
 const asrFacade = new AsrFacade({
-    asrJobs: new DrizzleAsrJobsRepo(createDb()),
+    asrJobs: new DrizzleAsrJobsRepo(sharedDb, metrics),
 });
 
 async function main() {
     await queue.start();
-    await queue.consume(async ({ jobId }: { jobId: string }) => {
-        const startedAt = Date.now();
-        const maxMs = Number(readEnv('CLIP_MAX_RUNTIME_SEC') || 600) * 1000; // default 10m
-        const nowIso = () => new Date().toISOString();
-        let cleanup: (() => Promise<void>) | null = null;
-        let outputLocal: string | null = null;
-        let lastHeartbeat = 0;
-        const heartbeatIntervalMs = Number(
-            readEnv('WORKER_HEARTBEAT_INTERVAL_MS') || 15_000
-        );
-        const sendHeartbeat = async () => {
-            const now = Date.now();
-            if (now - lastHeartbeat < heartbeatIntervalMs) return;
-            lastHeartbeat = now;
-            try {
-                await jobs.update(jobId, { lastHeartbeatAt: nowIso() } as any);
-            } catch {}
-        };
-
-        const finish = async (status: 'done' | 'failed', patch: any = {}) => {
-            await jobs.update(jobId, { status, ...patch });
-            await events.add({ jobId, ts: nowIso(), type: status });
-        };
-
-        try {
-            const job = await jobs.get(jobId);
-            if (!job) {
-                log.warn('job not found', { jobId });
-                return;
-            }
-            if (job.status === 'done') return; // idempotent
-            if (job.status !== 'processing') {
-                await jobs.update(jobId, { status: 'processing', progress: 0 });
-                await events.add({ jobId, ts: nowIso(), type: 'processing' });
-                log.info('job processing start', { jobId });
-            }
-
-            // Resolve source
-            let resolveRes: {
-                localPath: string;
-                cleanup: () => Promise<void>;
-                meta?: any;
+    await queue.consume(
+        async ({
+            jobId,
+            correlationId,
+        }: {
+            jobId: string;
+            correlationId?: string;
+        }) => {
+            const startedAt = Date.now();
+            const cid = correlationId || jobId; // fallback to jobId if none provided
+            const maxMs = Number(readEnv('CLIP_MAX_RUNTIME_SEC') || 600) * 1000; // default 10m
+            const nowIso = () => new Date().toISOString();
+            let cleanup: (() => Promise<void>) | null = null;
+            let outputLocal: string | null = null;
+            let lastHeartbeat = 0;
+            const heartbeatIntervalMs = Number(
+                readEnv('WORKER_HEARTBEAT_INTERVAL_MS') || 15_000
+            );
+            const sendHeartbeat = async () => {
+                const now = Date.now();
+                if (now - lastHeartbeat < heartbeatIntervalMs) return;
+                lastHeartbeat = now;
+                try {
+                    await jobs.update(jobId, {
+                        lastHeartbeatAt: nowIso(),
+                    } as any);
+                } catch {}
             };
-            if (job.sourceType === 'upload') {
-                resolveRes = await resolveUploadSource({
-                    id: job.id,
-                    sourceType: 'upload',
-                    sourceKey: job.sourceKey!,
-                } as any);
-            } else {
-                // Let underlying error surface for clearer diagnostics
-                resolveRes = await resolveYouTubeSource({
-                    id: job.id,
-                    sourceType: 'youtube',
-                    sourceUrl: job.sourceUrl!,
-                } as any);
-            }
-            cleanup = resolveRes.cleanup;
-            await events.add({
-                jobId,
-                ts: nowIso(),
-                type: 'source:ready',
-                data: { durationSec: resolveRes.meta?.durationSec },
-            });
 
-            // Perform clip
-            const clipStart = Date.now();
-            const { localPath: clipPath, progress$ } = await clipper.clip({
-                input: resolveRes.localPath,
-                startSec: job.startSec,
-                endSec: job.endSec,
-                jobId,
-            });
-            outputLocal = clipPath;
-            let lastPersist = 0;
-            let lastPct = -1;
-            const persist = async (pct: number) => {
-                await jobs.update(jobId, { progress: pct });
+            const finish = async (
+                status: 'done' | 'failed',
+                patch: any = {}
+            ) => {
+                await jobs.update(jobId, { status, ...patch });
                 await events.add({
                     jobId,
                     ts: nowIso(),
-                    type: 'progress',
-                    data: { pct, stage: 'clip' },
+                    type: status,
+                    data: { correlationId: cid },
                 });
-                await sendHeartbeat();
             };
-            const debounceMs = 500;
-            for await (const pct of progress$) {
-                const now = Date.now();
-                // Global timeout enforcement
-                if (now - startedAt > maxMs) {
-                    throw new Error('CLIP_TIMEOUT');
-                }
-                if (
-                    pct === 100 ||
-                    pct >= lastPct + 1 ||
-                    now - lastPersist >= debounceMs
-                ) {
-                    await persist(pct);
-                    lastPersist = now;
-                    lastPct = pct;
-                } else {
-                    // Even if we didn't persist progress, still emit heartbeat occasionally
-                    await sendHeartbeat();
-                }
-            }
-            if (lastPct < 100) await persist(100);
-            await sendHeartbeat();
 
-            // Upload result
-            if (!storage) throw new Error('STORAGE_NOT_AVAILABLE');
-            const key = storageKeys.resultVideo(jobId);
-            // Retry transient storage failures (network / 5xx) with exponential backoff
-            const uploadWithRetry = async () => {
-                const maxAttempts = Number(
-                    readEnv('STORAGE_UPLOAD_ATTEMPTS') || 4
-                );
-                let attempt = 0;
-                let delay = 200;
-                // simple transient detector
-                const isTransient = (err: any) => {
-                    const msg = String(err?.message || err);
-                    return /timeout|fetch|network|ECONN|EAI_AGAIN|ENOTFOUND|5\d{2}/i.test(
-                        msg
-                    );
-                };
-                // eslint-disable-next-line no-constant-condition
-                while (true) {
-                    try {
-                        attempt++;
-                        await storage.upload(clipPath, key, 'video/mp4');
-                        return;
-                    } catch (e) {
-                        if (attempt >= maxAttempts || !isTransient(e)) {
-                            throw e;
+            try {
+                const job = await jobs.get(jobId);
+                if (!job) {
+                    log.warn('job not found', { jobId });
+                    return;
+                }
+                if (job.status === 'done') return; // idempotent
+                if (job.status !== 'processing') {
+                    await jobs.update(jobId, {
+                        status: 'processing',
+                        progress: 0,
+                    });
+                    await events.add({
+                        jobId,
+                        ts: nowIso(),
+                        type: 'processing',
+                        data: { correlationId: cid },
+                    });
+                    log.info('job processing start', {
+                        jobId,
+                        correlationId: cid,
+                    });
+                }
+
+                // Resolve source (stage: resolve)
+                let resolveRes = await withStage(
+                    metrics,
+                    'resolve',
+                    async () => {
+                        if (job.sourceType === 'upload') {
+                            return await resolveUploadSource({
+                                id: job.id,
+                                sourceType: 'upload',
+                                sourceKey: job.sourceKey!,
+                            } as any);
+                        } else {
+                            return await resolveYouTubeSource({
+                                id: job.id,
+                                sourceType: 'youtube',
+                                sourceUrl: job.sourceUrl!,
+                            } as any);
                         }
-                        log.warn('storage upload retry', {
+                    }
+                );
+                cleanup = resolveRes.cleanup;
+                await events.add({
+                    jobId,
+                    ts: nowIso(),
+                    type: 'source:ready',
+                    data: {
+                        durationSec: resolveRes.meta?.durationSec,
+                        correlationId: cid,
+                    },
+                });
+
+                // Perform clip
+                const clipStart = Date.now();
+                const { localPath: clipPath, progress$ } = await withStage(
+                    metrics,
+                    'clip',
+                    async () =>
+                        await clipper.clip({
+                            input: resolveRes.localPath,
+                            startSec: job.startSec,
+                            endSec: job.endSec,
                             jobId,
-                            attempt,
-                            error: String(e),
-                        });
-                        await new Promise((r) => setTimeout(r, delay));
-                        delay = Math.min(delay * 2, 2000);
+                        })
+                );
+                outputLocal = clipPath;
+                let lastPersist = 0;
+                let lastPct = -1;
+                const persist = async (pct: number) => {
+                    await jobs.update(jobId, { progress: pct });
+                    await events.add({
+                        jobId,
+                        ts: nowIso(),
+                        type: 'progress',
+                        data: { pct, stage: 'clip', correlationId: cid },
+                    });
+                    await sendHeartbeat();
+                };
+                const debounceMs = 500;
+                for await (const pct of progress$) {
+                    const now = Date.now();
+                    // Global timeout enforcement
+                    if (now - startedAt > maxMs) {
+                        throw new Error('CLIP_TIMEOUT');
+                    }
+                    if (
+                        pct === 100 ||
+                        pct >= lastPct + 1 ||
+                        now - lastPersist >= debounceMs
+                    ) {
+                        await persist(pct);
+                        lastPersist = now;
+                        lastPct = pct;
+                    } else {
+                        // Even if we didn't persist progress, still emit heartbeat occasionally
+                        await sendHeartbeat();
                     }
                 }
-            };
-            await uploadWithRetry();
-            metrics.observe('clip.upload_ms', Date.now() - clipStart);
-            await events.add({
-                jobId,
-                ts: nowIso(),
-                type: 'uploaded',
-                data: { key },
-            });
+                if (lastPct < 100) await persist(100);
+                await sendHeartbeat();
 
-            // If subtitles requested and set to auto, create ASR job request (fire-and-forget)
-            if (
-                job.withSubtitles &&
-                (job.subtitleLang === 'auto' || !job.subtitleLang)
-            ) {
-                try {
-                    const asrRes = await asrFacade.request({
-                        localPath: clipPath,
-                        clipJobId: job.id,
-                        sourceType: 'internal',
-                        languageHint: job.subtitleLang ?? 'auto',
-                    });
-                    await events.add({
-                        jobId,
-                        ts: nowIso(),
-                        type: 'asr:requested',
-                        data: {
-                            asrJobId: asrRes.asrJobId,
-                            status: asrRes.status,
-                        },
-                    });
-                } catch (e) {
-                    // don't fail the clip if ASR enqueue fails
-                    await events.add({
-                        jobId,
-                        ts: nowIso(),
-                        type: 'asr:error',
-                        data: { err: String(e) },
+                // Upload result
+                if (!storage) throw new Error('STORAGE_NOT_AVAILABLE');
+                const key = storageKeys.resultVideo(jobId);
+                // Retry transient storage failures (network / 5xx) with exponential backoff
+                const uploadWithRetry = async () => {
+                    const maxAttempts = Number(
+                        readEnv('STORAGE_UPLOAD_ATTEMPTS') || 4
+                    );
+                    let attempt = 0;
+                    let delay = 200;
+                    // simple transient detector
+                    const isTransient = (err: any) => {
+                        const msg = String(err?.message || err);
+                        return /timeout|fetch|network|ECONN|EAI_AGAIN|ENOTFOUND|5\d{2}/i.test(
+                            msg
+                        );
+                    };
+                    // eslint-disable-next-line no-constant-condition
+                    while (true) {
+                        try {
+                            attempt++;
+                            await storage.upload(clipPath, key, 'video/mp4');
+                            return;
+                        } catch (e) {
+                            if (attempt >= maxAttempts || !isTransient(e)) {
+                                throw e;
+                            }
+                            log.warn('storage upload retry', {
+                                jobId,
+                                attempt,
+                                error: String(e),
+                            });
+                            await new Promise((r) => setTimeout(r, delay));
+                            delay = Math.min(delay * 2, 2000);
+                        }
+                    }
+                };
+                await withStage(metrics, 'upload', async () => {
+                    await uploadWithRetry();
+                });
+                metrics.observe('clip.upload_ms', Date.now() - clipStart);
+                await events.add({
+                    jobId,
+                    ts: nowIso(),
+                    type: 'uploaded',
+                    data: { key, correlationId: cid },
+                });
+
+                // If subtitles requested and set to auto, create ASR job request (fire-and-forget)
+                if (
+                    job.withSubtitles &&
+                    (job.subtitleLang === 'auto' || !job.subtitleLang)
+                ) {
+                    await withStage(metrics, 'asr', async () => {
+                        try {
+                            const asrRes = await asrFacade.request({
+                                localPath: clipPath,
+                                clipJobId: job.id,
+                                sourceType: 'internal',
+                                languageHint: job.subtitleLang ?? 'auto',
+                            });
+                            await events.add({
+                                jobId,
+                                ts: nowIso(),
+                                type: 'asr:requested',
+                                data: {
+                                    asrJobId: asrRes.asrJobId,
+                                    status: asrRes.status,
+                                    correlationId: cid,
+                                },
+                            });
+                        } catch (e) {
+                            await events.add({
+                                jobId,
+                                ts: nowIso(),
+                                type: 'asr:error',
+                                data: { err: String(e), correlationId: cid },
+                            });
+                            // swallow so primary pipeline continues
+                        }
                     });
                 }
-            }
 
-            await finish('done', { progress: 100, resultVideoKey: key });
-            metrics.observe('clip.total_ms', Date.now() - startedAt);
-            const ms = Date.now() - startedAt;
-            log.info('job completed', { jobId, ms });
-        } catch (e) {
-            const err = fromException(e, jobId);
-            log.error('job failed', { jobId, err });
-            metrics.inc('clip.failures');
-            try {
-                await jobs.update(jobId, {
-                    status: 'failed',
-                    errorCode:
-                        (err.error && (err.error as any).code) || 'INTERNAL',
-                    errorMessage:
-                        (err.error && (err.error as any).message) || String(e),
-                });
-                await events.add({ jobId, ts: nowIso(), type: 'failed' });
-            } catch {}
-        } finally {
-            // Final heartbeat on exit (success or failure) if runtime not exceeded
-            try {
-                await jobs.update(jobId, { lastHeartbeatAt: nowIso() } as any);
-            } catch {}
-            // Cleanup source + local output
-            if (cleanup) {
+                await finish('done', { progress: 100, resultVideoKey: key });
+                metrics.observe('clip.total_ms', Date.now() - startedAt);
+                const ms = Date.now() - startedAt;
+                log.info('job completed', { jobId, ms, correlationId: cid });
+            } catch (e) {
+                const err = fromException(e, jobId);
+                log.error('job failed', { jobId, err, correlationId: cid });
+                metrics.inc('clip.failures');
                 try {
-                    await cleanup();
+                    await jobs.update(jobId, {
+                        status: 'failed',
+                        errorCode:
+                            (err.error && (err.error as any).code) ||
+                            'INTERNAL',
+                        errorMessage:
+                            (err.error && (err.error as any).message) ||
+                            String(e),
+                    });
+                    await events.add({
+                        jobId,
+                        ts: nowIso(),
+                        type: 'failed',
+                        data: { correlationId: cid },
+                    });
                 } catch {}
-            }
-            if (outputLocal) {
+            } finally {
+                // Final heartbeat on exit (success or failure) if runtime not exceeded
                 try {
-                    await Bun.spawn(['rm', '-f', outputLocal]).exited;
+                    await jobs.update(jobId, {
+                        lastHeartbeatAt: nowIso(),
+                    } as any);
                 } catch {}
+                // Cleanup source + local output
+                if (cleanup) {
+                    try {
+                        await cleanup();
+                    } catch {}
+                }
+                if (outputLocal) {
+                    try {
+                        await Bun.spawn(['rm', '-f', outputLocal]).exited;
+                    } catch {}
+                }
             }
         }
-    });
+    );
 }
 
 if (import.meta.main) {

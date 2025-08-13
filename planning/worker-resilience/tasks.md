@@ -4,14 +4,14 @@ artifact_id: a7e5c1d2-3b4f-45c6-8d17-9f1e2d3c4b5a
 
 ## 1. Schema Migration
 
--   [ ] 1.1 Add last_heartbeat_at, attempt_count, processing_started_at columns (Req 1/2/7)
--   [ ] 1.2 Add index (status, last_heartbeat_at) (Req 2)
+-   [x] 1.1 Add last_heartbeat_at, attempt_count, processing_started_at columns (Req 1/2/7)
+-   [x] 1.2 Add index (status, last_heartbeat_at) (Req 2)
 
 ## 2. Heartbeat Implementation
 
--   [ ] 2.1 Track active job IDs list (Req 1)
--   [ ] 2.2 Batch update heartbeat loop (Req 1)
--   [ ] 2.3 Warning log on >3 consecutive failures (Req 1)
+-   [x] 2.1 Track active job IDs list (Req 1)
+-   [x] 2.2 Batch update heartbeat loop (Req 1)
+-   [x] 2.3 Warning log on >3 consecutive failures (Req 1)
 
 ## 3. Recovery Scanner
 

@@ -16,6 +16,7 @@ import {
 } from '@clipper/data';
 import { PgBossQueueAdapter } from '@clipper/queue';
 import { BunClipper } from '@clipper/ffmpeg';
+import { inArray } from 'drizzle-orm';
 import { AsrFacade } from '@clipper/asr/facade';
 import { InMemoryMetrics } from '@clipper/common/metrics';
 import { withStage } from './stage';
@@ -47,8 +48,66 @@ const asrFacade = new AsrFacade({
     asrJobs: new DrizzleAsrJobsRepo(sharedDb, metrics),
 });
 
+// Active job tracking for batch heartbeat (Req 2.1)
+const activeJobs = new Set<string>();
+let shuttingDown = false;
+
+interface HeartbeatLoopOpts {
+    intervalMs?: number;
+    updater?: (ids: string[], now: Date) => Promise<void>;
+    onWarn?: (failures: number, error: unknown) => void;
+}
+
+function startHeartbeatLoop(opts: HeartbeatLoopOpts = {}) {
+    const intervalMs =
+        opts.intervalMs ??
+        Number(readEnv('WORKER_HEARTBEAT_INTERVAL_MS') || 10_000);
+    let stopped = false;
+    let consecutiveFailures = 0;
+    const updater =
+        opts.updater ||
+        (async (ids: string[], now: Date) => {
+            await (sharedDb as any)
+                .update(jobs as any)
+                .set({ lastHeartbeatAt: now })
+                .where(inArray((jobs as any).id, ids));
+        });
+    (async () => {
+        while (!stopped && !shuttingDown) {
+            try {
+                if (activeJobs.size) {
+                    const ids = Array.from(activeJobs);
+                    const now = new Date();
+                    // eslint-disable-next-line no-await-in-loop
+                    await updater(ids, now);
+                    metrics.inc('worker.heartbeats_total');
+                    consecutiveFailures = 0;
+                }
+            } catch (e) {
+                consecutiveFailures++;
+                metrics.inc('worker.heartbeat_failures_total');
+                if (consecutiveFailures > 3) {
+                    log.warn('heartbeat degraded', {
+                        error: String(e),
+                        consecutiveFailures,
+                    });
+                    try {
+                        opts.onWarn?.(consecutiveFailures, e);
+                    } catch {}
+                }
+            }
+            // eslint-disable-next-line no-await-in-loop
+            await new Promise((r) => setTimeout(r, intervalMs));
+        }
+    })();
+    return () => {
+        stopped = true;
+    };
+}
+
 async function main() {
     await queue.start();
+    const stopHeartbeat = startHeartbeatLoop();
     await queue.consume(
         async ({
             jobId,
@@ -63,20 +122,6 @@ async function main() {
             const nowIso = () => new Date().toISOString();
             let cleanup: (() => Promise<void>) | null = null;
             let outputLocal: string | null = null;
-            let lastHeartbeat = 0;
-            const heartbeatIntervalMs = Number(
-                readEnv('WORKER_HEARTBEAT_INTERVAL_MS') || 15_000
-            );
-            const sendHeartbeat = async () => {
-                const now = Date.now();
-                if (now - lastHeartbeat < heartbeatIntervalMs) return;
-                lastHeartbeat = now;
-                try {
-                    await jobs.update(jobId, {
-                        lastHeartbeatAt: nowIso(),
-                    } as any);
-                } catch {}
-            };
 
             const finish = async (
                 status: 'done' | 'failed',
@@ -102,6 +147,7 @@ async function main() {
                     await jobs.update(jobId, {
                         status: 'processing',
                         progress: 0,
+                        processingStartedAt: nowIso(),
                     });
                     await events.add({
                         jobId,
@@ -114,6 +160,7 @@ async function main() {
                         correlationId: cid,
                     });
                 }
+                activeJobs.add(jobId);
 
                 // Resolve source (stage: resolve)
                 let resolveRes = await withStage(
@@ -170,7 +217,6 @@ async function main() {
                         type: 'progress',
                         data: { pct, stage: 'clip', correlationId: cid },
                     });
-                    await sendHeartbeat();
                 };
                 const debounceMs = 500;
                 for await (const pct of progress$) {
@@ -187,13 +233,9 @@ async function main() {
                         await persist(pct);
                         lastPersist = now;
                         lastPct = pct;
-                    } else {
-                        // Even if we didn't persist progress, still emit heartbeat occasionally
-                        await sendHeartbeat();
                     }
                 }
                 if (lastPct < 100) await persist(100);
-                await sendHeartbeat();
 
                 // Upload result
                 if (!storage) throw new Error('STORAGE_NOT_AVAILABLE');
@@ -305,6 +347,7 @@ async function main() {
                 } catch {}
             } finally {
                 // Final heartbeat on exit (success or failure) if runtime not exceeded
+                activeJobs.delete(jobId);
                 try {
                     await jobs.update(jobId, {
                         lastHeartbeatAt: nowIso(),
@@ -336,11 +379,20 @@ if (import.meta.main) {
         }
     };
     const stop = async () => {
+        shuttingDown = true;
         log.info('worker stopping');
         await queue.shutdown();
-        process.exit(0);
+        // allow heartbeat loop to exit gracefully
+        setTimeout(() => process.exit(0), 500);
     };
     process.on('SIGINT', stop);
     process.on('SIGTERM', stop);
     run();
 }
+
+// Test hooks (non-production usage)
+export const __test = {
+    activeJobs,
+    startHeartbeatLoop,
+    metrics,
+};
