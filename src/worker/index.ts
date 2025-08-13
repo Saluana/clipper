@@ -109,6 +109,8 @@ function startHeartbeatLoop(opts: HeartbeatLoopOpts = {}) {
 async function main() {
     await queue.start();
     const stopHeartbeat = startHeartbeatLoop();
+    const maxConc = Number(readEnv('WORKER_MAX_CONCURRENCY') || 4);
+    const sem = new (__test as any).Semaphore(maxConc);
     await queue.consume(
         async ({
             jobId,
@@ -117,6 +119,7 @@ async function main() {
             jobId: string;
             correlationId?: string;
         }) => {
+            await sem.acquire();
             const startedAt = Date.now();
             const cid = correlationId || jobId; // fallback to jobId if none provided
             const maxMs = Number(readEnv('CLIP_MAX_RUNTIME_SEC') || 600) * 1000; // default 10m
@@ -365,6 +368,7 @@ async function main() {
                         await Bun.spawn(['rm', '-f', outputLocal]).exited;
                     } catch {}
                 }
+                sem.release();
             }
         }
     );
@@ -506,3 +510,27 @@ function startRecoveryScanner() {
 // augment test hooks
 (__test as any).runRecoveryScan = runRecoveryScan;
 (__test as any).startRecoveryScanner = startRecoveryScanner;
+
+// ------------------ Concurrency Control (Req 4) ------------------
+class Semaphore {
+    private queue: (() => void)[] = [];
+    public inflight = 0;
+    constructor(private limit: number) {}
+    async acquire() {
+        if (this.inflight < this.limit) {
+            this.inflight++;
+            metrics.setGauge('worker.concurrent_jobs', this.inflight);
+            return;
+        }
+        await new Promise<void>((res) => this.queue.push(res));
+        this.inflight++;
+        metrics.setGauge('worker.concurrent_jobs', this.inflight);
+    }
+    release() {
+        this.inflight = Math.max(0, this.inflight - 1);
+        metrics.setGauge('worker.concurrent_jobs', this.inflight);
+        const next = this.queue.shift();
+        if (next) next();
+    }
+}
+(__test as any).Semaphore = Semaphore;

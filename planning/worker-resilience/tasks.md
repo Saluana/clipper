@@ -21,9 +21,9 @@ artifact_id: a7e5c1d2-3b4f-45c6-8d17-9f1e2d3c4b5a
 
 ## 4. Concurrency Control
 
--   [ ] 4.1 Implement semaphore (Req 3)
--   [ ] 4.2 Prefetch logic constrained by available slots (Req 3)
--   [ ] 4.3 Gauge worker.concurrent_jobs (Req 3)
+-   [x] 4.1 Implement semaphore (Req 3)
+-   [x] 4.2 Prefetch logic constrained by available slots (Req 3) _(basic: queue handler acquire gate)_
+-   [x] 4.3 Gauge worker.concurrent_jobs (Req 3)
 
 ## 5. Backpressure Pause
 
