@@ -27,15 +27,15 @@ artifact_id: a7e5c1d2-3b4f-45c6-8d17-9f1e2d3c4b5a
 
 ## 5. Backpressure Pause
 
--   [ ] 5.1 Monitor queue depth + CPU load (Req 4)
--   [ ] 5.2 Pause dequeuing under high watermark (Req 4)
--   [ ] 5.3 Metric worker.pauses_total (Req 4)
+-   [x] 5.1 Monitor queue depth + CPU load (Req 4)
+-   [x] 5.2 Pause dequeuing under high watermark (Req 4)
+-   [x] 5.3 Metric worker.pauses_total (Req 4)
 
 ## 6. Idempotent Output Handling
 
--   [ ] 6.1 Implement temp -> atomic move pattern (Req 5)
--   [ ] 6.2 Pre-check existing artifact skip path (Req 5)
--   [ ] 6.3 Integrity validation (size > 0) (Req 5)
+-   [x] 6.1 Implement temp -> atomic move pattern (Req 5)
+-   [x] 6.2 Pre-check existing artifact skip path (Req 5)
+-   [x] 6.3 Integrity validation (size > 0) (Req 5)
 
 ## 7. Duplicate Suppression
 

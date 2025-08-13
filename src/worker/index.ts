@@ -21,6 +21,7 @@ import { jobEvents, jobs as jobsTable } from '@clipper/data/db/schema';
 import { AsrFacade } from '@clipper/asr/facade';
 import { InMemoryMetrics } from '@clipper/common/metrics';
 import { withStage } from './stage';
+import os from 'os';
 export * from './asr.ts';
 
 const log = createLogger((readEnv('LOG_LEVEL') as any) || 'info').with({
@@ -106,18 +107,89 @@ function startHeartbeatLoop(opts: HeartbeatLoopOpts = {}) {
     };
 }
 
+// ------------------ Backpressure (Req 5) ------------------
+interface BackpressureOpts {
+    getDepth: () => Promise<number> | number;
+    getCpu: () => number;
+    highDepth: number;
+    highCpu: number;
+    pauseMs: number;
+    now?: () => number;
+}
+function createBackpressureController(opts: BackpressureOpts) {
+    let pausedUntil = 0;
+    const nowFn = opts.now || (() => Date.now());
+    async function evaluate(): Promise<boolean> {
+        const now = nowFn();
+        if (pausedUntil && now < pausedUntil) return false;
+        const depth = await opts.getDepth();
+        const cpu = opts.getCpu();
+        if (depth >= opts.highDepth && cpu >= opts.highCpu) {
+            pausedUntil = now + opts.pauseMs;
+            metrics.inc('worker.pauses_total');
+            log.info('backpressure pause', {
+                depth,
+                cpuLoad: cpu,
+                pauseMs: opts.pauseMs,
+            });
+            return true;
+        }
+        return false;
+    }
+    function isPaused() {
+        return pausedUntil > nowFn();
+    }
+    return {
+        evaluate,
+        isPaused,
+        get pausedUntil() {
+            return pausedUntil;
+        },
+    };
+}
+export const __backpressureTest = { createBackpressureController };
+// expose on global for tests that import worker side-effects
+(globalThis as any).__backpressureTest = __backpressureTest;
+
 async function main() {
     await queue.start();
-    const stopHeartbeat = startHeartbeatLoop();
+    startHeartbeatLoop();
     const maxConc = Number(readEnv('WORKER_MAX_CONCURRENCY') || 4);
-    const sem = new (__test as any).Semaphore(maxConc);
-    const handler = async ({
-        jobId,
-        correlationId,
-    }: {
-        jobId: string;
-        correlationId?: string;
-    }) => {
+    const sem = new Semaphore(maxConc);
+    const highDepth = Number(readEnv('WORKER_QUEUE_HIGH_WATERMARK') || 500);
+    const highCpu = Number(readEnv('WORKER_CPU_LOAD_HIGH') || os.cpus().length);
+    const pauseMs = Number(readEnv('WORKER_BACKPRESSURE_PAUSE_MS') || 3000);
+    const backpressure = createBackpressureController({
+        getDepth: async () => {
+            try {
+                const r = await (sharedDb as any)
+                    .select({ c: sql<number>`count(*)` })
+                    .from(jobsTable)
+                    .where(eq(jobsTable.status, 'queued'));
+                return Number(r[0]?.c || 0);
+            } catch (e) {
+                log.warn('queue depth query failed', { error: String(e) });
+                return 0;
+            }
+        },
+        getCpu: () => os.loadavg()[0] || 0,
+        highDepth,
+        highCpu,
+        pauseMs,
+    });
+    (async () => {
+        while (!shuttingDown) {
+            try {
+                await backpressure.evaluate();
+            } catch (e) {
+                log.warn('backpressure evaluate failed', { error: String(e) });
+            }
+            await new Promise((r) => setTimeout(r, 1000));
+        }
+    })();
+
+    const handler = async (msg: { jobId: string; correlationId?: string }) => {
+        const { jobId, correlationId } = msg;
         await sem.acquire();
         const startedAt = Date.now();
         const cid = correlationId || jobId; // fallback to jobId if none provided
@@ -191,6 +263,34 @@ async function main() {
 
             // Perform clip
             const clipStart = Date.now();
+            // Idempotent artifact pre-check
+            const finalKey = storageKeys.resultVideo(jobId);
+            let finalLocalPath: string | null = null;
+            if (storage) {
+                try {
+                    // Attempt signed URL then head fetch to see if object exists (cheap existence check)
+                    const signed = await storage.sign(finalKey, 30);
+                    const head = await fetch(signed, { method: 'HEAD' });
+                    if (head.ok) {
+                        log.info('idempotent skip existing artifact', {
+                            jobId,
+                            key: finalKey,
+                        });
+                        await finish('done', {
+                            progress: 100,
+                            resultVideoKey: finalKey,
+                        });
+                        metrics.inc('worker.idempotent_skips_total');
+                        return; // short circuit entire processing
+                    }
+                } catch {}
+            }
+            const tempDir = `/tmp/clipper/${jobId}`;
+            try {
+                await Bun.spawn(['mkdir', '-p', tempDir]).exited;
+            } catch {}
+            const tempOut = `${tempDir}/clip.tmp.mp4`;
+            const finalOut = `${tempDir}/clip.final.mp4`;
             const { localPath: clipPath, progress$ } = await withStage(
                 metrics,
                 'clip',
@@ -200,6 +300,7 @@ async function main() {
                         startSec: job.startSec,
                         endSec: job.endSec,
                         jobId,
+                        // override output path if clipper supports? (assumed internal uses jobId)
                     })
             );
             outputLocal = clipPath;
@@ -232,10 +333,32 @@ async function main() {
                 }
             }
             if (lastPct < 100) await persist(100);
+            // Integrity validation (size>0) & atomic move into finalOut
+            try {
+                const f = Bun.file(clipPath);
+                if (!(await f.exists())) throw new Error('OUTPUT_MISSING');
+                const size = (await f.arrayBuffer()).byteLength;
+                if (size <= 0) throw new Error('OUTPUT_EMPTY');
+                // atomic move (rename) to final path
+                try {
+                    await Bun.spawn(['mv', clipPath, finalOut]).exited;
+                    outputLocal = finalOut;
+                } catch (e) {
+                    // fallback copy
+                    await Bun.write(finalOut, await f.arrayBuffer());
+                    outputLocal = finalOut;
+                }
+            } catch (e) {
+                log.error('output integrity validation failed', {
+                    jobId,
+                    err: String(e),
+                });
+                throw e;
+            }
 
             // Upload result
             if (!storage) throw new Error('STORAGE_NOT_AVAILABLE');
-            const key = storageKeys.resultVideo(jobId);
+            const key = finalKey; // reuse deterministic key
             // Retry transient storage failures (network / 5xx) with exponential backoff
             const uploadWithRetry = async () => {
                 const maxAttempts = Number(
@@ -254,7 +377,7 @@ async function main() {
                 while (true) {
                     try {
                         attempt++;
-                        await storage.upload(clipPath, key, 'video/mp4');
+                        await storage.upload(outputLocal!, key, 'video/mp4');
                         return;
                     } catch (e) {
                         if (attempt >= maxAttempts || !isTransient(e)) {
@@ -361,10 +484,13 @@ async function main() {
             sem.release();
         }
     };
+
     if ((queue as any).adaptiveConsume) {
         log.info('using adaptive queue consumption (capacity-aware prefetch)');
         (queue as any)
-            .adaptiveConsume(handler, () => sem.capacity())
+            .adaptiveConsume(handler, () =>
+                backpressure.isPaused() ? 0 : sem.capacity()
+            )
             .catch((e: any) =>
                 log.error('adaptiveConsume loop crashed', { error: String(e) })
             );
