@@ -144,6 +144,73 @@ export class PgBossQueueAdapter implements QueueAdapter {
         );
     }
 
+    /**
+     * Adaptive consumption loop that only fetches jobs when capacityProvider() > 0.
+     * Avoids over-claiming jobs whose work would just sit waiting on a local semaphore.
+     * Optional optimization (enabled by caller explicitly using this API).
+     */
+    async adaptiveConsume(
+        handler: (msg: QueueMessage) => Promise<void>,
+        capacityProvider: () => number,
+        opts?: { idleDelayMs?: number; maxBatch?: number }
+    ) {
+        if (!this.boss) await this.start();
+        const idleDelayMs = opts?.idleDelayMs ?? 250;
+        const maxConfigured = Number(
+            readIntEnv('QUEUE_CONCURRENCY', this.opts.concurrency ?? 4)
+        );
+        const maxBatch = opts?.maxBatch ?? maxConfigured;
+        // Loop forever; caller governs process lifetime.
+        // We intentionally do not use boss.work here so we control fetch timing.
+        // eslint-disable-next-line no-constant-condition
+        while (true) {
+            try {
+                const cap = capacityProvider();
+                if (cap <= 0) {
+                    await new Promise((r) => setTimeout(r, idleDelayMs));
+                    continue;
+                }
+                const batchSize = Math.min(cap, maxBatch);
+                const jobs = await this.boss!.fetch(this.topic, {
+                    batchSize,
+                } as any);
+                if (!jobs || jobs.length === 0) {
+                    await new Promise((r) => setTimeout(r, idleDelayMs));
+                    continue;
+                }
+                this.metrics.claims += jobs.length;
+                for (const job of jobs) {
+                    // Fire and forget each job; completion/failure ack individually.
+                    (async () => {
+                        try {
+                            await handler(job.data as QueueMessage);
+                            await this.boss!.complete(
+                                job.name,
+                                job.id,
+                                (job as any).data || {}
+                            );
+                            this.metrics.completes++;
+                        } catch (err) {
+                            this.metrics.retries++;
+                            this.metrics.errors++;
+                            try {
+                                await this.boss!.fail(
+                                    job.name,
+                                    job.id,
+                                    (job as any).data || {}
+                                );
+                            } catch {}
+                        }
+                    })();
+                }
+            } catch (e) {
+                this.metrics.errors++;
+                // Backoff briefly on errors
+                await new Promise((r) => setTimeout(r, idleDelayMs));
+            }
+        }
+    }
+
     // Optional multi-topic methods (for subsystems like ASR)
     async publishTo(
         topic: string,
