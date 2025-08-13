@@ -215,22 +215,34 @@ async function main() {
                 return;
             }
             if (job.status === 'done') return; // idempotent
-            if (job.status !== 'processing') {
-                await jobs.update(jobId, {
-                    status: 'processing',
-                    progress: 0,
-                    processingStartedAt: nowIso(),
-                });
+            // Atomic acquire: only proceed if currently queued. Prevent duplicate starts (Req 6)
+            if (job.status === 'queued') {
+                const acquired = await (sharedDb as any)
+                    .update(jobsTable)
+                    .set({
+                        status: 'processing',
+                        processingStartedAt: new Date(),
+                        lastHeartbeatAt: new Date(),
+                        updatedAt: new Date(),
+                    })
+                    .where(and(eq(jobsTable.id, jobId), eq(jobsTable.status, 'queued')))
+                    .returning({ id: jobsTable.id });
+                if (!acquired.length) {
+                    metrics.inc('worker.acquire_conflicts_total');
+                    log.info('acquire conflict skip', { jobId });
+                    return; // another worker got it
+                }
                 await events.add({
                     jobId,
                     ts: nowIso(),
                     type: 'processing',
                     data: { correlationId: cid },
                 });
-                log.info('job processing start', {
-                    jobId,
-                    correlationId: cid,
-                });
+                log.info('job processing start', { jobId, correlationId: cid });
+            } else if (job.status !== 'processing') {
+                // Unexpected state, skip (could be failed/cancelled)
+                log.info('skip job in non-runnable state', { jobId, status: job.status });
+                return;
             }
             activeJobs.add(jobId);
 

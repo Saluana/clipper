@@ -39,8 +39,8 @@ artifact_id: a7e5c1d2-3b4f-45c6-8d17-9f1e2d3c4b5a
 
 ## 7. Duplicate Suppression
 
--   [ ] 7.1 Atomic queued->processing update (Req 6)
--   [ ] 7.2 Track acquire conflicts metric (Req 6)
+-   [x] 7.1 Atomic queued->processing update (Req 6)
+-   [x] 7.2 Track acquire conflicts metric (Req 6)
 
 ## 8. Retry Classification
 
