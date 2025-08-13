@@ -15,9 +15,9 @@ artifact_id: a7e5c1d2-3b4f-45c6-8d17-9f1e2d3c4b5a
 
 ## 3. Recovery Scanner
 
--   [ ] 3.1 Implement recovery scan SQL (Req 2)
--   [ ] 3.2 Emit requeued:stale events (Req 2)
--   [ ] 3.3 Attempt limit fail path RETRIES_EXHAUSTED (Req 7)
+-   [x] 3.1 Implement recovery scan SQL (Req 2)
+-   [x] 3.2 Emit requeued:stale events (Req 2)
+-   [x] 3.3 Attempt limit fail path RETRIES_EXHAUSTED (Req 7)
 
 ## 4. Concurrency Control
 

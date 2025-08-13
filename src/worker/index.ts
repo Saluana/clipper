@@ -16,7 +16,8 @@ import {
 } from '@clipper/data';
 import { PgBossQueueAdapter } from '@clipper/queue';
 import { BunClipper } from '@clipper/ffmpeg';
-import { inArray } from 'drizzle-orm';
+import { inArray, and, eq, lt, gte, sql } from 'drizzle-orm';
+import { jobEvents, jobs as jobsTable } from '@clipper/data/db/schema';
 import { AsrFacade } from '@clipper/asr/facade';
 import { InMemoryMetrics } from '@clipper/common/metrics';
 import { withStage } from './stage';
@@ -395,4 +396,113 @@ export const __test = {
     activeJobs,
     startHeartbeatLoop,
     metrics,
+    // recovery test hooks will be appended below after definition
 };
+
+// ------------------ Recovery Scanner (Req 3) ------------------
+async function runRecoveryScan(now = new Date()) {
+    const heartbeatIntervalMs = Number(
+        readEnv('WORKER_HEARTBEAT_INTERVAL_MS') || 10_000
+    );
+    const leaseTimeoutSec = Number(
+        readEnv('WORKER_LEASE_TIMEOUT_SEC') ||
+            Math.ceil((heartbeatIntervalMs / 1000) * 3)
+    );
+    const maxAttempts = Number(readEnv('JOB_MAX_ATTEMPTS') || 3);
+    const staleCutoff = new Date(now.getTime() - leaseTimeoutSec * 1000);
+    const start = Date.now();
+    let requeued: { id: string }[] = [];
+    let exhausted: { id: string }[] = [];
+    await (sharedDb as any).transaction(async (tx: any) => {
+        // Requeue stale processing jobs under attempt limit
+        requeued = await tx
+            .update(jobsTable)
+            .set({
+                status: 'queued',
+                attemptCount: sql`${jobsTable.attemptCount} + 1`,
+                updatedAt: now,
+            })
+            .where(
+                and(
+                    eq(jobsTable.status, 'processing'),
+                    lt(jobsTable.lastHeartbeatAt, staleCutoff),
+                    lt(jobsTable.attemptCount, maxAttempts)
+                )
+            )
+            .returning({ id: jobsTable.id });
+        if (requeued.length) {
+            // Emit requeued:stale events
+            await tx.insert(jobEvents).values(
+                requeued.map((r) => ({
+                    jobId: r.id,
+                    ts: now,
+                    type: 'requeued:stale',
+                    data: null,
+                }))
+            );
+        }
+        // Mark exhausted attempts as failed
+        exhausted = await tx
+            .update(jobsTable)
+            .set({
+                status: 'failed',
+                errorCode: 'RETRIES_EXHAUSTED',
+                errorMessage: 'Lease expired and retry attempts exhausted',
+                updatedAt: now,
+            })
+            .where(
+                and(
+                    eq(jobsTable.status, 'processing'),
+                    lt(jobsTable.lastHeartbeatAt, staleCutoff),
+                    gte(jobsTable.attemptCount, maxAttempts)
+                )
+            )
+            .returning({ id: jobsTable.id });
+        if (exhausted.length) {
+            await tx.insert(jobEvents).values(
+                exhausted.map((r) => ({
+                    jobId: r.id,
+                    ts: now,
+                    type: 'failed',
+                    data: { code: 'RETRIES_EXHAUSTED' },
+                }))
+            );
+        }
+    });
+    if (requeued.length)
+        metrics.inc('worker.recovered_jobs_total', requeued.length, {
+            reason: 'stale',
+        });
+    if (exhausted.length)
+        metrics.inc('worker.retry_exhausted_total', exhausted.length);
+    metrics.observe('worker.recovery_scan_ms', Date.now() - start);
+    return {
+        requeued: requeued.map((r) => r.id),
+        exhausted: exhausted.map((r) => r.id),
+    };
+}
+
+function startRecoveryScanner() {
+    const intervalMsBase = Number(
+        readEnv('WORKER_RECOVERY_SCAN_INTERVAL_MS') || 30_000
+    );
+    let stopped = false;
+    (async () => {
+        while (!stopped && !shuttingDown) {
+            try {
+                await runRecoveryScan();
+            } catch (e) {
+                log.error('recovery scan failed', { error: String(e) });
+            }
+            const jitter = Math.floor(intervalMsBase * 0.1 * Math.random());
+            await new Promise((r) => setTimeout(r, intervalMsBase + jitter));
+        }
+    })();
+    return () => {
+        stopped = true;
+    };
+}
+
+// augment test hooks
+(__test as any).runRecoveryScan = runRecoveryScan;
+(__test as any).startRecoveryScanner = startRecoveryScanner;
