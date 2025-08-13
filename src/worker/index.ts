@@ -59,7 +59,7 @@ interface HeartbeatLoopOpts {
     updater?: (ids: string[], now: Date) => Promise<void>;
     onWarn?: (failures: number, error: unknown) => void;
 }
-
+// Start a lightweight heartbeat loop that batches active job IDs and updates lastHeartbeatAt
 function startHeartbeatLoop(opts: HeartbeatLoopOpts = {}) {
     const intervalMs =
         opts.intervalMs ??
@@ -107,7 +107,7 @@ function startHeartbeatLoop(opts: HeartbeatLoopOpts = {}) {
     };
 }
 
-// ------------------ Backpressure (Req 5) ------------------
+// ------------------ Backpressure Controller (Req 5) ------------------
 interface BackpressureOpts {
     getDepth: () => Promise<number> | number;
     getCpu: () => number;
@@ -148,12 +148,14 @@ function createBackpressureController(opts: BackpressureOpts) {
     };
 }
 export const __backpressureTest = { createBackpressureController };
-// ------------------ Progress Throttling Helper (Req 8) ------------------
+(globalThis as any).__backpressureTest = __backpressureTest;
+
+// ------------------ Progress Throttling (Req 9) ------------------
 interface ThrottleOpts {
     persist: (pct: number) => Promise<void>;
     now: () => number;
-    debounceMs: number; // time-based emit if exceeded
-    enforce?: (now: number) => void; // optional timeout / extra checks
+    debounceMs: number;
+    enforce?: (now: number) => void;
 }
 async function throttleProgress(
     progressIter: AsyncIterable<number>,
@@ -179,85 +181,103 @@ async function throttleProgress(
     }
 }
 export const __progressTest = { throttleProgress };
-// Retry classification helper (Req 7)
+
+// ------------------ Retry Classification (Req 8) ------------------
 type RetryClass = 'retryable' | 'fatal';
 function classifyError(e: any): RetryClass {
-    const msg = String(e?.message || e || '').toUpperCase();
+    const msg = String(e?.message || e || '');
     if (
-        /STORAGE_UPLOAD_FAILED|YTDLP_TIMEOUT|CLIP_TIMEOUT|UPSTREAM|INTERNAL_TRANSIENT|NETWORK|ECONN|EAI_AGAIN/.test(
+        /CLIP_TIMEOUT|STORAGE_NOT_AVAILABLE|timeout|fetch|network|ECONN|EAI_AGAIN|ENOTFOUND|5\d{2}/i.test(
             msg
         )
-    )
+    ) {
         return 'retryable';
-    if (/OUTPUT_EMPTY|OUTPUT_MISSING/.test(msg)) return 'retryable';
+    }
+    if (/OUTPUT_EMPTY|OUTPUT_MISSING/i.test(msg)) return 'fatal';
     return 'fatal';
 }
-export const __retryTest = { classifyError };
-async function handleRetryError(
-    jobId: string,
-    correlationId: string | undefined,
-    e: any
-) {
-    const nowIso = () => new Date().toISOString();
-    const clazz = classifyError(e);
-    if (clazz === 'retryable') {
-        const maxAttempts = Number(readEnv('JOB_MAX_ATTEMPTS') || 3);
-        const updated = await (sharedDb as any)
-            .update(jobsTable)
-            .set({
-                status: sql`CASE WHEN ${jobsTable.attemptCount} + 1 < ${maxAttempts} THEN 'queued' ELSE 'failed' END`,
-                attemptCount: sql`${jobsTable.attemptCount} + 1`,
-                errorCode: 'RETRYABLE_ERROR',
-                errorMessage: String(e),
-                updatedAt: new Date(),
-            })
-            .where(eq(jobsTable.id, jobId))
-            .returning({
-                attemptCount: jobsTable.attemptCount,
-                status: jobsTable.status,
-            });
-        const attempt = updated[0]?.attemptCount ?? 0;
-        metrics.inc('worker.retry_attempts_total', 1, { code: 'retryable' });
-        if (attempt >= maxAttempts) {
-            await events.add({
-                jobId,
-                ts: nowIso(),
-                type: 'failed',
-                data: { correlationId, code: 'RETRIES_EXHAUSTED' },
-            });
-        } else {
-            await events.add({
-                jobId,
-                ts: nowIso(),
-                type: 'requeued:retry',
-                data: { attempt, correlationId },
-            });
+async function handleRetryError(jobId: string, e: unknown) {
+    const maxAttempts = Number(readEnv('JOB_MAX_ATTEMPTS') || 3);
+    const updated = await (sharedDb as any)
+        .update(jobsTable)
+        .set({
+            status: sql`CASE WHEN ${jobsTable.attemptCount} + 1 < ${maxAttempts} THEN 'queued' ELSE 'failed' END`,
+            attemptCount: sql`${jobsTable.attemptCount} + 1`,
+            errorCode: 'RETRYABLE_ERROR',
+            errorMessage: String(e),
+            updatedAt: new Date(),
+        })
+        .where(eq(jobsTable.id, jobId))
+        .returning({ attemptCount: jobsTable.attemptCount });
+    return updated[0]?.attemptCount ?? 0;
+}
+export const __retryInternal = { classifyError, handleRetryError };
+
+// ------------------ Concurrency Control (Req 4) ------------------
+class Semaphore {
+    private queue: (() => void)[] = [];
+    public inflight = 0;
+    constructor(public readonly limit: number) {}
+    capacity() {
+        return Math.max(0, this.limit - this.inflight);
+    }
+    async acquire() {
+        if (this.inflight < this.limit) {
+            this.inflight++;
+            metrics.setGauge('worker.concurrent_jobs', this.inflight);
+            return;
         }
-        return clazz;
-    } else {
-        const err = fromException(e, jobId);
-        metrics.inc('clip.failures');
-        try {
-            await jobs.update(jobId, {
-                status: 'failed',
-                errorCode: (err.error && (err.error as any).code) || 'FATAL',
-                errorMessage:
-                    (err.error && (err.error as any).message) || String(e),
-            });
-            await events.add({
-                jobId,
-                ts: nowIso(),
-                type: 'failed',
-                data: { correlationId },
-            });
-        } catch {}
-        return clazz;
+        await new Promise<void>((res) => this.queue.push(res));
+        this.inflight++;
+        metrics.setGauge('worker.concurrent_jobs', this.inflight);
+    }
+    release() {
+        this.inflight = Math.max(0, this.inflight - 1);
+        metrics.setGauge('worker.concurrent_jobs', this.inflight);
+        const next = this.queue.shift();
+        if (next) next();
     }
 }
-export const __retryInternal = { handleRetryError };
-// expose on global for tests that import worker side-effects
-(globalThis as any).__backpressureTest = __backpressureTest;
 
+// ------------------ Scratch lifecycle helpers (Req 10) ------------------
+async function measureDirSizeBytes(dir: string): Promise<number> {
+    try {
+        const out = await Bun.$`du -sk ${dir} | cut -f1`.text();
+        const kb = Number((out || '').trim() || '0');
+        return isNaN(kb) ? 0 : kb * 1024;
+    } catch {
+        return 0;
+    }
+}
+async function cleanupScratch(dir: string, success: boolean) {
+    if (!dir) return { deleted: false, sizeBytes: 0 } as const;
+    const keepOnSuccess =
+        String(readEnv('KEEP_SCRATCH_ON_SUCCESS') || '0') === '1';
+    if (success) {
+        if (keepOnSuccess) {
+            log.info('scratch kept on success by config', { dir });
+            return {
+                deleted: false,
+                sizeBytes: await measureDirSizeBytes(dir),
+            } as const;
+        }
+        try {
+            await Bun.spawn(['rm', '-rf', dir]).exited;
+            return { deleted: true, sizeBytes: 0 } as const;
+        } catch (e) {
+            log.warn('failed to delete scratch dir', { dir, error: String(e) });
+            return {
+                deleted: false,
+                sizeBytes: await measureDirSizeBytes(dir),
+            } as const;
+        }
+    } else {
+        const size = await measureDirSizeBytes(dir);
+        log.info('scratch preserved after failure', { dir, sizeBytes: size });
+        return { deleted: false, sizeBytes: size } as const;
+    }
+}
+(globalThis as any).__scratchTest = { measureDirSizeBytes, cleanupScratch };
 async function main() {
     await queue.start();
     startHeartbeatLoop();
@@ -299,11 +319,13 @@ async function main() {
         const { jobId, correlationId } = msg;
         await sem.acquire();
         const startedAt = Date.now();
-        const cid = correlationId || jobId; // fallback to jobId if none provided
-        const maxMs = Number(readEnv('CLIP_MAX_RUNTIME_SEC') || 600) * 1000; // default 10m
+        const cid = correlationId || jobId;
+        const maxMs = Number(readEnv('CLIP_MAX_RUNTIME_SEC') || 600) * 1000;
         const nowIso = () => new Date().toISOString();
         let cleanup: (() => Promise<void>) | null = null;
         let outputLocal: string | null = null;
+        let scratchDir: string | null = null;
+        let success = false;
 
         const finish = async (status: 'done' | 'failed', patch: any = {}) => {
             await jobs.update(jobId, { status, ...patch });
@@ -321,8 +343,7 @@ async function main() {
                 log.warn('job not found', { jobId });
                 return;
             }
-            if (job.status === 'done') return; // idempotent
-            // Atomic acquire: only proceed if currently queued. Prevent duplicate starts (Req 6)
+            if (job.status === 'done') return;
             if (job.status === 'queued') {
                 const acquired = await (sharedDb as any)
                     .update(jobsTable)
@@ -342,7 +363,7 @@ async function main() {
                 if (!acquired.length) {
                     metrics.inc('worker.acquire_conflicts_total');
                     log.info('acquire conflict skip', { jobId });
-                    return; // another worker got it
+                    return;
                 }
                 await events.add({
                     jobId,
@@ -352,7 +373,6 @@ async function main() {
                 });
                 log.info('job processing start', { jobId, correlationId: cid });
             } else if (job.status !== 'processing') {
-                // Unexpected state, skip (could be failed/cancelled)
                 log.info('skip job in non-runnable state', {
                     jobId,
                     status: job.status,
@@ -361,8 +381,7 @@ async function main() {
             }
             activeJobs.add(jobId);
 
-            // Resolve source (stage: resolve)
-            let resolveRes = await withStage(metrics, 'resolve', async () => {
+            const resolveRes = await withStage(metrics, 'resolve', async () => {
                 if (job.sourceType === 'upload') {
                     return await resolveUploadSource({
                         id: job.id,
@@ -388,14 +407,10 @@ async function main() {
                 },
             });
 
-            // Perform clip
             const clipStart = Date.now();
-            // Idempotent artifact pre-check
             const finalKey = storageKeys.resultVideo(jobId);
-            let finalLocalPath: string | null = null;
             if (storage) {
                 try {
-                    // Attempt signed URL then head fetch to see if object exists (cheap existence check)
                     const signed = await storage.sign(finalKey, 30);
                     const head = await fetch(signed, { method: 'HEAD' });
                     if (head.ok) {
@@ -408,11 +423,12 @@ async function main() {
                             resultVideoKey: finalKey,
                         });
                         metrics.inc('worker.idempotent_skips_total');
-                        return; // short circuit entire processing
+                        return;
                     }
                 } catch {}
             }
             const tempDir = `/tmp/clipper/${jobId}`;
+            scratchDir = tempDir;
             try {
                 await Bun.spawn(['mkdir', '-p', tempDir]).exited;
             } catch {}
@@ -427,11 +443,9 @@ async function main() {
                         startSec: job.startSec,
                         endSec: job.endSec,
                         jobId,
-                        // override output path if clipper supports? (assumed internal uses jobId)
                     })
             );
             outputLocal = clipPath;
-            // Progress throttling (Req 8) via helper
             const persist = async (pct: number) => {
                 await jobs.update(jobId, { progress: pct });
                 await events.add({
@@ -450,18 +464,16 @@ async function main() {
                 debounceMs: 500,
                 enforce: enforceTimeout,
             });
-            // Integrity validation (size>0) & atomic move into finalOut
+
             try {
                 const f = Bun.file(clipPath);
                 if (!(await f.exists())) throw new Error('OUTPUT_MISSING');
                 const size = (await f.arrayBuffer()).byteLength;
                 if (size <= 0) throw new Error('OUTPUT_EMPTY');
-                // atomic move (rename) to final path
                 try {
                     await Bun.spawn(['mv', clipPath, finalOut]).exited;
                     outputLocal = finalOut;
-                } catch (e) {
-                    // fallback copy
+                } catch {
                     await Bun.write(finalOut, await f.arrayBuffer());
                     outputLocal = finalOut;
                 }
@@ -473,24 +485,18 @@ async function main() {
                 throw e;
             }
 
-            // Upload result
             if (!storage) throw new Error('STORAGE_NOT_AVAILABLE');
-            const key = finalKey; // reuse deterministic key
-            // Retry transient storage failures (network / 5xx) with exponential backoff
+            const key = finalKey;
             const uploadWithRetry = async () => {
                 const maxAttempts = Number(
                     readEnv('STORAGE_UPLOAD_ATTEMPTS') || 4
                 );
                 let attempt = 0;
                 let delay = 200;
-                // simple transient detector
-                const isTransient = (err: any) => {
-                    const msg = String(err?.message || err);
-                    return /timeout|fetch|network|ECONN|EAI_AGAIN|ENOTFOUND|5\d{2}/i.test(
-                        msg
+                const isTransient = (err: any) =>
+                    /timeout|fetch|network|ECONN|EAI_AGAIN|ENOTFOUND|5\d{2}/i.test(
+                        String(err?.message || err)
                     );
-                };
-                // eslint-disable-next-line no-constant-condition
                 while (true) {
                     try {
                         attempt++;
@@ -521,7 +527,6 @@ async function main() {
                 data: { key, correlationId: cid },
             });
 
-            // If subtitles requested and set to auto, create ASR job request (fire-and-forget)
             if (
                 job.withSubtitles &&
                 (job.subtitleLang === 'auto' || !job.subtitleLang)
@@ -551,7 +556,6 @@ async function main() {
                             type: 'asr:error',
                             data: { err: String(e), correlationId: cid },
                         });
-                        // swallow so primary pipeline continues
                     }
                 });
             }
@@ -560,11 +564,11 @@ async function main() {
             metrics.observe('clip.total_ms', Date.now() - startedAt);
             const ms = Date.now() - startedAt;
             log.info('job completed', { jobId, ms, correlationId: cid });
+            success = true;
         } catch (e) {
             const clazz = classifyError(e);
             if (clazz === 'retryable') {
                 const maxAttempts = Number(readEnv('JOB_MAX_ATTEMPTS') || 3);
-                // Atomic increment + status decision
                 const updated = await (sharedDb as any)
                     .update(jobsTable)
                     .set({
@@ -623,22 +627,18 @@ async function main() {
                 } catch {}
             }
         } finally {
-            // Final heartbeat on exit (success or failure) if runtime not exceeded
             activeJobs.delete(jobId);
             try {
-                await jobs.update(jobId, {
-                    lastHeartbeatAt: nowIso(),
-                } as any);
+                await jobs.update(jobId, { lastHeartbeatAt: nowIso() } as any);
             } catch {}
-            // Cleanup source + local output
             if (cleanup) {
                 try {
                     await cleanup();
                 } catch {}
             }
-            if (outputLocal) {
+            if (scratchDir) {
                 try {
-                    await Bun.spawn(['rm', '-f', outputLocal]).exited;
+                    await cleanupScratch(scratchDir, success);
                 } catch {}
             }
             sem.release();
@@ -796,29 +796,4 @@ function startRecoveryScanner() {
 (__test as any).runRecoveryScan = runRecoveryScan;
 (__test as any).startRecoveryScanner = startRecoveryScanner;
 
-// ------------------ Concurrency Control (Req 4) ------------------
-class Semaphore {
-    private queue: (() => void)[] = [];
-    public inflight = 0;
-    constructor(public readonly limit: number) {}
-    capacity() {
-        return Math.max(0, this.limit - this.inflight);
-    }
-    async acquire() {
-        if (this.inflight < this.limit) {
-            this.inflight++;
-            metrics.setGauge('worker.concurrent_jobs', this.inflight);
-            return;
-        }
-        await new Promise<void>((res) => this.queue.push(res));
-        this.inflight++;
-        metrics.setGauge('worker.concurrent_jobs', this.inflight);
-    }
-    release() {
-        this.inflight = Math.max(0, this.inflight - 1);
-        metrics.setGauge('worker.concurrent_jobs', this.inflight);
-        const next = this.queue.shift();
-        if (next) next();
-    }
-}
 (__test as any).Semaphore = Semaphore;
