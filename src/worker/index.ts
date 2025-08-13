@@ -70,9 +70,9 @@ function startHeartbeatLoop(opts: HeartbeatLoopOpts = {}) {
         opts.updater ||
         (async (ids: string[], now: Date) => {
             await (sharedDb as any)
-                .update(jobs as any)
+                .update(jobsTable)
                 .set({ lastHeartbeatAt: now })
-                .where(inArray((jobs as any).id, ids));
+                .where(inArray(jobsTable.id, ids));
         });
     (async () => {
         while (!stopped && !shuttingDown) {
@@ -187,7 +187,7 @@ type RetryClass = 'retryable' | 'fatal';
 function classifyError(e: any): RetryClass {
     const msg = String(e?.message || e || '');
     if (
-        /CLIP_TIMEOUT|STORAGE_NOT_AVAILABLE|timeout|fetch|network|ECONN|EAI_AGAIN|ENOTFOUND|5\d{2}/i.test(
+        /CLIP_TIMEOUT|STORAGE_NOT_AVAILABLE|storage_upload_failed|timeout|fetch|network|ECONN|EAI_AGAIN|ENOTFOUND|5\d{2}/i.test(
             msg
         )
     ) {
@@ -196,22 +196,87 @@ function classifyError(e: any): RetryClass {
     if (/OUTPUT_EMPTY|OUTPUT_MISSING/i.test(msg)) return 'fatal';
     return 'fatal';
 }
-async function handleRetryError(jobId: string, e: unknown) {
-    const maxAttempts = Number(readEnv('JOB_MAX_ATTEMPTS') || 3);
-    const updated = await (sharedDb as any)
-        .update(jobsTable)
-        .set({
-            status: sql`CASE WHEN ${jobsTable.attemptCount} + 1 < ${maxAttempts} THEN 'queued' ELSE 'failed' END`,
-            attemptCount: sql`${jobsTable.attemptCount} + 1`,
-            errorCode: 'RETRYABLE_ERROR',
-            errorMessage: String(e),
-            updatedAt: new Date(),
-        })
-        .where(eq(jobsTable.id, jobId))
-        .returning({ attemptCount: jobsTable.attemptCount });
-    return updated[0]?.attemptCount ?? 0;
+async function handleRetryError(
+    jobId: string,
+    correlationId?: string,
+    err?: unknown
+) {
+    const now = new Date();
+    const clazz = classifyError(err);
+    if (clazz === 'retryable') {
+        const maxAttempts = Number(readEnv('JOB_MAX_ATTEMPTS') || 3);
+        let attemptCountOut = 0;
+        let statusOut = 'queued';
+        await (sharedDb as any).transaction(async (tx: any) => {
+            const updated = await tx
+                .update(jobsTable)
+                .set({
+                    status: sql`CASE WHEN ${jobsTable.attemptCount} + 1 < ${maxAttempts} THEN 'queued'::job_status ELSE 'failed'::job_status END`,
+                    attemptCount: sql`${jobsTable.attemptCount} + 1`,
+                    errorCode: 'RETRYABLE_ERROR',
+                    errorMessage: String(err),
+                    updatedAt: now,
+                })
+                .where(eq(jobsTable.id, jobId))
+                .returning({
+                    attemptCount: jobsTable.attemptCount,
+                    status: jobsTable.status,
+                });
+            const attemptCount = updated[0]?.attemptCount ?? 0;
+            const status = updated[0]?.status ?? 'queued';
+            attemptCountOut = attemptCount;
+            statusOut = status;
+            if (status === 'queued') {
+                await tx.insert(jobEvents).values({
+                    jobId,
+                    ts: now,
+                    type: 'requeued:retry',
+                    data: { attempt: attemptCount, correlationId },
+                });
+            } else {
+                await tx.insert(jobEvents).values({
+                    jobId,
+                    ts: now,
+                    type: 'failed',
+                    data: { correlationId, code: 'RETRIES_EXHAUSTED' },
+                });
+            }
+        });
+        metrics.inc('worker.retry_attempts_total', 1, { code: 'retryable' });
+        return attemptCountOut;
+    }
+    // fatal
+    try {
+        const errObj = fromException(err, jobId);
+        await (sharedDb as any).transaction(async (tx: any) => {
+            await tx
+                .update(jobsTable)
+                .set({
+                    status: sql`'failed'::job_status`,
+                    errorCode:
+                        (errObj.error && (errObj.error as any).code) || 'FATAL',
+                    errorMessage:
+                        (errObj.error && (errObj.error as any).message) ||
+                        String(err),
+                    updatedAt: now,
+                })
+                .where(eq(jobsTable.id, jobId));
+            await tx.insert(jobEvents).values({
+                jobId,
+                ts: now,
+                type: 'failed',
+                data: { correlationId },
+            });
+        });
+    } finally {
+        metrics.inc('clip.failures');
+    }
+    return 0;
 }
 export const __retryInternal = { classifyError, handleRetryError };
+// expose for bun tests
+(globalThis as any).__retryInternal = __retryInternal;
+(globalThis as any).__retryTest = { classifyError };
 
 // ------------------ Concurrency Control (Req 4) ------------------
 class Semaphore {
@@ -348,7 +413,7 @@ async function main() {
                 const acquired = await (sharedDb as any)
                     .update(jobsTable)
                     .set({
-                        status: 'processing',
+                        status: sql`'processing'::job_status`,
                         processingStartedAt: new Date(),
                         lastHeartbeatAt: new Date(),
                         updatedAt: new Date(),
@@ -572,7 +637,7 @@ async function main() {
                 const updated = await (sharedDb as any)
                     .update(jobsTable)
                     .set({
-                        status: sql`CASE WHEN ${jobsTable.attemptCount} + 1 < ${maxAttempts} THEN 'queued' ELSE 'failed' END`,
+                        status: sql`CASE WHEN ${jobsTable.attemptCount} + 1 < ${maxAttempts} THEN 'queued'::job_status ELSE 'failed'::job_status END`,
                         attemptCount: sql`${jobsTable.attemptCount} + 1`,
                         errorCode: 'RETRYABLE_ERROR',
                         errorMessage: String(e),
@@ -707,7 +772,7 @@ async function runRecoveryScan(now = new Date()) {
         requeued = await tx
             .update(jobsTable)
             .set({
-                status: 'queued',
+                status: sql`'queued'::job_status`,
                 attemptCount: sql`${jobsTable.attemptCount} + 1`,
                 updatedAt: now,
             })
@@ -734,7 +799,7 @@ async function runRecoveryScan(now = new Date()) {
         exhausted = await tx
             .update(jobsTable)
             .set({
-                status: 'failed',
+                status: sql`'failed'::job_status`,
                 errorCode: 'RETRIES_EXHAUSTED',
                 errorMessage: 'Lease expired and retry attempts exhausted',
                 updatedAt: now,
