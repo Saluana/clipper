@@ -110,11 +110,12 @@ curl -X POST http://localhost:3000/api/jobs \
 
 ---
 
-## 7. Subtitles (Future / When Enabled)
+## 7. Subtitles
 
 Set `withSubtitles:true` and (optionally) `subtitleLang:"auto"`.
 Events will include `asr:requested` and later job status will gain `resultSrtKey`.
-If `burnSubtitles:true`, a burned variant will upload under `clip.subbed.mp4` (future path).
+If `burnSubtitles:true`, a burned variant will upload under `results/{jobId}/clip.subbed.mp4`.
+The result endpoint will include `burnedVideo` alongside `video` and optional `srt`.
 
 ---
 

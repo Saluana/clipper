@@ -2,6 +2,7 @@ import {
     DrizzleAsrJobsRepo,
     DrizzleJobsRepo,
     DrizzleAsrArtifactsRepo,
+    DrizzleJobEventsRepo,
     createDb,
     storageKeys,
     createSupabaseStorageRepo,
@@ -23,6 +24,7 @@ import {
     fromException,
     withExternal,
 } from '@clipper/common';
+import { InMemoryJobEventsRepo } from '@clipper/data';
 
 export interface AsrWorkerDeps {
     asrJobs?: DrizzleAsrJobsRepo;
@@ -48,6 +50,14 @@ export async function startAsrWorker(deps: AsrWorkerDeps) {
     const clipJobs = deps?.clipJobs ?? new DrizzleJobsRepo(createDb());
     const artifacts =
         deps?.artifacts ?? new DrizzleAsrArtifactsRepo(createDb());
+    const events = (() => {
+        try {
+            return new DrizzleJobEventsRepo(createDb());
+        } catch {
+            // Fallback in tests or when DB is not configured
+            return new InMemoryJobEventsRepo();
+        }
+    })();
     const storage =
         deps?.storage ??
         (() => {
@@ -212,7 +222,7 @@ export async function startAsrWorker(deps: AsrWorkerDeps) {
             }
 
             // Burn-in subtitles if the originating clip requested it
-            if (clipJobId && includeJson) {
+            if (clipJobId) {
                 try {
                     const clip = await clipJobs.get(clipJobId);
                     if (clip?.burnSubtitles && clip?.resultVideoKey) {
@@ -222,31 +232,73 @@ export async function startAsrWorker(deps: AsrWorkerDeps) {
                             clip.resultVideoKey
                         );
                         const srtLocal = await storage.download(srtKey);
-                        // Simple ffmpeg burn-in (assumes ffmpeg installed in env)
+
                         const burnedPath = `/tmp/${clipJobId}.subbed.mp4`;
-                        const ff = Bun.spawn([
-                            'ffmpeg',
-                            '-y',
-                            '-i',
-                            clipLocal,
-                            '-vf',
-                            `subtitles=${srtLocal}:force_style='Fontsize=18'`,
-                            '-c:a',
-                            'copy',
-                            burnedPath,
-                        ]);
-                        await ff.exited;
-                        await storage.upload(
-                            burnedPath,
-                            burnedKey,
-                            'video/mp4'
+
+                        // Emit started event + metric
+                        try {
+                            await events.add({
+                                jobId: clipJobId,
+                                ts: new Date().toISOString(),
+                                type: 'burnin:started',
+                                data: { srtKey, in: clip.resultVideoKey },
+                            });
+                        } catch {}
+                        metrics.inc('burnin.started');
+                        const t0 = Date.now();
+
+                        const burnRes = await burnInSubtitles({
+                            srcVideoPath: clipLocal,
+                            srtPath: srtLocal,
+                            outPath: burnedPath,
+                        });
+                        metrics.observe(
+                            'burnin.duration_ms',
+                            Math.max(0, Date.now() - t0)
                         );
-                        await clipJobs.update(clipJobId, {
-                            resultVideoKey: burnedKey,
-                        } as any);
+
+                        if (!burnRes.ok) {
+                            metrics.inc('burnin.failed');
+                            log.warn('burn-in failed (non-fatal)', {
+                                asrJobId,
+                                clipJobId,
+                                stderr: burnRes.stderr?.slice(0, 500),
+                            });
+                            try {
+                                await events.add({
+                                    jobId: clipJobId,
+                                    ts: new Date().toISOString(),
+                                    type: 'burnin:failed',
+                                    data: {
+                                        srtKey,
+                                        in: clip.resultVideoKey,
+                                        err: burnRes.stderr?.slice(0, 500),
+                                    },
+                                });
+                            } catch {}
+                        } else {
+                            // Upload and persist burned key without overwriting original
+                            await storage.upload(
+                                burnedPath,
+                                burnedKey,
+                                'video/mp4'
+                            );
+                            await clipJobs.update(clipJobId, {
+                                resultVideoBurnedKey: burnedKey,
+                            } as any);
+                            metrics.inc('burnin.completed');
+                            try {
+                                await events.add({
+                                    jobId: clipJobId,
+                                    ts: new Date().toISOString(),
+                                    type: 'burnin:completed',
+                                    data: { key: burnedKey },
+                                });
+                            } catch {}
+                        }
                     }
                 } catch (e) {
-                    log.warn('burn-in failed (non-fatal)', {
+                    log.warn('burn-in stage error (non-fatal)', {
                         asrJobId,
                         e: String(e),
                     });
@@ -273,3 +325,60 @@ export async function startAsrWorker(deps: AsrWorkerDeps) {
         }
     });
 }
+
+// --- Internal helpers ---
+
+function escapeForSubtitlesFilter(path: string): string {
+    return path
+        .replace(/\\/g, '\\\\')
+        .replace(/:/g, '\\:')
+        .replace(/'/g, "\\'")
+        .replace(/,/g, '\\,')
+        .replace(/ /g, '\\ ');
+}
+
+async function burnInSubtitles(args: {
+    srcVideoPath: string;
+    srtPath: string;
+    outPath: string;
+}): Promise<{ ok: true } | { ok: false; stderr?: string }> {
+    const escapedSrt = escapeForSubtitlesFilter(args.srtPath);
+    const ffArgs = [
+        'ffmpeg',
+        '-y',
+        '-i',
+        args.srcVideoPath,
+        '-vf',
+        `subtitles=${escapedSrt}:force_style='FontSize=18,Outline=1,Shadow=0,MarginV=18'`,
+        '-c:v',
+        'libx264',
+        '-preset',
+        'veryfast',
+        '-pix_fmt',
+        'yuv420p',
+        '-c:a',
+        'copy',
+        args.outPath,
+    ];
+    const proc = Bun.spawn(ffArgs, { stderr: 'pipe' });
+    let stderr = '';
+    try {
+        if (proc.stderr) {
+            for await (const c of proc.stderr) {
+                stderr += new TextDecoder().decode(c);
+                if (stderr.length > 4000) {
+                    stderr = stderr.slice(-4000);
+                }
+            }
+        }
+    } catch {}
+    const code = await proc.exited;
+    if (code === 0) return { ok: true };
+    return { ok: false, stderr };
+}
+
+// Export test hooks without polluting public API
+export const __test = {
+    escapeForSubtitlesFilter,
+    burnInSubtitles,
+};

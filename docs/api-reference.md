@@ -77,7 +77,8 @@ GET `/api/jobs/{id}`
     "id": "uuid",
     "status": "queued" | "processing" | "done" | "failed",
     "progress": 0-100,
-    "resultVideoKey": "results/<id>/clip.mp4"?,
+  "resultVideoKey": "results/<id>/clip.mp4"?,
+  "resultVideoBurnedKey": "results/<id>/clip.subbed.mp4"?,
     "resultSrtKey": "results/<id>/clip.srt"?,
     "expiresAt": "ISO"?
   },
@@ -110,6 +111,7 @@ GET `/api/jobs/{id}/result`
   "result": {
     "id": "uuid",
     "video": { "key": "results/<id>/clip.mp4", "url": "signedUrl" },
+    "burnedVideo": { "key": "results/<id>/clip.subbed.mp4", "url": "signedUrl" }?,
     "srt": { "key": "results/<id>/clip.srt", "url": "signedUrl" }?
   }
 }
@@ -156,7 +158,7 @@ Heartbeats update `lastHeartbeatAt` internally.
 
 ```
 results/{jobId}/clip.mp4
-results/{jobId}/clip.subbed.mp4 (future)
+results/{jobId}/clip.subbed.mp4
 results/{jobId}/clip.srt (ASR)
 ```
 
