@@ -304,6 +304,9 @@ class Semaphore {
     }
 }
 
+// Global reference for graceful shutdown wait logic
+let semGlobal: { inflight: number } | null = null;
+
 // ------------------ Scratch lifecycle helpers (Req 10) ------------------
 async function measureDirSizeBytes(dir: string): Promise<number> {
     try {
@@ -348,6 +351,8 @@ async function main() {
     startHeartbeatLoop();
     const maxConc = Number(readEnv('WORKER_MAX_CONCURRENCY') || 4);
     const sem = new Semaphore(maxConc);
+    semGlobal = sem;
+    (globalThis as any).__workerSem = sem;
     const highDepth = Number(readEnv('WORKER_QUEUE_HIGH_WATERMARK') || 500);
     const highCpu = Number(readEnv('WORKER_CPU_LOAD_HIGH') || os.cpus().length);
     const pauseMs = Number(readEnv('WORKER_BACKPRESSURE_PAUSE_MS') || 3000);
@@ -714,7 +719,7 @@ async function main() {
         log.info('using adaptive queue consumption (capacity-aware prefetch)');
         (queue as any)
             .adaptiveConsume(handler, () =>
-                backpressure.isPaused() ? 0 : sem.capacity()
+                shuttingDown || backpressure.isPaused() ? 0 : sem.capacity()
             )
             .catch((e: any) =>
                 log.error('adaptiveConsume loop crashed', { error: String(e) })
@@ -722,6 +727,33 @@ async function main() {
     } else {
         await (queue as any).consume(handler);
     }
+}
+
+// Wait for active jobs to finish with a timeout and emit aborted events if needed
+async function waitForActiveJobsToFinish(
+    timeoutMs: number
+): Promise<{ timedOut: boolean; aborted: string[] }> {
+    const start = Date.now();
+    const pollMs = 100;
+    const getInflight = () =>
+        semGlobal?.inflight ?? (globalThis as any).__workerSem?.inflight ?? 0;
+    while (getInflight() > 0 && Date.now() - start < timeoutMs) {
+        // eslint-disable-next-line no-await-in-loop
+        await new Promise((r) => setTimeout(r, pollMs));
+    }
+    if (getInflight() === 0) return { timedOut: false, aborted: [] };
+    const aborted = Array.from(activeJobs);
+    for (const id of aborted) {
+        try {
+            await events.add({
+                jobId: id,
+                ts: new Date().toISOString(),
+                type: 'aborted:shutdown',
+                data: {},
+            });
+        } catch {}
+    }
+    return { timedOut: true, aborted };
 }
 
 if (import.meta.main) {
@@ -737,8 +769,19 @@ if (import.meta.main) {
         shuttingDown = true;
         log.info('worker stopping');
         await queue.shutdown();
-        // allow heartbeat loop to exit gracefully
-        setTimeout(() => process.exit(0), 500);
+        const timeoutMs = Number(
+            readEnv('WORKER_SHUTDOWN_TIMEOUT_MS') || 15000
+        );
+        const { timedOut, aborted } = await waitForActiveJobsToFinish(
+            timeoutMs
+        );
+        if (timedOut && aborted.length) {
+            log.warn('shutdown timeout; jobs aborted', {
+                count: aborted.length,
+                aborted,
+            });
+        }
+        process.exit(0);
     };
     process.on('SIGINT', stop);
     process.on('SIGTERM', stop);
@@ -751,6 +794,17 @@ export const __test = {
     startHeartbeatLoop,
     metrics,
     // recovery test hooks will be appended below after definition
+    // graceful shutdown test hooks
+    _internal: {
+        get inflight() {
+            return (globalThis as any).__workerSem?.inflight ?? 0;
+        },
+        setInflight(n: number) {
+            (globalThis as any).__workerSem = { inflight: n };
+            semGlobal = (globalThis as any).__workerSem;
+        },
+        waitForActiveJobsToFinish,
+    },
 };
 
 // ------------------ Recovery Scanner (Req 3) ------------------

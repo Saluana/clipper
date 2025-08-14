@@ -55,14 +55,14 @@ artifact_id: a7e5c1d2-3b4f-45c6-8d17-9f1e2d3c4b5a
 
 ## 10. Scratch Management
 
--   [ ] 10.1 Delete scratch on success (Req 9)
--   [ ] 10.2 Preserve on failure with size log (Req 9)
+-   [x] 10.1 Delete scratch on success (Req 9)
+-   [x] 10.2 Preserve on failure with size log (Req 9)
 
 ## 11. Graceful Shutdown
 
--   [ ] 11.1 SIGTERM handler: stop dequeue (Req 10)
--   [ ] 11.2 Wait for active jobs with timeout (Req 10)
--   [ ] 11.3 Abort events for timed out jobs (Req 10)
+-   [x] 11.1 SIGTERM handler: stop dequeue (Req 10)
+-   [x] 11.2 Wait for active jobs with timeout (Req 10)
+-   [x] 11.3 Abort events for timed out jobs (Req 10)
 
 ## 12. Observability Metrics
 
