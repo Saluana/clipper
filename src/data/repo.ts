@@ -14,6 +14,7 @@ export interface JobRow {
     burnSubtitles: boolean;
     subtitleLang?: string;
     resultVideoKey?: string;
+    resultVideoBurnedKey?: string;
     resultSrtKey?: string;
     errorCode?: string;
     errorMessage?: string;

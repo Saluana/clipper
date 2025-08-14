@@ -17,6 +17,7 @@ export interface JobRecord {
     status: JobStatus;
     progress: number; // 0..100
     resultVideoKey?: string;
+    resultVideoBurnedKey?: string;
     resultSrtKey?: string;
     error?: string;
     expiresAt: string;

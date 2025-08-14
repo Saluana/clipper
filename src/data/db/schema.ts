@@ -42,6 +42,7 @@ export const jobs = pgTable(
         burnSubtitles: boolean('burn_subtitles').notNull().default(false),
         subtitleLang: text('subtitle_lang'),
         resultVideoKey: text('result_video_key'),
+        resultVideoBurnedKey: text('result_video_burned_key'),
         resultSrtKey: text('result_srt_key'),
         errorCode: text('error_code'),
         errorMessage: text('error_message'),

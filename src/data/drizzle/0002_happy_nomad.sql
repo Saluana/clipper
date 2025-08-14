@@ -1,0 +1,2 @@
+-- Empty migration placeholder: previous generate produced objects that already exist.
+-- Keeping this file to maintain incremental numbering. No-op.

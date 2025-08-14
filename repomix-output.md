@@ -110,6 +110,7 @@ src/
       0000_tense_yellow_claw.sql
       0001_asr_jobs.sql
       0002_add_last_heartbeat.sql
+      0003_attempt_and_processing.sql
     scripts/
       admin-jobs.ts
       backfill-expires.ts
@@ -2528,106 +2529,6 @@ Harden worker execution against crashes, duplicates, and partial progress loss b
 -   Attempt exhaustion path yields RETRIES_EXHAUSTED.
 ````
 
-## File: planning/worker-resilience/tasks.md
-````markdown
-# Worker Runtime Resilience Tasks
-
-artifact_id: a7e5c1d2-3b4f-45c6-8d17-9f1e2d3c4b5a
-
-## 1. Schema Migration
-
--   [ ] 1.1 Add last_heartbeat_at, attempt_count, processing_started_at columns (Req 1/2/7)
--   [ ] 1.2 Add index (status, last_heartbeat_at) (Req 2)
-
-## 2. Heartbeat Implementation
-
--   [ ] 2.1 Track active job IDs list (Req 1)
--   [ ] 2.2 Batch update heartbeat loop (Req 1)
--   [ ] 2.3 Warning log on >3 consecutive failures (Req 1)
-
-## 3. Recovery Scanner
-
--   [ ] 3.1 Implement recovery scan SQL (Req 2)
--   [ ] 3.2 Emit requeued:stale events (Req 2)
--   [ ] 3.3 Attempt limit fail path RETRIES_EXHAUSTED (Req 7)
-
-## 4. Concurrency Control
-
--   [ ] 4.1 Implement semaphore (Req 3)
--   [ ] 4.2 Prefetch logic constrained by available slots (Req 3)
--   [ ] 4.3 Gauge worker.concurrent_jobs (Req 3)
-
-## 5. Backpressure Pause
-
--   [ ] 5.1 Monitor queue depth + CPU load (Req 4)
--   [ ] 5.2 Pause dequeuing under high watermark (Req 4)
--   [ ] 5.3 Metric worker.pauses_total (Req 4)
-
-## 6. Idempotent Output Handling
-
--   [ ] 6.1 Implement temp -> atomic move pattern (Req 5)
--   [ ] 6.2 Pre-check existing artifact skip path (Req 5)
--   [ ] 6.3 Integrity validation (size > 0) (Req 5)
-
-## 7. Duplicate Suppression
-
--   [ ] 7.1 Atomic queued->processing update (Req 6)
--   [ ] 7.2 Track acquire conflicts metric (Req 6)
-
-## 8. Retry Classification
-
--   [ ] 8.1 Implement classify(err) (Req 7)
--   [ ] 8.2 Update attempt_count on retry (Req 7)
--   [ ] 8.3 Fail fast on fatal (Req 7)
-
-## 9. Progress Throttling
-
--   [ ] 9.1 Implement delta/time based throttler (Req 8)
--   [ ] 9.2 Persist last progress percent (Req 8)
-
-## 10. Scratch Management
-
--   [ ] 10.1 Delete scratch on success (Req 9)
--   [ ] 10.2 Preserve on failure with size log (Req 9)
-
-## 11. Graceful Shutdown
-
--   [ ] 11.1 SIGTERM handler: stop dequeue (Req 10)
--   [ ] 11.2 Wait for active jobs with timeout (Req 10)
--   [ ] 11.3 Abort events for timed out jobs (Req 10)
-
-## 12. Observability Metrics
-
--   [ ] 12.1 heartbeats_total, heartbeat_failures_total (Req 11)
--   [ ] 12.2 recovered_jobs_total{reason} (Req 11)
--   [ ] 12.3 retry_attempts_total{code} (Req 11)
--   [ ] 12.4 duplicate_skips_total & acquire_conflicts_total (Req 6/11)
-
-## 13. Event Timeline Consistency
-
--   [ ] 13.1 Ensure event ordering logic (Req 12)
--   [ ] 13.2 Test normal + recovery sequences (Req 12)
-
-## 14. Testing & Simulation
-
--   [ ] 14.1 Integration test simulated crash (Req 2)
--   [ ] 14.2 Concurrency limit test (Req 3)
--   [ ] 14.3 Retry exhaustion test (Req 7)
--   [ ] 14.4 Idempotent artifact skip test (Req 5)
-
-## 15. Rollout
-
--   [ ] 15.1 Deploy migration only
--   [ ] 15.2 Enable heartbeat & logging (observe only)
--   [ ] 15.3 Enable recovery scanner (low frequency)
--   [ ] 15.4 Increase scan frequency & enable attempt limits
-
-## 16. Future Enhancements
-
--   [ ] 16.1 Dynamic lease timeout based on clip duration
--   [ ] 16.2 Per-stage adaptive concurrency
-````
-
 ## File: planning/design.md
 ````markdown
 # Design
@@ -4424,6 +4325,15 @@ export interface JobRecord {
 -- Add last_heartbeat_at column to jobs
 ALTER TABLE "jobs" ADD COLUMN IF NOT EXISTS "last_heartbeat_at" timestamp with time zone;
 -- Index could be added later if querying stale heartbeats frequently
+````
+
+## File: src/data/drizzle/0003_attempt_and_processing.sql
+````sql
+-- Migration: add attempt_count & processing_started_at + index on (status,last_heartbeat_at)
+ALTER TABLE "jobs" ADD COLUMN IF NOT EXISTS "attempt_count" integer NOT NULL DEFAULT 0;
+ALTER TABLE "jobs" ADD COLUMN IF NOT EXISTS "processing_started_at" timestamp with time zone;
+-- Create index to accelerate stale heartbeat recovery scans
+CREATE INDEX IF NOT EXISTS "idx_jobs_status_last_hb" ON "jobs" USING btree ("status","last_heartbeat_at");
 ````
 
 ## File: src/data/scripts/admin-jobs.ts
@@ -6323,249 +6233,6 @@ export async function* parseFfmpegProgress(
 }
 ````
 
-## File: src/queue/pgboss.ts
-````typescript
-import PgBoss from 'pg-boss';
-import { readEnv, readIntEnv } from '@clipper/common';
-import type { QueueAdapter, QueueMessage, QueuePriority } from './types';
-import { QUEUE_TOPIC_CLIPS } from './types';
-
-const priorityMap: Record<QueuePriority, number> = {
-    fast: 10,
-    normal: 50,
-    bulk: 90,
-};
-
-export class PgBossQueueAdapter implements QueueAdapter {
-    private boss?: PgBoss;
-    private topic: string;
-    private dlqTopic: string;
-    private metrics = {
-        publishes: 0,
-        claims: 0,
-        completes: 0,
-        retries: 0,
-        errors: 0,
-        dlq: 0,
-    };
-
-    constructor(
-        private readonly opts: {
-            connectionString: string;
-            schema?: string;
-            queueName?: string;
-            concurrency?: number;
-            visibilityTimeoutSec?: number;
-            maxAttempts?: number;
-        }
-    ) {
-        this.topic =
-            opts.queueName ?? readEnv('QUEUE_NAME') ?? QUEUE_TOPIC_CLIPS;
-        this.dlqTopic = `${this.topic}.dlq`;
-    }
-
-    async start() {
-        if (this.boss) return;
-        this.boss = new PgBoss({
-            connectionString: this.opts.connectionString,
-            schema: this.opts.schema ?? readEnv('PG_BOSS_SCHEMA') ?? 'pgboss',
-        });
-        this.boss.on('error', (err) => {
-            // Increment error metric on boss-level errors
-            this.metrics.errors++;
-            // Avoid importing logger to keep package lean; rely on caller logs
-            console.error('[pgboss] error', err);
-        });
-        await this.boss.start();
-        // Ensure queues exist with basic policies
-        const expireInSeconds = Math.max(
-            1,
-            Math.floor(
-                Number(
-                    readIntEnv(
-                        'QUEUE_VISIBILITY_SEC',
-                        this.opts.visibilityTimeoutSec ?? 90
-                    )
-                )
-            )
-        );
-        const retryLimit = Number(
-            readIntEnv('QUEUE_MAX_ATTEMPTS', this.opts.maxAttempts ?? 3)
-        );
-        try {
-            await this.boss.createQueue(this.topic, {
-                name: this.topic,
-                expireInSeconds,
-                retryLimit,
-                deadLetter: this.dlqTopic,
-            });
-        } catch (err) {
-            // Intentionally ignore errors if the queue already exists
-            // console.error('Error creating queue:', err);
-        }
-        try {
-            await this.boss.createQueue(this.dlqTopic, {
-                name: this.dlqTopic,
-                expireInSeconds: expireInSeconds * 2,
-                retryLimit: 0,
-            });
-        } catch {}
-    }
-
-    async publish(
-        msg: QueueMessage,
-        opts?: { timeoutSec?: number }
-    ): Promise<void> {
-        if (!this.boss) await this.start();
-        const expireInSeconds = Math.max(
-            1,
-            Math.floor(
-                opts?.timeoutSec ??
-                    Number(
-                        readIntEnv(
-                            'QUEUE_VISIBILITY_SEC',
-                            this.opts.visibilityTimeoutSec ?? 90
-                        )
-                    )
-            )
-        );
-        const attemptLimit = Number(
-            readIntEnv('QUEUE_MAX_ATTEMPTS', this.opts.maxAttempts ?? 3)
-        );
-        const priority = priorityMap[msg.priority ?? 'normal'];
-        await this.boss!.send(this.topic, msg as object, {
-            priority,
-            expireInSeconds,
-            retryLimit: attemptLimit,
-            retryBackoff: true,
-            deadLetter: this.dlqTopic,
-        });
-        this.metrics.publishes++;
-    }
-
-    async consume(
-        handler: (msg: QueueMessage) => Promise<void>
-    ): Promise<void> {
-        if (!this.boss) await this.start();
-        const batchSize = Number(
-            readIntEnv('QUEUE_CONCURRENCY', this.opts.concurrency ?? 4)
-        );
-        await this.boss!.work<QueueMessage>(
-            this.topic,
-            { batchSize },
-            async (jobs) => {
-                for (const job of jobs) {
-                    this.metrics.claims++;
-                    try {
-                        await handler(job.data as QueueMessage);
-                        this.metrics.completes++;
-                    } catch (err) {
-                        // A thrown error triggers retry/DLQ in pg-boss
-                        this.metrics.retries++;
-                        this.metrics.errors++;
-                        throw err;
-                    }
-                }
-                // Throw inside handler to trigger retry; returning resolves completions
-            }
-        );
-    }
-
-    // Optional multi-topic methods (for subsystems like ASR)
-    async publishTo(
-        topic: string,
-        msg: object,
-        opts?: { timeoutSec?: number }
-    ) {
-        if (!this.boss) await this.start();
-        const expireInSeconds = Math.max(
-            1,
-            Math.floor(
-                opts?.timeoutSec ??
-                    Number(
-                        readIntEnv(
-                            'QUEUE_VISIBILITY_SEC',
-                            this.opts.visibilityTimeoutSec ?? 90
-                        )
-                    )
-            )
-        );
-        const retryLimit = Number(
-            readIntEnv('QUEUE_MAX_ATTEMPTS', this.opts.maxAttempts ?? 3)
-        );
-        const dlq = `${topic}.dlq`;
-        try {
-            await this.boss!.createQueue(topic, {
-                name: topic,
-                expireInSeconds,
-                retryLimit,
-                deadLetter: dlq,
-            });
-        } catch {}
-        try {
-            await this.boss!.createQueue(dlq, {
-                name: dlq,
-                expireInSeconds: expireInSeconds * 2,
-                retryLimit: 0,
-            });
-        } catch {}
-        await this.boss!.send(topic, msg, {
-            expireInSeconds,
-            retryLimit,
-            retryBackoff: true,
-            deadLetter: dlq,
-        });
-        this.metrics.publishes++;
-    }
-
-    async consumeFrom(topic: string, handler: (msg: any) => Promise<void>) {
-        if (!this.boss) await this.start();
-        const batchSize = Number(
-            readIntEnv('QUEUE_CONCURRENCY', this.opts.concurrency ?? 4)
-        );
-        await this.boss!.work<any>(topic, { batchSize }, async (jobs) => {
-            for (const job of jobs) {
-                this.metrics.claims++;
-                try {
-                    await handler(job.data as any);
-                    this.metrics.completes++;
-                } catch (err) {
-                    this.metrics.retries++;
-                    this.metrics.errors++;
-                    throw err;
-                }
-            }
-        });
-    }
-
-    async shutdown(): Promise<void> {
-        if (this.boss) {
-            await this.boss.stop();
-            this.boss = undefined;
-        }
-    }
-
-    async health(): Promise<{ ok: boolean; error?: string }> {
-        try {
-            if (!this.boss) await this.start();
-            // Simple ping by fetching the state; if it throws, not healthy
-            // getQueue takes a name and returns settings; use topic
-            await this.boss!.getQueue(this.topic);
-            return { ok: true };
-        } catch (e) {
-            return {
-                ok: false,
-                error: e instanceof Error ? e.message : String(e),
-            };
-        }
-    }
-
-    getMetrics() {
-        return { ...this.metrics };
-    }
-}
-````
-
 ## File: src/queue/types.ts
 ````typescript
 export type QueuePriority = 'fast' | 'normal' | 'bulk';
@@ -6727,156 +6394,6 @@ export * from './metrics';
 export * from './redact';
 export * from './external';
 export * from './resource-sampler';
-````
-
-## File: src/data/db/schema.ts
-````typescript
-import {
-    pgEnum,
-    pgTable,
-    text,
-    timestamp,
-    uuid,
-    integer,
-    boolean,
-    jsonb,
-    index,
-    primaryKey,
-} from 'drizzle-orm/pg-core';
-
-// Enums
-export const jobStatus = pgEnum('job_status', [
-    'queued',
-    'processing',
-    'done',
-    'failed',
-]);
-export const sourceType = pgEnum('source_type', ['upload', 'youtube']);
-export const asrJobStatus = pgEnum('asr_job_status', [
-    'queued',
-    'processing',
-    'done',
-    'failed',
-]);
-
-// jobs table
-export const jobs = pgTable(
-    'jobs',
-    {
-        id: uuid('id').primaryKey(),
-        status: jobStatus('status').notNull().default('queued'),
-        progress: integer('progress').notNull().default(0),
-        sourceType: sourceType('source_type').notNull(),
-        sourceKey: text('source_key'),
-        sourceUrl: text('source_url'),
-        startSec: integer('start_sec').notNull(),
-        endSec: integer('end_sec').notNull(),
-        withSubtitles: boolean('with_subtitles').notNull().default(false),
-        burnSubtitles: boolean('burn_subtitles').notNull().default(false),
-        subtitleLang: text('subtitle_lang'),
-        resultVideoKey: text('result_video_key'),
-        resultSrtKey: text('result_srt_key'),
-        errorCode: text('error_code'),
-        errorMessage: text('error_message'),
-        createdAt: timestamp('created_at', { withTimezone: true })
-            .notNull()
-            .defaultNow(),
-        updatedAt: timestamp('updated_at', { withTimezone: true })
-            .notNull()
-            .defaultNow(),
-        expiresAt: timestamp('expires_at', { withTimezone: true }),
-        lastHeartbeatAt: timestamp('last_heartbeat_at', { withTimezone: true }),
-    },
-    (t) => [
-        index('idx_jobs_status_created_at').on(t.status, t.createdAt),
-        index('idx_jobs_expires_at').on(t.expiresAt),
-    ]
-);
-
-// job_events table
-export const jobEvents = pgTable(
-    'job_events',
-    {
-        jobId: uuid('job_id')
-            .notNull()
-            .references(() => jobs.id, { onDelete: 'cascade' }),
-        ts: timestamp('ts', { withTimezone: true }).notNull().defaultNow(),
-        type: text('type').notNull(),
-        data: jsonb('data'),
-    },
-    (t) => [index('idx_job_events_job_id_ts').on(t.jobId, t.ts)]
-);
-
-// api_keys table (optional)
-export const apiKeys = pgTable('api_keys', {
-    id: uuid('id').primaryKey(),
-    name: text('name').notNull(),
-    keyHash: text('key_hash').notNull(),
-    revoked: boolean('revoked').notNull().default(false),
-    createdAt: timestamp('created_at', { withTimezone: true })
-        .notNull()
-        .defaultNow(),
-    lastUsedAt: timestamp('last_used_at', { withTimezone: true }),
-});
-
-// ASR tables
-export const asrJobs = pgTable(
-    'asr_jobs',
-    {
-        id: uuid('id').primaryKey(),
-        clipJobId: uuid('clip_job_id').references(() => jobs.id),
-        sourceType: text('source_type').notNull(), // upload | youtube | internal
-        sourceKey: text('source_key'),
-        mediaHash: text('media_hash').notNull(),
-        modelVersion: text('model_version').notNull(),
-        languageHint: text('language_hint'),
-        detectedLanguage: text('detected_language'),
-        durationSec: integer('duration_sec'),
-        status: asrJobStatus('status').notNull().default('queued'),
-        errorCode: text('error_code'),
-        errorMessage: text('error_message'),
-        createdAt: timestamp('created_at', { withTimezone: true })
-            .notNull()
-            .defaultNow(),
-        updatedAt: timestamp('updated_at', { withTimezone: true })
-            .notNull()
-            .defaultNow(),
-        completedAt: timestamp('completed_at', { withTimezone: true }),
-        expiresAt: timestamp('expires_at', { withTimezone: true }),
-    },
-    (t) => [
-        index('idx_asr_jobs_status_created_at').on(t.status, t.createdAt),
-        index('idx_asr_jobs_expires_at').on(t.expiresAt),
-        // Unique partial index handled via raw SQL migration (media_hash, model_version) where status='done'
-    ]
-);
-
-export const asrArtifacts = pgTable(
-    'asr_artifacts',
-    {
-        asrJobId: uuid('asr_job_id')
-            .notNull()
-            .references(() => asrJobs.id, { onDelete: 'cascade' }),
-        kind: text('kind').notNull(), // srt | text | json
-        storageKey: text('storage_key').notNull(),
-        sizeBytes: integer('size_bytes'),
-        createdAt: timestamp('created_at', { withTimezone: true })
-            .notNull()
-            .defaultNow(),
-    },
-    (t) => [primaryKey({ columns: [t.asrJobId, t.kind] })]
-);
-
-export type Job = typeof jobs.$inferSelect;
-export type NewJob = typeof jobs.$inferInsert;
-export type JobEvent = typeof jobEvents.$inferSelect;
-export type NewJobEvent = typeof jobEvents.$inferInsert;
-export type ApiKey = typeof apiKeys.$inferSelect;
-export type NewApiKey = typeof apiKeys.$inferInsert;
-export type AsrJob = typeof asrJobs.$inferSelect;
-export type NewAsrJob = typeof asrJobs.$inferInsert;
-export type AsrArtifact = typeof asrArtifacts.$inferSelect;
-export type NewAsrArtifact = typeof asrArtifacts.$inferInsert;
 ````
 
 ## File: src/data/cleanup.ts
@@ -7495,6 +7012,316 @@ export class BunClipper implements Clipper {
         // Both failed
         const msg = `ffmpeg failed (copy code=${copyResult.attempt.code}, reencode code=${reResult.attempt.code})`;
         throw new ServiceError('BAD_REQUEST', msg); // using existing code enum; adjust if more codes added later
+    }
+}
+````
+
+## File: src/queue/pgboss.ts
+````typescript
+import PgBoss from 'pg-boss';
+import { readEnv, readIntEnv } from '@clipper/common';
+import type { QueueAdapter, QueueMessage, QueuePriority } from './types';
+import { QUEUE_TOPIC_CLIPS } from './types';
+
+const priorityMap: Record<QueuePriority, number> = {
+    fast: 10,
+    normal: 50,
+    bulk: 90,
+};
+
+export class PgBossQueueAdapter implements QueueAdapter {
+    private boss?: PgBoss;
+    private topic: string;
+    private dlqTopic: string;
+    private metrics = {
+        publishes: 0,
+        claims: 0,
+        completes: 0,
+        retries: 0,
+        errors: 0,
+        dlq: 0,
+    };
+
+    constructor(
+        private readonly opts: {
+            connectionString: string;
+            schema?: string;
+            queueName?: string;
+            concurrency?: number;
+            visibilityTimeoutSec?: number;
+            maxAttempts?: number;
+        }
+    ) {
+        this.topic =
+            opts.queueName ?? readEnv('QUEUE_NAME') ?? QUEUE_TOPIC_CLIPS;
+        this.dlqTopic = `${this.topic}.dlq`;
+    }
+
+    async start() {
+        if (this.boss) return;
+        this.boss = new PgBoss({
+            connectionString: this.opts.connectionString,
+            schema: this.opts.schema ?? readEnv('PG_BOSS_SCHEMA') ?? 'pgboss',
+        });
+        this.boss.on('error', (err) => {
+            // Increment error metric on boss-level errors
+            this.metrics.errors++;
+            // Avoid importing logger to keep package lean; rely on caller logs
+            console.error('[pgboss] error', err);
+        });
+        await this.boss.start();
+        // Ensure queues exist with basic policies
+        const expireInSeconds = Math.max(
+            1,
+            Math.floor(
+                Number(
+                    readIntEnv(
+                        'QUEUE_VISIBILITY_SEC',
+                        this.opts.visibilityTimeoutSec ?? 90
+                    )
+                )
+            )
+        );
+        const retryLimit = Number(
+            readIntEnv('QUEUE_MAX_ATTEMPTS', this.opts.maxAttempts ?? 3)
+        );
+        try {
+            await this.boss.createQueue(this.topic, {
+                name: this.topic,
+                expireInSeconds,
+                retryLimit,
+                deadLetter: this.dlqTopic,
+            });
+        } catch (err) {
+            // Intentionally ignore errors if the queue already exists
+            // console.error('Error creating queue:', err);
+        }
+        try {
+            await this.boss.createQueue(this.dlqTopic, {
+                name: this.dlqTopic,
+                expireInSeconds: expireInSeconds * 2,
+                retryLimit: 0,
+            });
+        } catch {}
+    }
+
+    async publish(
+        msg: QueueMessage,
+        opts?: { timeoutSec?: number }
+    ): Promise<void> {
+        if (!this.boss) await this.start();
+        const expireInSeconds = Math.max(
+            1,
+            Math.floor(
+                opts?.timeoutSec ??
+                    Number(
+                        readIntEnv(
+                            'QUEUE_VISIBILITY_SEC',
+                            this.opts.visibilityTimeoutSec ?? 90
+                        )
+                    )
+            )
+        );
+        const attemptLimit = Number(
+            readIntEnv('QUEUE_MAX_ATTEMPTS', this.opts.maxAttempts ?? 3)
+        );
+        const priority = priorityMap[msg.priority ?? 'normal'];
+        await this.boss!.send(this.topic, msg as object, {
+            priority,
+            expireInSeconds,
+            retryLimit: attemptLimit,
+            retryBackoff: true,
+            deadLetter: this.dlqTopic,
+        });
+        this.metrics.publishes++;
+    }
+
+    async consume(
+        handler: (msg: QueueMessage) => Promise<void>
+    ): Promise<void> {
+        if (!this.boss) await this.start();
+        const batchSize = Number(
+            readIntEnv('QUEUE_CONCURRENCY', this.opts.concurrency ?? 4)
+        );
+        await this.boss!.work<QueueMessage>(
+            this.topic,
+            { batchSize },
+            async (jobs) => {
+                for (const job of jobs) {
+                    this.metrics.claims++;
+                    try {
+                        await handler(job.data as QueueMessage);
+                        this.metrics.completes++;
+                    } catch (err) {
+                        // A thrown error triggers retry/DLQ in pg-boss
+                        this.metrics.retries++;
+                        this.metrics.errors++;
+                        throw err;
+                    }
+                }
+                // Throw inside handler to trigger retry; returning resolves completions
+            }
+        );
+    }
+
+    /**
+     * Adaptive consumption loop that only fetches jobs when capacityProvider() > 0.
+     * Avoids over-claiming jobs whose work would just sit waiting on a local semaphore.
+     * Optional optimization (enabled by caller explicitly using this API).
+     */
+    async adaptiveConsume(
+        handler: (msg: QueueMessage) => Promise<void>,
+        capacityProvider: () => number,
+        opts?: { idleDelayMs?: number; maxBatch?: number }
+    ) {
+        if (!this.boss) await this.start();
+        const idleDelayMs = opts?.idleDelayMs ?? 250;
+        const maxConfigured = Number(
+            readIntEnv('QUEUE_CONCURRENCY', this.opts.concurrency ?? 4)
+        );
+        const maxBatch = opts?.maxBatch ?? maxConfigured;
+        // Loop forever; caller governs process lifetime.
+        // We intentionally do not use boss.work here so we control fetch timing.
+        // eslint-disable-next-line no-constant-condition
+        while (true) {
+            try {
+                const cap = capacityProvider();
+                if (cap <= 0) {
+                    await new Promise((r) => setTimeout(r, idleDelayMs));
+                    continue;
+                }
+                const batchSize = Math.min(cap, maxBatch);
+                const jobs = await this.boss!.fetch(this.topic, {
+                    batchSize,
+                } as any);
+                if (!jobs || jobs.length === 0) {
+                    await new Promise((r) => setTimeout(r, idleDelayMs));
+                    continue;
+                }
+                this.metrics.claims += jobs.length;
+                for (const job of jobs) {
+                    // Fire and forget each job; completion/failure ack individually.
+                    (async () => {
+                        try {
+                            await handler(job.data as QueueMessage);
+                            await this.boss!.complete(
+                                job.name,
+                                job.id,
+                                (job as any).data || {}
+                            );
+                            this.metrics.completes++;
+                        } catch (err) {
+                            this.metrics.retries++;
+                            this.metrics.errors++;
+                            try {
+                                await this.boss!.fail(
+                                    job.name,
+                                    job.id,
+                                    (job as any).data || {}
+                                );
+                            } catch {}
+                        }
+                    })();
+                }
+            } catch (e) {
+                this.metrics.errors++;
+                // Backoff briefly on errors
+                await new Promise((r) => setTimeout(r, idleDelayMs));
+            }
+        }
+    }
+
+    // Optional multi-topic methods (for subsystems like ASR)
+    async publishTo(
+        topic: string,
+        msg: object,
+        opts?: { timeoutSec?: number }
+    ) {
+        if (!this.boss) await this.start();
+        const expireInSeconds = Math.max(
+            1,
+            Math.floor(
+                opts?.timeoutSec ??
+                    Number(
+                        readIntEnv(
+                            'QUEUE_VISIBILITY_SEC',
+                            this.opts.visibilityTimeoutSec ?? 90
+                        )
+                    )
+            )
+        );
+        const retryLimit = Number(
+            readIntEnv('QUEUE_MAX_ATTEMPTS', this.opts.maxAttempts ?? 3)
+        );
+        const dlq = `${topic}.dlq`;
+        try {
+            await this.boss!.createQueue(topic, {
+                name: topic,
+                expireInSeconds,
+                retryLimit,
+                deadLetter: dlq,
+            });
+        } catch {}
+        try {
+            await this.boss!.createQueue(dlq, {
+                name: dlq,
+                expireInSeconds: expireInSeconds * 2,
+                retryLimit: 0,
+            });
+        } catch {}
+        await this.boss!.send(topic, msg, {
+            expireInSeconds,
+            retryLimit,
+            retryBackoff: true,
+            deadLetter: dlq,
+        });
+        this.metrics.publishes++;
+    }
+
+    async consumeFrom(topic: string, handler: (msg: any) => Promise<void>) {
+        if (!this.boss) await this.start();
+        const batchSize = Number(
+            readIntEnv('QUEUE_CONCURRENCY', this.opts.concurrency ?? 4)
+        );
+        await this.boss!.work<any>(topic, { batchSize }, async (jobs) => {
+            for (const job of jobs) {
+                this.metrics.claims++;
+                try {
+                    await handler(job.data as any);
+                    this.metrics.completes++;
+                } catch (err) {
+                    this.metrics.retries++;
+                    this.metrics.errors++;
+                    throw err;
+                }
+            }
+        });
+    }
+
+    async shutdown(): Promise<void> {
+        if (this.boss) {
+            await this.boss.stop();
+            this.boss = undefined;
+        }
+    }
+
+    async health(): Promise<{ ok: boolean; error?: string }> {
+        try {
+            if (!this.boss) await this.start();
+            // Simple ping by fetching the state; if it throws, not healthy
+            // getQueue takes a name and returns settings; use topic
+            await this.boss!.getQueue(this.topic);
+            return { ok: true };
+        } catch (e) {
+            return {
+                ok: false,
+                error: e instanceof Error ? e.message : String(e),
+            };
+        }
+    }
+
+    getMetrics() {
+        return { ...this.metrics };
     }
 }
 ````
@@ -8292,177 +8119,159 @@ export function normalizeRoute(path: string) {
 }
 ````
 
-## File: src/data/repo.ts
+## File: src/data/db/schema.ts
 ````typescript
-import type { JobStatus } from '@clipper/contracts';
-import { desc, eq } from 'drizzle-orm';
+import {
+    pgEnum,
+    pgTable,
+    text,
+    timestamp,
+    uuid,
+    integer,
+    boolean,
+    jsonb,
+    index,
+    primaryKey,
+} from 'drizzle-orm/pg-core';
 
-export interface JobRow {
-    id: string;
-    status: JobStatus;
-    progress: number;
-    sourceType: 'upload' | 'youtube';
-    sourceKey?: string;
-    sourceUrl?: string;
-    startSec: number;
-    endSec: number;
-    withSubtitles: boolean;
-    burnSubtitles: boolean;
-    subtitleLang?: string;
-    resultVideoKey?: string;
-    resultSrtKey?: string;
-    errorCode?: string;
-    errorMessage?: string;
-    createdAt: string;
-    updatedAt: string;
-    expiresAt?: string;
-    lastHeartbeatAt?: string;
-}
+// Enums
+export const jobStatus = pgEnum('job_status', [
+    'queued',
+    'processing',
+    'done',
+    'failed',
+]);
+export const sourceType = pgEnum('source_type', ['upload', 'youtube']);
+export const asrJobStatus = pgEnum('asr_job_status', [
+    'queued',
+    'processing',
+    'done',
+    'failed',
+]);
 
-export interface JobEvent {
-    jobId: string;
-    ts: string;
-    type: string;
-    data?: Record<string, unknown>;
-}
+// jobs table
+export const jobs = pgTable(
+    'jobs',
+    {
+        id: uuid('id').primaryKey(),
+        status: jobStatus('status').notNull().default('queued'),
+        progress: integer('progress').notNull().default(0),
+        sourceType: sourceType('source_type').notNull(),
+        sourceKey: text('source_key'),
+        sourceUrl: text('source_url'),
+        startSec: integer('start_sec').notNull(),
+        endSec: integer('end_sec').notNull(),
+        withSubtitles: boolean('with_subtitles').notNull().default(false),
+        burnSubtitles: boolean('burn_subtitles').notNull().default(false),
+        subtitleLang: text('subtitle_lang'),
+        resultVideoKey: text('result_video_key'),
+        resultSrtKey: text('result_srt_key'),
+        errorCode: text('error_code'),
+        errorMessage: text('error_message'),
+        createdAt: timestamp('created_at', { withTimezone: true })
+            .notNull()
+            .defaultNow(),
+        updatedAt: timestamp('updated_at', { withTimezone: true })
+            .notNull()
+            .defaultNow(),
+        expiresAt: timestamp('expires_at', { withTimezone: true }),
+        lastHeartbeatAt: timestamp('last_heartbeat_at', { withTimezone: true }),
+        attemptCount: integer('attempt_count').notNull().default(0),
+        processingStartedAt: timestamp('processing_started_at', {
+            withTimezone: true,
+        }),
+    },
+    (t) => [
+        index('idx_jobs_status_created_at').on(t.status, t.createdAt),
+        index('idx_jobs_expires_at').on(t.expiresAt),
+        index('idx_jobs_status_last_hb').on(t.status, t.lastHeartbeatAt),
+    ]
+);
 
-export interface JobsRepository {
-    create(row: Omit<JobRow, 'createdAt' | 'updatedAt'>): Promise<JobRow>;
-    get(id: string): Promise<JobRow | null>;
-    update(id: string, patch: Partial<JobRow>): Promise<JobRow>;
-    listByStatus(
-        status: JobStatus,
-        limit?: number,
-        offset?: number
-    ): Promise<JobRow[]>;
-    transition(
-        id: string,
-        next: JobStatus,
-        event?: { type?: string; data?: Record<string, unknown> }
-    ): Promise<JobRow>;
-}
+// job_events table
+export const jobEvents = pgTable(
+    'job_events',
+    {
+        jobId: uuid('job_id')
+            .notNull()
+            .references(() => jobs.id, { onDelete: 'cascade' }),
+        ts: timestamp('ts', { withTimezone: true }).notNull().defaultNow(),
+        type: text('type').notNull(),
+        data: jsonb('data'),
+    },
+    (t) => [index('idx_job_events_job_id_ts').on(t.jobId, t.ts)]
+);
 
-export interface JobEventsRepository {
-    add(evt: JobEvent): Promise<void>;
-    list(jobId: string, limit?: number, offset?: number): Promise<JobEvent[]>;
-}
+// api_keys table (optional)
+export const apiKeys = pgTable('api_keys', {
+    id: uuid('id').primaryKey(),
+    name: text('name').notNull(),
+    keyHash: text('key_hash').notNull(),
+    revoked: boolean('revoked').notNull().default(false),
+    createdAt: timestamp('created_at', { withTimezone: true })
+        .notNull()
+        .defaultNow(),
+    lastUsedAt: timestamp('last_used_at', { withTimezone: true }),
+});
 
-// --- ASR (Automatic Speech Recognition) domain types ---
-export type AsrJobStatus = 'queued' | 'processing' | 'done' | 'failed';
+// ASR tables
+export const asrJobs = pgTable(
+    'asr_jobs',
+    {
+        id: uuid('id').primaryKey(),
+        clipJobId: uuid('clip_job_id').references(() => jobs.id),
+        sourceType: text('source_type').notNull(), // upload | youtube | internal
+        sourceKey: text('source_key'),
+        mediaHash: text('media_hash').notNull(),
+        modelVersion: text('model_version').notNull(),
+        languageHint: text('language_hint'),
+        detectedLanguage: text('detected_language'),
+        durationSec: integer('duration_sec'),
+        status: asrJobStatus('status').notNull().default('queued'),
+        errorCode: text('error_code'),
+        errorMessage: text('error_message'),
+        createdAt: timestamp('created_at', { withTimezone: true })
+            .notNull()
+            .defaultNow(),
+        updatedAt: timestamp('updated_at', { withTimezone: true })
+            .notNull()
+            .defaultNow(),
+        completedAt: timestamp('completed_at', { withTimezone: true }),
+        expiresAt: timestamp('expires_at', { withTimezone: true }),
+    },
+    (t) => [
+        index('idx_asr_jobs_status_created_at').on(t.status, t.createdAt),
+        index('idx_asr_jobs_expires_at').on(t.expiresAt),
+        // Unique partial index handled via raw SQL migration (media_hash, model_version) where status='done'
+    ]
+);
 
-export interface AsrJobRow {
-    id: string;
-    clipJobId?: string;
-    sourceType: string; // upload | youtube | internal
-    sourceKey?: string;
-    mediaHash: string;
-    modelVersion: string;
-    languageHint?: string;
-    detectedLanguage?: string;
-    durationSec?: number;
-    status: AsrJobStatus;
-    errorCode?: string;
-    errorMessage?: string;
-    createdAt: string;
-    updatedAt: string;
-    completedAt?: string;
-    expiresAt?: string;
-}
+export const asrArtifacts = pgTable(
+    'asr_artifacts',
+    {
+        asrJobId: uuid('asr_job_id')
+            .notNull()
+            .references(() => asrJobs.id, { onDelete: 'cascade' }),
+        kind: text('kind').notNull(), // srt | text | json
+        storageKey: text('storage_key').notNull(),
+        sizeBytes: integer('size_bytes'),
+        createdAt: timestamp('created_at', { withTimezone: true })
+            .notNull()
+            .defaultNow(),
+    },
+    (t) => [primaryKey({ columns: [t.asrJobId, t.kind] })]
+);
 
-export interface AsrArtifactRow {
-    asrJobId: string;
-    kind: 'srt' | 'text' | 'json';
-    storageKey: string;
-    sizeBytes?: number;
-    createdAt: string;
-}
-
-export interface AsrJobsRepository {
-    create(
-        row: Omit<AsrJobRow, 'createdAt' | 'updatedAt' | 'status'> &
-            Partial<Pick<AsrJobRow, 'status'>>
-    ): Promise<AsrJobRow>;
-    get(id: string): Promise<AsrJobRow | null>;
-    getReusable(
-        mediaHash: string,
-        modelVersion: string
-    ): Promise<(AsrJobRow & { artifacts: AsrArtifactRow[] }) | null>;
-    patch(id: string, patch: Partial<AsrJobRow>): Promise<AsrJobRow>;
-}
-
-export interface AsrArtifactsRepository {
-    put(artifact: AsrArtifactRow): Promise<void>;
-    list(asrJobId: string): Promise<AsrArtifactRow[]>;
-}
-
-// Minimal in-memory impl to wire API/worker until DB is added
-export class InMemoryJobsRepo implements JobsRepository {
-    private map = new Map<string, JobRow>();
-    async create(
-        row: Omit<JobRow, 'createdAt' | 'updatedAt'>
-    ): Promise<JobRow> {
-        const now = new Date().toISOString();
-        const rec: JobRow = { ...row, createdAt: now, updatedAt: now };
-        this.map.set(rec.id, rec);
-        return rec;
-    }
-    async get(id: string) {
-        return this.map.get(id) ?? null;
-    }
-    async update(id: string, patch: Partial<JobRow>): Promise<JobRow> {
-        const cur = this.map.get(id);
-        if (!cur) throw new Error('NOT_FOUND');
-        const next = {
-            ...cur,
-            ...patch,
-            updatedAt: new Date().toISOString(),
-        } as JobRow;
-        this.map.set(id, next);
-        return next;
-    }
-    async listByStatus(
-        status: JobStatus,
-        limit = 50,
-        offset = 0
-    ): Promise<JobRow[]> {
-        return Array.from(this.map.values())
-            .filter((r) => r.status === status)
-            .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
-            .slice(offset, offset + limit);
-    }
-    async transition(
-        id: string,
-        next: JobStatus,
-        event?: { type?: string; data?: Record<string, unknown> }
-    ): Promise<JobRow> {
-        const cur = await this.get(id);
-        if (!cur) throw new Error('NOT_FOUND');
-        const updated = await this.update(id, { status: next });
-        // no-op event store here; handled by InMemoryJobEventsRepo
-        return updated;
-    }
-}
-
-export class InMemoryJobEventsRepo implements JobEventsRepository {
-    private events: JobEvent[] = [];
-    async add(evt: JobEvent): Promise<void> {
-        this.events.push(evt);
-    }
-    async listRecent(jobId: string, limit = 10) {
-        return this.events
-            .filter((e) => e.jobId === jobId)
-            .sort((a, b) => a.ts.localeCompare(b.ts))
-            .slice(0, limit);
-    }
-    async list(jobId: string, limit = 100, offset = 0): Promise<JobEvent[]> {
-        return this.events
-            .filter((e) => e.jobId === jobId)
-            .sort((a, b) => a.ts.localeCompare(b.ts))
-            .slice(offset, offset + limit);
-    }
-}
-
-// (If a DrizzleJobEventsRepo is defined elsewhere, ensure it has listRecent; placeholder below if needed.)
+export type Job = typeof jobs.$inferSelect;
+export type NewJob = typeof jobs.$inferInsert;
+export type JobEvent = typeof jobEvents.$inferSelect;
+export type NewJobEvent = typeof jobEvents.$inferInsert;
+export type ApiKey = typeof apiKeys.$inferSelect;
+export type NewApiKey = typeof apiKeys.$inferInsert;
+export type AsrJob = typeof asrJobs.$inferSelect;
+export type NewAsrJob = typeof asrJobs.$inferInsert;
+export type AsrArtifact = typeof asrArtifacts.$inferSelect;
+export type NewAsrArtifact = typeof asrArtifacts.$inferInsert;
 ````
 
 ## File: src/data/storage.ts
@@ -9212,6 +9021,181 @@ export async function resolveYouTubeSource(
 }
 ````
 
+## File: src/data/repo.ts
+````typescript
+import type { JobStatus } from '@clipper/contracts';
+import { desc, eq } from 'drizzle-orm';
+
+export interface JobRow {
+    id: string;
+    status: JobStatus;
+    progress: number;
+    sourceType: 'upload' | 'youtube';
+    sourceKey?: string;
+    sourceUrl?: string;
+    startSec: number;
+    endSec: number;
+    withSubtitles: boolean;
+    burnSubtitles: boolean;
+    subtitleLang?: string;
+    resultVideoKey?: string;
+    resultSrtKey?: string;
+    errorCode?: string;
+    errorMessage?: string;
+    createdAt: string;
+    updatedAt: string;
+    expiresAt?: string;
+    lastHeartbeatAt?: string;
+    attemptCount?: number;
+    processingStartedAt?: string;
+}
+
+export interface JobEvent {
+    jobId: string;
+    ts: string;
+    type: string;
+    data?: Record<string, unknown>;
+}
+
+export interface JobsRepository {
+    create(row: Omit<JobRow, 'createdAt' | 'updatedAt'>): Promise<JobRow>;
+    get(id: string): Promise<JobRow | null>;
+    update(id: string, patch: Partial<JobRow>): Promise<JobRow>;
+    listByStatus(
+        status: JobStatus,
+        limit?: number,
+        offset?: number
+    ): Promise<JobRow[]>;
+    transition(
+        id: string,
+        next: JobStatus,
+        event?: { type?: string; data?: Record<string, unknown> }
+    ): Promise<JobRow>;
+}
+
+export interface JobEventsRepository {
+    add(evt: JobEvent): Promise<void>;
+    list(jobId: string, limit?: number, offset?: number): Promise<JobEvent[]>;
+}
+
+// --- ASR (Automatic Speech Recognition) domain types ---
+export type AsrJobStatus = 'queued' | 'processing' | 'done' | 'failed';
+
+export interface AsrJobRow {
+    id: string;
+    clipJobId?: string;
+    sourceType: string; // upload | youtube | internal
+    sourceKey?: string;
+    mediaHash: string;
+    modelVersion: string;
+    languageHint?: string;
+    detectedLanguage?: string;
+    durationSec?: number;
+    status: AsrJobStatus;
+    errorCode?: string;
+    errorMessage?: string;
+    createdAt: string;
+    updatedAt: string;
+    completedAt?: string;
+    expiresAt?: string;
+}
+
+export interface AsrArtifactRow {
+    asrJobId: string;
+    kind: 'srt' | 'text' | 'json';
+    storageKey: string;
+    sizeBytes?: number;
+    createdAt: string;
+}
+
+export interface AsrJobsRepository {
+    create(
+        row: Omit<AsrJobRow, 'createdAt' | 'updatedAt' | 'status'> &
+            Partial<Pick<AsrJobRow, 'status'>>
+    ): Promise<AsrJobRow>;
+    get(id: string): Promise<AsrJobRow | null>;
+    getReusable(
+        mediaHash: string,
+        modelVersion: string
+    ): Promise<(AsrJobRow & { artifacts: AsrArtifactRow[] }) | null>;
+    patch(id: string, patch: Partial<AsrJobRow>): Promise<AsrJobRow>;
+}
+
+export interface AsrArtifactsRepository {
+    put(artifact: AsrArtifactRow): Promise<void>;
+    list(asrJobId: string): Promise<AsrArtifactRow[]>;
+}
+
+// Minimal in-memory impl to wire API/worker until DB is added
+export class InMemoryJobsRepo implements JobsRepository {
+    private map = new Map<string, JobRow>();
+    async create(
+        row: Omit<JobRow, 'createdAt' | 'updatedAt'>
+    ): Promise<JobRow> {
+        const now = new Date().toISOString();
+        const rec: JobRow = { ...row, createdAt: now, updatedAt: now };
+        this.map.set(rec.id, rec);
+        return rec;
+    }
+    async get(id: string) {
+        return this.map.get(id) ?? null;
+    }
+    async update(id: string, patch: Partial<JobRow>): Promise<JobRow> {
+        const cur = this.map.get(id);
+        if (!cur) throw new Error('NOT_FOUND');
+        const next = {
+            ...cur,
+            ...patch,
+            updatedAt: new Date().toISOString(),
+        } as JobRow;
+        this.map.set(id, next);
+        return next;
+    }
+    async listByStatus(
+        status: JobStatus,
+        limit = 50,
+        offset = 0
+    ): Promise<JobRow[]> {
+        return Array.from(this.map.values())
+            .filter((r) => r.status === status)
+            .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+            .slice(offset, offset + limit);
+    }
+    async transition(
+        id: string,
+        next: JobStatus,
+        event?: { type?: string; data?: Record<string, unknown> }
+    ): Promise<JobRow> {
+        const cur = await this.get(id);
+        if (!cur) throw new Error('NOT_FOUND');
+        const updated = await this.update(id, { status: next });
+        // no-op event store here; handled by InMemoryJobEventsRepo
+        return updated;
+    }
+}
+
+export class InMemoryJobEventsRepo implements JobEventsRepository {
+    private events: JobEvent[] = [];
+    async add(evt: JobEvent): Promise<void> {
+        this.events.push(evt);
+    }
+    async listRecent(jobId: string, limit = 10) {
+        return this.events
+            .filter((e) => e.jobId === jobId)
+            .sort((a, b) => a.ts.localeCompare(b.ts))
+            .slice(0, limit);
+    }
+    async list(jobId: string, limit = 100, offset = 0): Promise<JobEvent[]> {
+        return this.events
+            .filter((e) => e.jobId === jobId)
+            .sort((a, b) => a.ts.localeCompare(b.ts))
+            .slice(offset, offset + limit);
+    }
+}
+
+// (If a DrizzleJobEventsRepo is defined elsewhere, ensure it has listRecent; placeholder below if needed.)
+````
+
 ## File: planning/todo.md
 ````markdown
 # Project Completion TODO (Focused & Prioritized)
@@ -9684,6 +9668,11 @@ function toJobRow(j: any): JobRow {
         lastHeartbeatAt: j.lastHeartbeatAt
             ? j.lastHeartbeatAt.toISOString()
             : undefined,
+        attemptCount:
+            typeof j.attemptCount === 'number' ? j.attemptCount : undefined,
+        processingStartedAt: j.processingStartedAt
+            ? j.processingStartedAt.toISOString()
+            : undefined,
     };
 }
 
@@ -9693,6 +9682,8 @@ function toJobsPatch(patch: Partial<JobRow>) {
         if (v === undefined) continue;
         if (k === 'expiresAt' && v) out[k] = new Date(v as string);
         else if (k === 'lastHeartbeatAt' && v) out[k] = new Date(v as string);
+        else if (k === 'processingStartedAt' && v)
+            out[k] = new Date(v as string);
         else out[k] = v as any;
     }
     return out;
@@ -10303,6 +10294,106 @@ if (import.meta.main) {
 }
 ````
 
+## File: planning/worker-resilience/tasks.md
+````markdown
+# Worker Runtime Resilience Tasks
+
+artifact_id: a7e5c1d2-3b4f-45c6-8d17-9f1e2d3c4b5a
+
+## 1. Schema Migration
+
+-   [x] 1.1 Add last_heartbeat_at, attempt_count, processing_started_at columns (Req 1/2/7)
+-   [x] 1.2 Add index (status, last_heartbeat_at) (Req 2)
+
+## 2. Heartbeat Implementation
+
+-   [x] 2.1 Track active job IDs list (Req 1)
+-   [x] 2.2 Batch update heartbeat loop (Req 1)
+-   [x] 2.3 Warning log on >3 consecutive failures (Req 1)
+
+## 3. Recovery Scanner
+
+-   [x] 3.1 Implement recovery scan SQL (Req 2)
+-   [x] 3.2 Emit requeued:stale events (Req 2)
+-   [x] 3.3 Attempt limit fail path RETRIES_EXHAUSTED (Req 7)
+
+## 4. Concurrency Control
+
+-   [x] 4.1 Implement semaphore (Req 3)
+-   [x] 4.2 Prefetch logic constrained by available slots (Req 3) _(basic: queue handler acquire gate)_
+-   [x] 4.3 Gauge worker.concurrent_jobs (Req 3)
+
+## 5. Backpressure Pause
+
+-   [x] 5.1 Monitor queue depth + CPU load (Req 4)
+-   [x] 5.2 Pause dequeuing under high watermark (Req 4)
+-   [x] 5.3 Metric worker.pauses_total (Req 4)
+
+## 6. Idempotent Output Handling
+
+-   [x] 6.1 Implement temp -> atomic move pattern (Req 5)
+-   [x] 6.2 Pre-check existing artifact skip path (Req 5)
+-   [x] 6.3 Integrity validation (size > 0) (Req 5)
+
+## 7. Duplicate Suppression
+
+-   [x] 7.1 Atomic queued->processing update (Req 6)
+-   [x] 7.2 Track acquire conflicts metric (Req 6)
+
+## 8. Retry Classification
+
+-   [x] 8.1 Implement classify(err) (Req 7)
+-   [x] 8.2 Update attempt_count on retry (Req 7)
+-   [x] 8.3 Fail fast on fatal (Req 7)
+
+## 9. Progress Throttling
+
+-   [x] 9.1 Implement delta/time based throttler (Req 8)
+-   [x] 9.2 Persist last progress percent (Req 8)
+
+## 10. Scratch Management
+
+-   [x] 10.1 Delete scratch on success (Req 9)
+-   [x] 10.2 Preserve on failure with size log (Req 9)
+
+## 11. Graceful Shutdown
+
+-   [x] 11.1 SIGTERM handler: stop dequeue (Req 10)
+-   [x] 11.2 Wait for active jobs with timeout (Req 10)
+-   [x] 11.3 Abort events for timed out jobs (Req 10)
+
+## 12. Observability Metrics
+
+-   [x] 12.1 heartbeats_total, heartbeat_failures_total (Req 11)
+-   [x] 12.2 recovered_jobs_total{reason} (Req 11)
+-   [x] 12.3 retry_attempts_total{code} (Req 11)
+-   [x] 12.4 duplicate_skips_total & acquire_conflicts_total (Req 6/11)
+
+## 13. Event Timeline Consistency
+
+-   [x] 13.1 Ensure event ordering logic (Req 12)
+-   [x] 13.2 Test normal + recovery sequences (Req 12)
+
+## 14. Testing & Simulation
+
+-   [x] 14.1 Integration test simulated crash (Req 2)
+-   [x] 14.2 Concurrency limit test (Req 3)
+-   [x] 14.3 Retry exhaustion test (Req 7)
+-   [x] 14.4 Idempotent artifact skip test (Req 5)
+
+## 15. Rollout
+
+-   [ ] 15.1 Deploy migration only
+-   [ ] 15.2 Enable heartbeat & logging (observe only)
+-   [ ] 15.3 Enable recovery scanner (low frequency)
+-   [ ] 15.4 Increase scan frequency & enable attempt limits
+
+## 16. Future Enhancements
+
+-   [ ] 16.1 Dynamic lease timeout based on clip duration
+-   [ ] 16.2 Per-stage adaptive concurrency
+````
+
 ## File: planning/observability/tasks.md
 ````markdown
 # Observability Improvements Tasks
@@ -10422,9 +10513,12 @@ import {
 } from '@clipper/data';
 import { PgBossQueueAdapter } from '@clipper/queue';
 import { BunClipper } from '@clipper/ffmpeg';
+import { inArray, and, eq, lt, gte, sql } from 'drizzle-orm';
+import { jobEvents, jobs as jobsTable } from '@clipper/data/db/schema';
 import { AsrFacade } from '@clipper/asr/facade';
 import { InMemoryMetrics } from '@clipper/common/metrics';
 import { withStage } from './stage';
+import os from 'os';
 export * from './asr.ts';
 
 const log = createLogger((readEnv('LOG_LEVEL') as any) || 'info').with({
@@ -10439,7 +10533,10 @@ const queue = new PgBossQueueAdapter({
     connectionString: requireEnv('DATABASE_URL'),
 });
 const clipper = new BunClipper();
+// Allow tests to inject a storage override
 const storage = (() => {
+    const override = (globalThis as any).__storageOverride;
+    if (override) return override;
     try {
         return createSupabaseStorageRepo();
     } catch (e) {
@@ -10453,251 +10550,688 @@ const asrFacade = new AsrFacade({
     asrJobs: new DrizzleAsrJobsRepo(sharedDb, metrics),
 });
 
+// Active job tracking for batch heartbeat (Req 2.1)
+const activeJobs = new Set<string>();
+let shuttingDown = false;
+
+interface HeartbeatLoopOpts {
+    intervalMs?: number;
+    updater?: (ids: string[], now: Date) => Promise<void>;
+    onWarn?: (failures: number, error: unknown) => void;
+}
+// Start a lightweight heartbeat loop that batches active job IDs and updates lastHeartbeatAt
+function startHeartbeatLoop(opts: HeartbeatLoopOpts = {}) {
+    const intervalMs =
+        opts.intervalMs ??
+        Number(readEnv('WORKER_HEARTBEAT_INTERVAL_MS') || 10_000);
+    let stopped = false;
+    let consecutiveFailures = 0;
+    const updater =
+        opts.updater ||
+        (async (ids: string[], now: Date) => {
+            await (sharedDb as any)
+                .update(jobsTable)
+                .set({ lastHeartbeatAt: now })
+                .where(inArray(jobsTable.id, ids));
+        });
+    (async () => {
+        while (!stopped && !shuttingDown) {
+            try {
+                if (activeJobs.size) {
+                    const ids = Array.from(activeJobs);
+                    const now = new Date();
+                    // eslint-disable-next-line no-await-in-loop
+                    await updater(ids, now);
+                    metrics.inc('worker.heartbeats_total');
+                    consecutiveFailures = 0;
+                }
+            } catch (e) {
+                consecutiveFailures++;
+                metrics.inc('worker.heartbeat_failures_total');
+                if (consecutiveFailures > 3) {
+                    log.warn('heartbeat degraded', {
+                        error: String(e),
+                        consecutiveFailures,
+                    });
+                    try {
+                        opts.onWarn?.(consecutiveFailures, e);
+                    } catch {}
+                }
+            }
+            // eslint-disable-next-line no-await-in-loop
+            await new Promise((r) => setTimeout(r, intervalMs));
+        }
+    })();
+    return () => {
+        stopped = true;
+    };
+}
+
+// ------------------ Backpressure Controller (Req 5) ------------------
+interface BackpressureOpts {
+    getDepth: () => Promise<number> | number;
+    getCpu: () => number;
+    highDepth: number;
+    highCpu: number;
+    pauseMs: number;
+    now?: () => number;
+}
+function createBackpressureController(opts: BackpressureOpts) {
+    let pausedUntil = 0;
+    const nowFn = opts.now || (() => Date.now());
+    async function evaluate(): Promise<boolean> {
+        const now = nowFn();
+        if (pausedUntil && now < pausedUntil) return false;
+        const depth = await opts.getDepth();
+        const cpu = opts.getCpu();
+        if (depth >= opts.highDepth && cpu >= opts.highCpu) {
+            pausedUntil = now + opts.pauseMs;
+            metrics.inc('worker.pauses_total');
+            log.info('backpressure pause', {
+                depth,
+                cpuLoad: cpu,
+                pauseMs: opts.pauseMs,
+            });
+            return true;
+        }
+        return false;
+    }
+    function isPaused() {
+        return pausedUntil > nowFn();
+    }
+    return {
+        evaluate,
+        isPaused,
+        get pausedUntil() {
+            return pausedUntil;
+        },
+    };
+}
+export const __backpressureTest = { createBackpressureController };
+(globalThis as any).__backpressureTest = __backpressureTest;
+
+// ------------------ Progress Throttling (Req 9) ------------------
+interface ThrottleOpts {
+    persist: (pct: number) => Promise<void>;
+    now: () => number;
+    debounceMs: number;
+    enforce?: (now: number) => void;
+}
+async function throttleProgress(
+    progressIter: AsyncIterable<number>,
+    opts: ThrottleOpts
+) {
+    let lastEmitTs = 0;
+    let lastPct = -1;
+    for await (const pct of progressIter) {
+        const now = opts.now();
+        opts.enforce?.(now);
+        if (
+            pct === 100 ||
+            pct >= lastPct + 1 ||
+            now - lastEmitTs >= opts.debounceMs
+        ) {
+            await opts.persist(pct);
+            lastPct = pct;
+            lastEmitTs = now;
+        }
+    }
+    if (lastPct < 100) {
+        await opts.persist(100);
+    }
+}
+export const __progressTest = { throttleProgress };
+
+// ------------------ Idempotent Short-circuit Helper (Req 5) ------------------
+async function maybeShortCircuitIdempotent(
+    jobId: string,
+    finalKey: string,
+    correlationId: string
+): Promise<boolean> {
+    const s = (globalThis as any).__storageOverride || storage;
+    if (!s) return false;
+    try {
+        const signed = await s.sign(finalKey, 30);
+        const head = await fetch(signed, { method: 'HEAD' });
+        if (head.ok) {
+            log.info('idempotent skip existing artifact', {
+                jobId,
+                key: finalKey,
+            });
+            await events.add({
+                jobId,
+                ts: new Date().toISOString(),
+                type: 'uploaded',
+                data: { key: finalKey, correlationId },
+            });
+            await jobs.update(jobId, {
+                status: 'done',
+                progress: 100,
+                resultVideoKey: finalKey,
+            });
+            await events.add({
+                jobId,
+                ts: new Date().toISOString(),
+                type: 'done',
+                data: { correlationId },
+            });
+            metrics.inc('worker.idempotent_skips_total');
+            return true;
+        }
+    } catch {}
+    return false;
+}
+// expose for tests
+(globalThis as any).__idempotentTest = { maybeShortCircuitIdempotent };
+
+// ------------------ Retry Classification (Req 8) ------------------
+type RetryClass = 'retryable' | 'fatal';
+function classifyError(e: any): RetryClass {
+    const msg = String(e?.message || e || '');
+    if (
+        /CLIP_TIMEOUT|STORAGE_NOT_AVAILABLE|storage_upload_failed|timeout|fetch|network|ECONN|EAI_AGAIN|ENOTFOUND|5\d{2}/i.test(
+            msg
+        )
+    ) {
+        return 'retryable';
+    }
+    if (/OUTPUT_EMPTY|OUTPUT_MISSING/i.test(msg)) return 'fatal';
+    return 'fatal';
+}
+async function handleRetryError(
+    jobId: string,
+    correlationId?: string,
+    err?: unknown
+) {
+    const now = new Date();
+    const clazz = classifyError(err);
+    if (clazz === 'retryable') {
+        const maxAttempts = Number(readEnv('JOB_MAX_ATTEMPTS') || 3);
+        let attemptCountOut = 0;
+        let statusOut = 'queued';
+        await (sharedDb as any).transaction(async (tx: any) => {
+            const updated = await tx
+                .update(jobsTable)
+                .set({
+                    status: sql`CASE WHEN ${jobsTable.attemptCount} + 1 < ${maxAttempts} THEN 'queued'::job_status ELSE 'failed'::job_status END`,
+                    attemptCount: sql`${jobsTable.attemptCount} + 1`,
+                    errorCode: sql`CASE WHEN ${jobsTable.attemptCount} + 1 < ${maxAttempts} THEN 'RETRYABLE_ERROR' ELSE 'RETRIES_EXHAUSTED' END`,
+                    errorMessage: String(err),
+                    updatedAt: now,
+                })
+                .where(eq(jobsTable.id, jobId))
+                .returning({
+                    attemptCount: jobsTable.attemptCount,
+                    status: jobsTable.status,
+                });
+            const attemptCount = updated[0]?.attemptCount ?? 0;
+            const status = updated[0]?.status ?? 'queued';
+            attemptCountOut = attemptCount;
+            statusOut = status;
+            if (status === 'queued') {
+                await tx.insert(jobEvents).values({
+                    jobId,
+                    ts: now,
+                    type: 'requeued:retry',
+                    data: { attempt: attemptCount, correlationId },
+                });
+            } else {
+                await tx.insert(jobEvents).values({
+                    jobId,
+                    ts: now,
+                    type: 'failed',
+                    data: { correlationId, code: 'RETRIES_EXHAUSTED' },
+                });
+            }
+        });
+        metrics.inc('worker.retry_attempts_total', 1, { code: 'retryable' });
+        return attemptCountOut;
+    }
+    // fatal
+    try {
+        const errObj = fromException(err, jobId);
+        await (sharedDb as any).transaction(async (tx: any) => {
+            await tx
+                .update(jobsTable)
+                .set({
+                    status: sql`'failed'::job_status`,
+                    errorCode:
+                        (errObj.error && (errObj.error as any).code) || 'FATAL',
+                    errorMessage:
+                        (errObj.error && (errObj.error as any).message) ||
+                        String(err),
+                    updatedAt: now,
+                })
+                .where(eq(jobsTable.id, jobId));
+            await tx.insert(jobEvents).values({
+                jobId,
+                ts: now,
+                type: 'failed',
+                data: { correlationId },
+            });
+        });
+    } finally {
+        metrics.inc('clip.failures');
+    }
+    return 0;
+}
+export const __retryInternal = { classifyError, handleRetryError };
+// expose for bun tests
+(globalThis as any).__retryInternal = __retryInternal;
+(globalThis as any).__retryTest = { classifyError };
+
+// ------------------ Concurrency Control (Req 4) ------------------
+class Semaphore {
+    private queue: (() => void)[] = [];
+    public inflight = 0;
+    constructor(public readonly limit: number) {}
+    capacity() {
+        return Math.max(0, this.limit - this.inflight);
+    }
+    async acquire() {
+        if (this.inflight < this.limit) {
+            this.inflight++;
+            metrics.setGauge('worker.concurrent_jobs', this.inflight);
+            return;
+        }
+        await new Promise<void>((res) => this.queue.push(res));
+        this.inflight++;
+        metrics.setGauge('worker.concurrent_jobs', this.inflight);
+    }
+    release() {
+        this.inflight = Math.max(0, this.inflight - 1);
+        metrics.setGauge('worker.concurrent_jobs', this.inflight);
+        const next = this.queue.shift();
+        if (next) next();
+    }
+}
+
+// Global reference for graceful shutdown wait logic
+let semGlobal: { inflight: number } | null = null;
+
+// ------------------ Scratch lifecycle helpers (Req 10) ------------------
+async function measureDirSizeBytes(dir: string): Promise<number> {
+    try {
+        const out = await Bun.$`du -sk ${dir} | cut -f1`.text();
+        const kb = Number((out || '').trim() || '0');
+        return isNaN(kb) ? 0 : kb * 1024;
+    } catch {
+        return 0;
+    }
+}
+async function cleanupScratch(dir: string, success: boolean) {
+    if (!dir) return { deleted: false, sizeBytes: 0 } as const;
+    const keepOnSuccess =
+        String(readEnv('KEEP_SCRATCH_ON_SUCCESS') || '0') === '1';
+    if (success) {
+        if (keepOnSuccess) {
+            log.info('scratch kept on success by config', { dir });
+            return {
+                deleted: false,
+                sizeBytes: await measureDirSizeBytes(dir),
+            } as const;
+        }
+        try {
+            await Bun.spawn(['rm', '-rf', dir]).exited;
+            return { deleted: true, sizeBytes: 0 } as const;
+        } catch (e) {
+            log.warn('failed to delete scratch dir', { dir, error: String(e) });
+            return {
+                deleted: false,
+                sizeBytes: await measureDirSizeBytes(dir),
+            } as const;
+        }
+    } else {
+        const size = await measureDirSizeBytes(dir);
+        log.info('scratch preserved after failure', { dir, sizeBytes: size });
+        return { deleted: false, sizeBytes: size } as const;
+    }
+}
+(globalThis as any).__scratchTest = { measureDirSizeBytes, cleanupScratch };
 async function main() {
     await queue.start();
-    await queue.consume(
-        async ({
-            jobId,
-            correlationId,
-        }: {
-            jobId: string;
-            correlationId?: string;
-        }) => {
-            const startedAt = Date.now();
-            const cid = correlationId || jobId; // fallback to jobId if none provided
-            const maxMs = Number(readEnv('CLIP_MAX_RUNTIME_SEC') || 600) * 1000; // default 10m
-            const nowIso = () => new Date().toISOString();
-            let cleanup: (() => Promise<void>) | null = null;
-            let outputLocal: string | null = null;
-            let lastHeartbeat = 0;
-            const heartbeatIntervalMs = Number(
-                readEnv('WORKER_HEARTBEAT_INTERVAL_MS') || 15_000
-            );
-            const sendHeartbeat = async () => {
-                const now = Date.now();
-                if (now - lastHeartbeat < heartbeatIntervalMs) return;
-                lastHeartbeat = now;
-                try {
-                    await jobs.update(jobId, {
-                        lastHeartbeatAt: nowIso(),
-                    } as any);
-                } catch {}
-            };
-
-            const finish = async (
-                status: 'done' | 'failed',
-                patch: any = {}
-            ) => {
-                await jobs.update(jobId, { status, ...patch });
-                await events.add({
-                    jobId,
-                    ts: nowIso(),
-                    type: status,
-                    data: { correlationId: cid },
-                });
-            };
-
+    startHeartbeatLoop();
+    const maxConc = Number(readEnv('WORKER_MAX_CONCURRENCY') || 4);
+    const sem = new Semaphore(maxConc);
+    semGlobal = sem;
+    (globalThis as any).__workerSem = sem;
+    const highDepth = Number(readEnv('WORKER_QUEUE_HIGH_WATERMARK') || 500);
+    const highCpu = Number(readEnv('WORKER_CPU_LOAD_HIGH') || os.cpus().length);
+    const pauseMs = Number(readEnv('WORKER_BACKPRESSURE_PAUSE_MS') || 3000);
+    const backpressure = createBackpressureController({
+        getDepth: async () => {
             try {
-                const job = await jobs.get(jobId);
-                if (!job) {
-                    log.warn('job not found', { jobId });
+                const r = await (sharedDb as any)
+                    .select({ c: sql<number>`count(*)` })
+                    .from(jobsTable)
+                    .where(eq(jobsTable.status, 'queued'));
+                return Number(r[0]?.c || 0);
+            } catch (e) {
+                log.warn('queue depth query failed', { error: String(e) });
+                return 0;
+            }
+        },
+        getCpu: () => os.loadavg()[0] || 0,
+        highDepth,
+        highCpu,
+        pauseMs,
+    });
+    (async () => {
+        while (!shuttingDown) {
+            try {
+                await backpressure.evaluate();
+            } catch (e) {
+                log.warn('backpressure evaluate failed', { error: String(e) });
+            }
+            await new Promise((r) => setTimeout(r, 1000));
+        }
+    })();
+
+    const handler = async (msg: { jobId: string; correlationId?: string }) => {
+        const { jobId, correlationId } = msg;
+        await sem.acquire();
+        const startedAt = Date.now();
+        const cid = correlationId || jobId;
+        const maxMs = Number(readEnv('CLIP_MAX_RUNTIME_SEC') || 600) * 1000;
+        const nowIso = () => new Date().toISOString();
+        let cleanup: (() => Promise<void>) | null = null;
+        let outputLocal: string | null = null;
+        let scratchDir: string | null = null;
+        let success = false;
+
+        const finish = async (status: 'done' | 'failed', patch: any = {}) => {
+            await jobs.update(jobId, { status, ...patch });
+            await events.add({
+                jobId,
+                ts: nowIso(),
+                type: status,
+                data: { correlationId: cid },
+            });
+        };
+
+        try {
+            const job = await jobs.get(jobId);
+            if (!job) {
+                log.warn('job not found', { jobId });
+                return;
+            }
+            if (job.status === 'done') return;
+            // Duplicate suppression: if already processing and lease is fresh, skip (Req 6)
+            if (job.status === 'processing') {
+                const hbMs = Number(
+                    readEnv('WORKER_HEARTBEAT_INTERVAL_MS') || 10_000
+                );
+                const leaseSec = Number(
+                    readEnv('WORKER_LEASE_TIMEOUT_SEC') ||
+                        Math.ceil((hbMs / 1000) * 3)
+                );
+                const last = job.lastHeartbeatAt
+                    ? new Date(job.lastHeartbeatAt as any)
+                    : null;
+                const fresh = last
+                    ? Date.now() - last.getTime() < leaseSec * 1000
+                    : false;
+                if (fresh) {
+                    metrics.inc('worker.duplicate_skips_total');
+                    log.info('duplicate skip (fresh lease)', { jobId });
                     return;
                 }
-                if (job.status === 'done') return; // idempotent
-                if (job.status !== 'processing') {
-                    await jobs.update(jobId, {
-                        status: 'processing',
-                        progress: 0,
-                    });
-                    await events.add({
-                        jobId,
-                        ts: nowIso(),
-                        type: 'processing',
-                        data: { correlationId: cid },
-                    });
-                    log.info('job processing start', {
-                        jobId,
-                        correlationId: cid,
-                    });
+            }
+            if (job.status === 'queued') {
+                const acquired = await (sharedDb as any)
+                    .update(jobsTable)
+                    .set({
+                        status: sql`'processing'::job_status`,
+                        processingStartedAt: new Date(),
+                        lastHeartbeatAt: new Date(),
+                        updatedAt: new Date(),
+                    })
+                    .where(
+                        and(
+                            eq(jobsTable.id, jobId),
+                            eq(jobsTable.status, 'queued')
+                        )
+                    )
+                    .returning({ id: jobsTable.id });
+                if (!acquired.length) {
+                    metrics.inc('worker.acquire_conflicts_total');
+                    metrics.inc('worker.atomic_acquire_fail_total');
+                    log.info('acquire conflict skip', { jobId });
+                    return;
                 }
-
-                // Resolve source (stage: resolve)
-                let resolveRes = await withStage(
-                    metrics,
-                    'resolve',
-                    async () => {
-                        if (job.sourceType === 'upload') {
-                            return await resolveUploadSource({
-                                id: job.id,
-                                sourceType: 'upload',
-                                sourceKey: job.sourceKey!,
-                            } as any);
-                        } else {
-                            return await resolveYouTubeSource({
-                                id: job.id,
-                                sourceType: 'youtube',
-                                sourceUrl: job.sourceUrl!,
-                            } as any);
-                        }
-                    }
-                );
-                cleanup = resolveRes.cleanup;
                 await events.add({
                     jobId,
                     ts: nowIso(),
-                    type: 'source:ready',
-                    data: {
-                        durationSec: resolveRes.meta?.durationSec,
-                        correlationId: cid,
-                    },
+                    type: 'processing',
+                    data: { correlationId: cid },
                 });
+                log.info('job processing start', { jobId, correlationId: cid });
+            } else if (job.status !== 'processing') {
+                log.info('skip job in non-runnable state', {
+                    jobId,
+                    status: job.status,
+                });
+                return;
+            }
+            activeJobs.add(jobId);
 
-                // Perform clip
-                const clipStart = Date.now();
-                const { localPath: clipPath, progress$ } = await withStage(
-                    metrics,
-                    'clip',
-                    async () =>
-                        await clipper.clip({
-                            input: resolveRes.localPath,
-                            startSec: job.startSec,
-                            endSec: job.endSec,
-                            jobId,
-                        })
-                );
-                outputLocal = clipPath;
-                let lastPersist = 0;
-                let lastPct = -1;
-                const persist = async (pct: number) => {
-                    await jobs.update(jobId, { progress: pct });
-                    await events.add({
-                        jobId,
-                        ts: nowIso(),
-                        type: 'progress',
-                        data: { pct, stage: 'clip', correlationId: cid },
-                    });
-                    await sendHeartbeat();
-                };
-                const debounceMs = 500;
-                for await (const pct of progress$) {
-                    const now = Date.now();
-                    // Global timeout enforcement
-                    if (now - startedAt > maxMs) {
-                        throw new Error('CLIP_TIMEOUT');
-                    }
-                    if (
-                        pct === 100 ||
-                        pct >= lastPct + 1 ||
-                        now - lastPersist >= debounceMs
-                    ) {
-                        await persist(pct);
-                        lastPersist = now;
-                        lastPct = pct;
-                    } else {
-                        // Even if we didn't persist progress, still emit heartbeat occasionally
-                        await sendHeartbeat();
-                    }
+            const resolveRes = await withStage(metrics, 'resolve', async () => {
+                if (job.sourceType === 'upload') {
+                    return await resolveUploadSource({
+                        id: job.id,
+                        sourceType: 'upload',
+                        sourceKey: job.sourceKey!,
+                    } as any);
+                } else {
+                    return await resolveYouTubeSource({
+                        id: job.id,
+                        sourceType: 'youtube',
+                        sourceUrl: job.sourceUrl!,
+                    } as any);
                 }
-                if (lastPct < 100) await persist(100);
-                await sendHeartbeat();
+            });
+            cleanup = resolveRes.cleanup;
+            await events.add({
+                jobId,
+                ts: nowIso(),
+                type: 'source:ready',
+                data: {
+                    durationSec: resolveRes.meta?.durationSec,
+                    correlationId: cid,
+                },
+            });
 
-                // Upload result
-                if (!storage) throw new Error('STORAGE_NOT_AVAILABLE');
-                const key = storageKeys.resultVideo(jobId);
-                // Retry transient storage failures (network / 5xx) with exponential backoff
-                const uploadWithRetry = async () => {
-                    const maxAttempts = Number(
-                        readEnv('STORAGE_UPLOAD_ATTEMPTS') || 4
-                    );
-                    let attempt = 0;
-                    let delay = 200;
-                    // simple transient detector
-                    const isTransient = (err: any) => {
-                        const msg = String(err?.message || err);
-                        return /timeout|fetch|network|ECONN|EAI_AGAIN|ENOTFOUND|5\d{2}/i.test(
-                            msg
-                        );
-                    };
-                    // eslint-disable-next-line no-constant-condition
-                    while (true) {
-                        try {
-                            attempt++;
-                            await storage.upload(clipPath, key, 'video/mp4');
-                            return;
-                        } catch (e) {
-                            if (attempt >= maxAttempts || !isTransient(e)) {
-                                throw e;
-                            }
-                            log.warn('storage upload retry', {
-                                jobId,
-                                attempt,
-                                error: String(e),
-                            });
-                            await new Promise((r) => setTimeout(r, delay));
-                            delay = Math.min(delay * 2, 2000);
-                        }
-                    }
-                };
-                await withStage(metrics, 'upload', async () => {
-                    await uploadWithRetry();
-                });
-                metrics.observe('clip.upload_ms', Date.now() - clipStart);
+            const clipStart = Date.now();
+            const finalKey = storageKeys.resultVideo(jobId);
+            // Idempotent short-circuit
+            if (await maybeShortCircuitIdempotent(jobId, finalKey, cid)) return;
+            const tempDir = `/tmp/clipper/${jobId}`;
+            scratchDir = tempDir;
+            try {
+                await Bun.spawn(['mkdir', '-p', tempDir]).exited;
+            } catch {}
+            const tempOut = `${tempDir}/clip.tmp.mp4`;
+            const finalOut = `${tempDir}/clip.final.mp4`;
+            const { localPath: clipPath, progress$ } = await withStage(
+                metrics,
+                'clip',
+                async () =>
+                    await clipper.clip({
+                        input: resolveRes.localPath,
+                        startSec: job.startSec,
+                        endSec: job.endSec,
+                        jobId,
+                    })
+            );
+            outputLocal = clipPath;
+            const persist = async (pct: number) => {
+                await jobs.update(jobId, { progress: pct });
                 await events.add({
                     jobId,
                     ts: nowIso(),
-                    type: 'uploaded',
-                    data: { key, correlationId: cid },
+                    type: 'progress',
+                    data: { pct, stage: 'clip', correlationId: cid },
                 });
+            };
+            const enforceTimeout = (now: number) => {
+                if (now - startedAt > maxMs) throw new Error('CLIP_TIMEOUT');
+            };
+            await throttleProgress(progress$, {
+                persist,
+                now: () => Date.now(),
+                debounceMs: 500,
+                enforce: enforceTimeout,
+            });
 
-                // If subtitles requested and set to auto, create ASR job request (fire-and-forget)
-                if (
-                    job.withSubtitles &&
-                    (job.subtitleLang === 'auto' || !job.subtitleLang)
-                ) {
-                    await withStage(metrics, 'asr', async () => {
-                        try {
-                            const asrRes = await asrFacade.request({
-                                localPath: clipPath,
-                                clipJobId: job.id,
-                                sourceType: 'internal',
-                                languageHint: job.subtitleLang ?? 'auto',
-                            });
-                            await events.add({
-                                jobId,
-                                ts: nowIso(),
-                                type: 'asr:requested',
-                                data: {
-                                    asrJobId: asrRes.asrJobId,
-                                    status: asrRes.status,
-                                    correlationId: cid,
-                                },
-                            });
-                        } catch (e) {
-                            await events.add({
-                                jobId,
-                                ts: nowIso(),
-                                type: 'asr:error',
-                                data: { err: String(e), correlationId: cid },
-                            });
-                            // swallow so primary pipeline continues
-                        }
-                    });
+            try {
+                const f = Bun.file(clipPath);
+                if (!(await f.exists())) throw new Error('OUTPUT_MISSING');
+                const size = (await f.arrayBuffer()).byteLength;
+                if (size <= 0) throw new Error('OUTPUT_EMPTY');
+                try {
+                    await Bun.spawn(['mv', clipPath, finalOut]).exited;
+                    outputLocal = finalOut;
+                } catch {
+                    await Bun.write(finalOut, await f.arrayBuffer());
+                    outputLocal = finalOut;
                 }
-
-                await finish('done', { progress: 100, resultVideoKey: key });
-                metrics.observe('clip.total_ms', Date.now() - startedAt);
-                const ms = Date.now() - startedAt;
-                log.info('job completed', { jobId, ms, correlationId: cid });
             } catch (e) {
+                log.error('output integrity validation failed', {
+                    jobId,
+                    err: String(e),
+                });
+                throw e;
+            }
+
+            if (!storage) throw new Error('STORAGE_NOT_AVAILABLE');
+            const key = finalKey;
+            const uploadWithRetry = async () => {
+                const maxAttempts = Number(
+                    readEnv('STORAGE_UPLOAD_ATTEMPTS') || 4
+                );
+                let attempt = 0;
+                let delay = 200;
+                const isTransient = (err: any) =>
+                    /timeout|fetch|network|ECONN|EAI_AGAIN|ENOTFOUND|5\d{2}/i.test(
+                        String(err?.message || err)
+                    );
+                while (true) {
+                    try {
+                        attempt++;
+                        await storage.upload(outputLocal!, key, 'video/mp4');
+                        return;
+                    } catch (e) {
+                        if (attempt >= maxAttempts || !isTransient(e)) {
+                            throw e;
+                        }
+                        log.warn('storage upload retry', {
+                            jobId,
+                            attempt,
+                            error: String(e),
+                        });
+                        await new Promise((r) => setTimeout(r, delay));
+                        delay = Math.min(delay * 2, 2000);
+                    }
+                }
+            };
+            await withStage(metrics, 'upload', async () => {
+                await uploadWithRetry();
+            });
+            metrics.observe('clip.upload_ms', Date.now() - clipStart);
+            await events.add({
+                jobId,
+                ts: nowIso(),
+                type: 'uploaded',
+                data: { key, correlationId: cid },
+            });
+
+            if (
+                job.withSubtitles &&
+                (job.subtitleLang === 'auto' || !job.subtitleLang)
+            ) {
+                await withStage(metrics, 'asr', async () => {
+                    try {
+                        const asrRes = await asrFacade.request({
+                            localPath: clipPath,
+                            clipJobId: job.id,
+                            sourceType: 'internal',
+                            languageHint: job.subtitleLang ?? 'auto',
+                        });
+                        await events.add({
+                            jobId,
+                            ts: nowIso(),
+                            type: 'asr:requested',
+                            data: {
+                                asrJobId: asrRes.asrJobId,
+                                status: asrRes.status,
+                                correlationId: cid,
+                            },
+                        });
+                    } catch (e) {
+                        await events.add({
+                            jobId,
+                            ts: nowIso(),
+                            type: 'asr:error',
+                            data: { err: String(e), correlationId: cid },
+                        });
+                    }
+                });
+            }
+
+            await finish('done', { progress: 100, resultVideoKey: key });
+            metrics.observe('clip.total_ms', Date.now() - startedAt);
+            const ms = Date.now() - startedAt;
+            log.info('job completed', { jobId, ms, correlationId: cid });
+            success = true;
+        } catch (e) {
+            const clazz = classifyError(e);
+            if (clazz === 'retryable') {
+                const maxAttempts = Number(readEnv('JOB_MAX_ATTEMPTS') || 3);
+                const updated = await (sharedDb as any)
+                    .update(jobsTable)
+                    .set({
+                        status: sql`CASE WHEN ${jobsTable.attemptCount} + 1 < ${maxAttempts} THEN 'queued'::job_status ELSE 'failed'::job_status END`,
+                        attemptCount: sql`${jobsTable.attemptCount} + 1`,
+                        errorCode: 'RETRYABLE_ERROR',
+                        errorMessage: String(e),
+                        updatedAt: new Date(),
+                    })
+                    .where(eq(jobsTable.id, jobId))
+                    .returning({ attemptCount: jobsTable.attemptCount });
+                const attempt = updated[0]?.attemptCount ?? 0;
+                metrics.inc('worker.retry_attempts_total', 1, {
+                    code: 'retryable',
+                });
+                if (attempt >= maxAttempts) {
+                    await events.add({
+                        jobId,
+                        ts: nowIso(),
+                        type: 'failed',
+                        data: { correlationId: cid, code: 'RETRIES_EXHAUSTED' },
+                    });
+                    log.error('retry attempts exhausted', { jobId, attempt });
+                } else {
+                    await events.add({
+                        jobId,
+                        ts: nowIso(),
+                        type: 'requeued:retry',
+                        data: { attempt, correlationId: cid },
+                    });
+                    log.warn('job requeued for retry', { jobId, attempt });
+                }
+            } else {
                 const err = fromException(e, jobId);
-                log.error('job failed', { jobId, err, correlationId: cid });
+                log.error('job failed (fatal)', {
+                    jobId,
+                    err,
+                    correlationId: cid,
+                });
                 metrics.inc('clip.failures');
                 try {
                     await jobs.update(jobId, {
                         status: 'failed',
                         errorCode:
-                            (err.error && (err.error as any).code) ||
-                            'INTERNAL',
+                            (err.error && (err.error as any).code) || 'FATAL',
                         errorMessage:
                             (err.error && (err.error as any).message) ||
                             String(e),
@@ -10709,27 +11243,65 @@ async function main() {
                         data: { correlationId: cid },
                     });
                 } catch {}
-            } finally {
-                // Final heartbeat on exit (success or failure) if runtime not exceeded
-                try {
-                    await jobs.update(jobId, {
-                        lastHeartbeatAt: nowIso(),
-                    } as any);
-                } catch {}
-                // Cleanup source + local output
-                if (cleanup) {
-                    try {
-                        await cleanup();
-                    } catch {}
-                }
-                if (outputLocal) {
-                    try {
-                        await Bun.spawn(['rm', '-f', outputLocal]).exited;
-                    } catch {}
-                }
             }
+        } finally {
+            activeJobs.delete(jobId);
+            try {
+                await jobs.update(jobId, { lastHeartbeatAt: nowIso() } as any);
+            } catch {}
+            if (cleanup) {
+                try {
+                    await cleanup();
+                } catch {}
+            }
+            if (scratchDir) {
+                try {
+                    await cleanupScratch(scratchDir, success);
+                } catch {}
+            }
+            sem.release();
         }
-    );
+    };
+
+    if ((queue as any).adaptiveConsume) {
+        log.info('using adaptive queue consumption (capacity-aware prefetch)');
+        (queue as any)
+            .adaptiveConsume(handler, () =>
+                shuttingDown || backpressure.isPaused() ? 0 : sem.capacity()
+            )
+            .catch((e: any) =>
+                log.error('adaptiveConsume loop crashed', { error: String(e) })
+            );
+    } else {
+        await (queue as any).consume(handler);
+    }
+}
+
+// Wait for active jobs to finish with a timeout and emit aborted events if needed
+async function waitForActiveJobsToFinish(
+    timeoutMs: number
+): Promise<{ timedOut: boolean; aborted: string[] }> {
+    const start = Date.now();
+    const pollMs = 100;
+    const getInflight = () =>
+        semGlobal?.inflight ?? (globalThis as any).__workerSem?.inflight ?? 0;
+    while (getInflight() > 0 && Date.now() - start < timeoutMs) {
+        // eslint-disable-next-line no-await-in-loop
+        await new Promise((r) => setTimeout(r, pollMs));
+    }
+    if (getInflight() === 0) return { timedOut: false, aborted: [] };
+    const aborted = Array.from(activeJobs);
+    for (const id of aborted) {
+        try {
+            await events.add({
+                jobId: id,
+                ts: new Date().toISOString(),
+                type: 'aborted:shutdown',
+                data: {},
+            });
+        } catch {}
+    }
+    return { timedOut: true, aborted };
 }
 
 if (import.meta.main) {
@@ -10742,12 +11314,154 @@ if (import.meta.main) {
         }
     };
     const stop = async () => {
+        shuttingDown = true;
         log.info('worker stopping');
         await queue.shutdown();
+        const timeoutMs = Number(
+            readEnv('WORKER_SHUTDOWN_TIMEOUT_MS') || 15000
+        );
+        const { timedOut, aborted } = await waitForActiveJobsToFinish(
+            timeoutMs
+        );
+        if (timedOut && aborted.length) {
+            log.warn('shutdown timeout; jobs aborted', {
+                count: aborted.length,
+                aborted,
+            });
+        }
         process.exit(0);
     };
     process.on('SIGINT', stop);
     process.on('SIGTERM', stop);
     run();
 }
+
+// Test hooks (non-production usage)
+export const __test = {
+    activeJobs,
+    startHeartbeatLoop,
+    metrics,
+    // recovery test hooks will be appended below after definition
+    // graceful shutdown test hooks
+    _internal: {
+        get inflight() {
+            return (globalThis as any).__workerSem?.inflight ?? 0;
+        },
+        setInflight(n: number) {
+            (globalThis as any).__workerSem = { inflight: n };
+            semGlobal = (globalThis as any).__workerSem;
+        },
+        waitForActiveJobsToFinish,
+    },
+};
+
+// ------------------ Recovery Scanner (Req 3) ------------------
+async function runRecoveryScan(now = new Date()) {
+    const heartbeatIntervalMs = Number(
+        readEnv('WORKER_HEARTBEAT_INTERVAL_MS') || 10_000
+    );
+    const leaseTimeoutSec = Number(
+        readEnv('WORKER_LEASE_TIMEOUT_SEC') ||
+            Math.ceil((heartbeatIntervalMs / 1000) * 3)
+    );
+    const maxAttempts = Number(readEnv('JOB_MAX_ATTEMPTS') || 3);
+    const staleCutoff = new Date(now.getTime() - leaseTimeoutSec * 1000);
+    const start = Date.now();
+    let requeued: { id: string }[] = [];
+    let exhausted: { id: string }[] = [];
+    await (sharedDb as any).transaction(async (tx: any) => {
+        // Requeue stale processing jobs under attempt limit
+        requeued = await tx
+            .update(jobsTable)
+            .set({
+                status: sql`'queued'::job_status`,
+                attemptCount: sql`${jobsTable.attemptCount} + 1`,
+                updatedAt: now,
+            })
+            .where(
+                and(
+                    eq(jobsTable.status, 'processing'),
+                    lt(jobsTable.lastHeartbeatAt, staleCutoff),
+                    lt(jobsTable.attemptCount, maxAttempts)
+                )
+            )
+            .returning({ id: jobsTable.id });
+        if (requeued.length) {
+            // Emit requeued:stale events
+            await tx.insert(jobEvents).values(
+                requeued.map((r) => ({
+                    jobId: r.id,
+                    ts: now,
+                    type: 'requeued:stale',
+                    data: null,
+                }))
+            );
+        }
+        // Mark exhausted attempts as failed
+        exhausted = await tx
+            .update(jobsTable)
+            .set({
+                status: sql`'failed'::job_status`,
+                errorCode: 'RETRIES_EXHAUSTED',
+                errorMessage: 'Lease expired and retry attempts exhausted',
+                updatedAt: now,
+            })
+            .where(
+                and(
+                    eq(jobsTable.status, 'processing'),
+                    lt(jobsTable.lastHeartbeatAt, staleCutoff),
+                    gte(jobsTable.attemptCount, maxAttempts)
+                )
+            )
+            .returning({ id: jobsTable.id });
+        if (exhausted.length) {
+            await tx.insert(jobEvents).values(
+                exhausted.map((r) => ({
+                    jobId: r.id,
+                    ts: now,
+                    type: 'failed',
+                    data: { code: 'RETRIES_EXHAUSTED' },
+                }))
+            );
+        }
+    });
+    if (requeued.length)
+        metrics.inc('worker.recovered_jobs_total', requeued.length, {
+            reason: 'stale',
+        });
+    if (exhausted.length)
+        metrics.inc('worker.retry_exhausted_total', exhausted.length);
+    metrics.observe('worker.recovery_scan_ms', Date.now() - start);
+    return {
+        requeued: requeued.map((r) => r.id),
+        exhausted: exhausted.map((r) => r.id),
+    };
+}
+
+function startRecoveryScanner() {
+    const intervalMsBase = Number(
+        readEnv('WORKER_RECOVERY_SCAN_INTERVAL_MS') || 30_000
+    );
+    let stopped = false;
+    (async () => {
+        while (!stopped && !shuttingDown) {
+            try {
+                await runRecoveryScan();
+            } catch (e) {
+                log.error('recovery scan failed', { error: String(e) });
+            }
+            const jitter = Math.floor(intervalMsBase * 0.1 * Math.random());
+            await new Promise((r) => setTimeout(r, intervalMsBase + jitter));
+        }
+    })();
+    return () => {
+        stopped = true;
+    };
+}
+
+// augment test hooks
+(__test as any).runRecoveryScan = runRecoveryScan;
+(__test as any).startRecoveryScanner = startRecoveryScanner;
+
+(__test as any).Semaphore = Semaphore;
 ````

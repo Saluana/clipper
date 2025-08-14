@@ -452,6 +452,8 @@ export const app = addHttpInstrumentation(baseApp)
                     status: job.status,
                     progress: job.progress,
                     resultVideoKey: job.resultVideoKey ?? undefined,
+                    resultVideoBurnedKey:
+                        (job as any).resultVideoBurnedKey ?? undefined,
                     resultSrtKey: job.resultSrtKey ?? undefined,
                     expiresAt: job.expiresAt ?? undefined,
                 },
@@ -514,6 +516,13 @@ export const app = addHttpInstrumentation(baseApp)
                 );
             }
             const videoUrl = await storage.sign(job.resultVideoKey);
+            let burnedUrl: string | undefined;
+            const burnedKey = (job as any).resultVideoBurnedKey;
+            if (burnedKey) {
+                try {
+                    burnedUrl = await storage.sign(burnedKey);
+                } catch {}
+            }
             let srtUrl: string | undefined;
             if (job.resultSrtKey) {
                 try {
@@ -526,6 +535,10 @@ export const app = addHttpInstrumentation(baseApp)
                 result: {
                     id: job.id,
                     video: { key: job.resultVideoKey, url: videoUrl },
+                    burnedVideo:
+                        burnedKey && burnedUrl
+                            ? { key: burnedKey, url: burnedUrl }
+                            : undefined,
                     srt:
                         job.resultSrtKey && srtUrl
                             ? { key: job.resultSrtKey, url: srtUrl }

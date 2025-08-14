@@ -36,6 +36,14 @@ export const CreateJobInput = z
                 path: ['youtubeUrl'],
             });
         }
+        if (val.burnSubtitles && !val.withSubtitles) {
+            ctx.addIssue({
+                code: z.ZodIssueCode.custom,
+                message:
+                    'burnSubtitles requires withSubtitles=true (server-side burn-in depends on SRT)',
+                path: ['burnSubtitles'],
+            });
+        }
     });
 
 export const JobRecord = z.object({
@@ -43,6 +51,7 @@ export const JobRecord = z.object({
     status: JobStatus,
     progress: z.number().min(0).max(100),
     resultVideoKey: z.string().optional(),
+    resultVideoBurnedKey: z.string().optional(),
     resultSrtKey: z.string().optional(),
     error: z.string().optional(),
     expiresAt: z.string(),
