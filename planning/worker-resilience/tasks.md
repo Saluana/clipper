@@ -66,22 +66,22 @@ artifact_id: a7e5c1d2-3b4f-45c6-8d17-9f1e2d3c4b5a
 
 ## 12. Observability Metrics
 
--   [ ] 12.1 heartbeats_total, heartbeat_failures_total (Req 11)
--   [ ] 12.2 recovered_jobs_total{reason} (Req 11)
--   [ ] 12.3 retry_attempts_total{code} (Req 11)
--   [ ] 12.4 duplicate_skips_total & acquire_conflicts_total (Req 6/11)
+-   [x] 12.1 heartbeats_total, heartbeat_failures_total (Req 11)
+-   [x] 12.2 recovered_jobs_total{reason} (Req 11)
+-   [x] 12.3 retry_attempts_total{code} (Req 11)
+-   [x] 12.4 duplicate_skips_total & acquire_conflicts_total (Req 6/11)
 
 ## 13. Event Timeline Consistency
 
--   [ ] 13.1 Ensure event ordering logic (Req 12)
--   [ ] 13.2 Test normal + recovery sequences (Req 12)
+-   [x] 13.1 Ensure event ordering logic (Req 12)
+-   [x] 13.2 Test normal + recovery sequences (Req 12)
 
 ## 14. Testing & Simulation
 
--   [ ] 14.1 Integration test simulated crash (Req 2)
--   [ ] 14.2 Concurrency limit test (Req 3)
--   [ ] 14.3 Retry exhaustion test (Req 7)
--   [ ] 14.4 Idempotent artifact skip test (Req 5)
+-   [x] 14.1 Integration test simulated crash (Req 2)
+-   [x] 14.2 Concurrency limit test (Req 3)
+-   [x] 14.3 Retry exhaustion test (Req 7)
+-   [x] 14.4 Idempotent artifact skip test (Req 5)
 
 ## 15. Rollout
 

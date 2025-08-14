@@ -36,7 +36,10 @@ const queue = new PgBossQueueAdapter({
     connectionString: requireEnv('DATABASE_URL'),
 });
 const clipper = new BunClipper();
+// Allow tests to inject a storage override
 const storage = (() => {
+    const override = (globalThis as any).__storageOverride;
+    if (override) return override;
     try {
         return createSupabaseStorageRepo();
     } catch (e) {
@@ -182,6 +185,48 @@ async function throttleProgress(
 }
 export const __progressTest = { throttleProgress };
 
+// ------------------ Idempotent Short-circuit Helper (Req 5) ------------------
+async function maybeShortCircuitIdempotent(
+    jobId: string,
+    finalKey: string,
+    correlationId: string
+): Promise<boolean> {
+    const s = (globalThis as any).__storageOverride || storage;
+    if (!s) return false;
+    try {
+        const signed = await s.sign(finalKey, 30);
+        const head = await fetch(signed, { method: 'HEAD' });
+        if (head.ok) {
+            log.info('idempotent skip existing artifact', {
+                jobId,
+                key: finalKey,
+            });
+            await events.add({
+                jobId,
+                ts: new Date().toISOString(),
+                type: 'uploaded',
+                data: { key: finalKey, correlationId },
+            });
+            await jobs.update(jobId, {
+                status: 'done',
+                progress: 100,
+                resultVideoKey: finalKey,
+            });
+            await events.add({
+                jobId,
+                ts: new Date().toISOString(),
+                type: 'done',
+                data: { correlationId },
+            });
+            metrics.inc('worker.idempotent_skips_total');
+            return true;
+        }
+    } catch {}
+    return false;
+}
+// expose for tests
+(globalThis as any).__idempotentTest = { maybeShortCircuitIdempotent };
+
 // ------------------ Retry Classification (Req 8) ------------------
 type RetryClass = 'retryable' | 'fatal';
 function classifyError(e: any): RetryClass {
@@ -213,7 +258,7 @@ async function handleRetryError(
                 .set({
                     status: sql`CASE WHEN ${jobsTable.attemptCount} + 1 < ${maxAttempts} THEN 'queued'::job_status ELSE 'failed'::job_status END`,
                     attemptCount: sql`${jobsTable.attemptCount} + 1`,
-                    errorCode: 'RETRYABLE_ERROR',
+                    errorCode: sql`CASE WHEN ${jobsTable.attemptCount} + 1 < ${maxAttempts} THEN 'RETRYABLE_ERROR' ELSE 'RETRIES_EXHAUSTED' END`,
                     errorMessage: String(err),
                     updatedAt: now,
                 })
@@ -414,6 +459,27 @@ async function main() {
                 return;
             }
             if (job.status === 'done') return;
+            // Duplicate suppression: if already processing and lease is fresh, skip (Req 6)
+            if (job.status === 'processing') {
+                const hbMs = Number(
+                    readEnv('WORKER_HEARTBEAT_INTERVAL_MS') || 10_000
+                );
+                const leaseSec = Number(
+                    readEnv('WORKER_LEASE_TIMEOUT_SEC') ||
+                        Math.ceil((hbMs / 1000) * 3)
+                );
+                const last = job.lastHeartbeatAt
+                    ? new Date(job.lastHeartbeatAt as any)
+                    : null;
+                const fresh = last
+                    ? Date.now() - last.getTime() < leaseSec * 1000
+                    : false;
+                if (fresh) {
+                    metrics.inc('worker.duplicate_skips_total');
+                    log.info('duplicate skip (fresh lease)', { jobId });
+                    return;
+                }
+            }
             if (job.status === 'queued') {
                 const acquired = await (sharedDb as any)
                     .update(jobsTable)
@@ -432,6 +498,7 @@ async function main() {
                     .returning({ id: jobsTable.id });
                 if (!acquired.length) {
                     metrics.inc('worker.acquire_conflicts_total');
+                    metrics.inc('worker.atomic_acquire_fail_total');
                     log.info('acquire conflict skip', { jobId });
                     return;
                 }
@@ -479,24 +546,8 @@ async function main() {
 
             const clipStart = Date.now();
             const finalKey = storageKeys.resultVideo(jobId);
-            if (storage) {
-                try {
-                    const signed = await storage.sign(finalKey, 30);
-                    const head = await fetch(signed, { method: 'HEAD' });
-                    if (head.ok) {
-                        log.info('idempotent skip existing artifact', {
-                            jobId,
-                            key: finalKey,
-                        });
-                        await finish('done', {
-                            progress: 100,
-                            resultVideoKey: finalKey,
-                        });
-                        metrics.inc('worker.idempotent_skips_total');
-                        return;
-                    }
-                } catch {}
-            }
+            // Idempotent short-circuit
+            if (await maybeShortCircuitIdempotent(jobId, finalKey, cid)) return;
             const tempDir = `/tmp/clipper/${jobId}`;
             scratchDir = tempDir;
             try {
