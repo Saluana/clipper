@@ -46,7 +46,7 @@ status: draft
 
 ## 4. Cleanup and retention
 
--   [ ] Ensure cleanup job removes `result_video_burned_key` artifact.
+-   [x] Ensure cleanup job removes `result_video_burned_key` artifact.
     -   Requirements: 8.2
 
 ## 5. Tests

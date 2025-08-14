@@ -58,9 +58,12 @@ export async function cleanupExpiredJobs(
 
     for (const r of rows) {
         const jobId = r.id as string;
-        const keys = [r.resultVideoKey, r.resultSrtKey].filter(
-            (k): k is string => !!k
-        );
+        const keys = [
+            r.resultVideoKey,
+            // include burned video artifact if present
+            (r as any).resultVideoBurnedKey,
+            r.resultSrtKey,
+        ].filter((k): k is string => !!k);
         result.items.push({ jobId, resultKeys: keys });
 
         if (dryRun) continue;

@@ -115,3 +115,36 @@ test('cleanup removes expired job objects', async () => {
     const remaining = await db.select().from(jobs).where(eq(jobs.id, jobId));
     expect(remaining.length).toBe(0);
 });
+
+test('cleanup also removes burned video artifact when present', async () => {
+    await ensureSchema();
+    const db = createDb();
+    const jobId = crypto.randomUUID();
+    const videoKey = storageKeys.resultVideo(jobId);
+    const burnedKey = storageKeys.resultVideoBurned(jobId);
+    const srtKey = storageKeys.resultSrt(jobId);
+    const row: NewJob = {
+        id: jobId,
+        status: 'done',
+        progress: 100,
+        sourceType: 'upload',
+        startSec: 0,
+        endSec: 1,
+        withSubtitles: true,
+        burnSubtitles: true,
+        resultVideoKey: videoKey,
+        // burned key persisted in the same row
+        resultVideoBurnedKey: burnedKey as any,
+        resultSrtKey: srtKey,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        expiresAt: new Date(Date.now() - 1000),
+    } as any;
+    await db.insert(jobs).values(row);
+    const storage = new MemoryStorage();
+    const res = await cleanupExpiredJobs({ dryRun: false, storage });
+    expect(res.deletedJobs).toBeGreaterThanOrEqual(1);
+    expect(storage.removed).toEqual(
+        expect.arrayContaining([videoKey, burnedKey, srtKey])
+    );
+});
