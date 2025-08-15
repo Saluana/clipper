@@ -12,9 +12,12 @@ import {
     createLogger,
     readEnv,
     readIntEnv,
+    readFloatEnv,
+    readBoolEnv,
     requireEnv,
     fromException,
 } from '@clipper/common';
+import { validateRange, coerceNearZeroDuration } from '@clipper/common/time';
 import {
     DrizzleJobsRepo,
     DrizzleJobEventsRepo,
@@ -344,20 +347,41 @@ export const app = addHttpInstrumentation(baseApp)
             }
             const input = parsed.data as CreateJobInputType;
             const id = crypto.randomUUID();
-            const startSec = tcToSec(input.start);
-            const endSec = tcToSec(input.end);
-            if (
-                endSec - startSec >
-                Number(readIntEnv('MAX_CLIP_SECONDS', 120))
-            ) {
+            // Env-driven validation & coercion
+            const maxDurationSec = Number(readIntEnv('MAX_CLIP_SECONDS', 120));
+            const minDurationSec = Number(
+                readFloatEnv('MIN_DURATION_SEC', 0.5) ?? 0.5
+            );
+            const coerceMin = readBoolEnv('COERCE_MIN_DURATION', false);
+
+            const validated = validateRange(input.start, input.end, {
+                maxDurationSec,
+            });
+            if (!validated.ok) {
+                if (validated.reason === 'duration_exceeds_cap') {
+                    return buildError(
+                        set,
+                        400,
+                        'CLIP_TOO_LONG',
+                        `Clip exceeds MAX_CLIP_SECONDS (${maxDurationSec}s)`,
+                        correlationId
+                    );
+                }
                 return buildError(
                     set,
                     400,
-                    'CLIP_TOO_LONG',
-                    'Clip exceeds MAX_CLIP_SECONDS',
+                    'VALIDATION_FAILED',
+                    'start must be before end and within max duration',
                     correlationId
                 );
             }
+            let { startSec, endSec } = validated;
+            const coerced = coerceNearZeroDuration(startSec, endSec, {
+                minDurationSec,
+                coerce: coerceMin,
+            });
+            startSec = coerced.startSec;
+            endSec = coerced.endSec;
             const retentionHours = Number(readIntEnv('RETENTION_HOURS', 72));
             const expiresAt = new Date(Date.now() + retentionHours * 3600_000);
             const row = await jobsRepo.create({

@@ -44,6 +44,20 @@ export const CreateJobInput = z
                 path: ['burnSubtitles'],
             });
         }
+        // start/end relationship basic check (detailed limits in API handler)
+        try {
+            const [sh, sm, ss] = val.start.split(':');
+            const [eh, em, es] = val.end.split(':');
+            const s = Number(sh) * 3600 + Number(sm) * 60 + Number(ss);
+            const e = Number(eh) * 3600 + Number(em) * 60 + Number(es);
+            if (!(s < e)) {
+                ctx.addIssue({
+                    code: z.ZodIssueCode.custom,
+                    message: 'start must be before end',
+                    path: ['start'],
+                });
+            }
+        } catch {}
     });
 
 export const JobRecord = z.object({

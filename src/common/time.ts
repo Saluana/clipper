@@ -38,3 +38,20 @@ export function validateRange(
         return { ok: false as const, reason: 'duration_exceeds_cap' };
     return { ok: true as const, startSec: start, endSec: end };
 }
+
+export function coerceNearZeroDuration(
+    startSec: number,
+    endSec: number,
+    opts: { minDurationSec: number; coerce: boolean }
+): { startSec: number; endSec: number; coerced: boolean } {
+    const duration = endSec - startSec;
+    if (duration >= opts.minDurationSec) {
+        return { startSec, endSec, coerced: false };
+    }
+    if (!opts.coerce) {
+        return { startSec, endSec, coerced: false };
+    }
+    // Coerce by extending end time to meet min duration
+    const newEnd = startSec + opts.minDurationSec;
+    return { startSec, endSec: newEnd, coerced: true };
+}

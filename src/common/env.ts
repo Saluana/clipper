@@ -29,3 +29,21 @@ export function readIntEnv(
     if (Number.isNaN(n)) return defaultValue;
     return n;
 }
+
+export function readFloatEnv(
+    key: string,
+    defaultValue?: number
+): number | undefined {
+    const v = readEnv(key);
+    if (v == null || v === '') return defaultValue;
+    const n = Number(v);
+    if (!Number.isFinite(n)) return defaultValue;
+    return n;
+}
+
+export function readBoolEnv(key: string, defaultValue = false): boolean {
+    const v = readEnv(key);
+    if (v == null || v === '') return defaultValue;
+    const low = v.toLowerCase();
+    return low === '1' || low === 'true' || low === 'yes' || low === 'on';
+}
