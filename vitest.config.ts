@@ -14,9 +14,9 @@ export default defineConfig({
         },
     },
     test: {
-    include: ['src/**/*.test.ts', 'src/**/*.integration.test.ts'],
-    // Exclude Bun-runner tests from Vitest runs
-    exclude: ['src/**/*.bun.test.ts'],
+        include: ['src/**/*.test.ts', 'src/**/*.integration.test.ts'],
+        // Exclude Bun-runner tests from Vitest runs
+        exclude: ['src/**/*.bun.test.ts'],
         testTimeout: 60000,
         setupFiles: ['src/test/setup.ts'],
     },

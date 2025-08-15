@@ -17,6 +17,7 @@ export interface ResourceSamplerOptions {
  *  - proc.memory_rss_mb (gauge)
  *  - scratch.disk_used_pct (gauge)   ( -1 when capacity unknown )
  *  - event_loop.lag_ms (histogram)
+ *  - proc.open_fds (gauge)          (best-effort via lsof; -1 on failure)
  */
 export class ResourceSampler {
     private readonly metrics: MetricsRegistry;
@@ -67,6 +68,7 @@ export class ResourceSampler {
         }
         this.lastTick = now;
         this.sampleMemory();
+        await this.sampleOpenFds();
         await this.sampleScratch();
     }
 
@@ -75,6 +77,31 @@ export class ResourceSampler {
             const rss = (process.memoryUsage?.().rss ?? 0) / (1024 * 1024);
             this.metrics.setGauge('proc.memory_rss_mb', Number(rss.toFixed(2)));
         } catch {}
+    }
+
+    private async sampleOpenFds() {
+        try {
+            const pid = process.pid?.toString?.() ?? '';
+            if (!pid) return;
+            // Use lsof if available; output lines include header; subtract 1
+            const proc = Bun.spawn(
+                [
+                    'bash',
+                    '-lc',
+                    `command -v lsof >/dev/null 2>&1 && lsof -p ${pid} | wc -l || echo 0`,
+                ],
+                {
+                    stdout: 'pipe',
+                    stderr: 'ignore',
+                }
+            );
+            const out = await new Response(proc.stdout).text();
+            await proc.exited;
+            const n = Math.max(0, (Number(out.trim()) || 0) - 1);
+            this.metrics.setGauge('proc.open_fds', n);
+        } catch {
+            this.metrics.setGauge('proc.open_fds', -1);
+        }
     }
 
     private async sampleScratch() {

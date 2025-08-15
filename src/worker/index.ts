@@ -20,6 +20,7 @@ import { inArray, and, eq, lt, gte, sql } from 'drizzle-orm';
 import { jobEvents, jobs as jobsTable } from '@clipper/data/db/schema';
 import { AsrFacade } from '@clipper/asr/facade';
 import { InMemoryMetrics } from '@clipper/common/metrics';
+import { startResourceSampler } from '@clipper/common/resource-sampler';
 import { withStage } from './stage';
 import os from 'os';
 import { classifyError as _classifyErrorUtil, getMaxRetries } from './retry';
@@ -492,6 +493,9 @@ async function main() {
                 return;
             }
             activeJobs.add(jobId);
+            try {
+                metrics.setGauge('worker.inflight_jobs', activeJobs.size);
+            } catch {}
 
             const resolveRes = await withStage(metrics, 'resolve', async () => {
                 if (job.sourceType === 'upload') {
@@ -740,6 +744,9 @@ async function main() {
         } finally {
             activeJobs.delete(jobId);
             try {
+                metrics.setGauge('worker.inflight_jobs', activeJobs.size);
+            } catch {}
+            try {
                 await jobs.update(jobId, { lastHeartbeatAt: nowIso() } as any);
             } catch {}
             if (cleanup) {
@@ -800,6 +807,8 @@ async function waitForActiveJobsToFinish(
 if (import.meta.main) {
     const run = async () => {
         try {
+            // Start resource sampler in worker too
+            startResourceSampler(metrics, { intervalMs: 15000 });
             await main();
         } catch (e) {
             log.error('worker crashed', { err: String(e) });

@@ -12,7 +12,8 @@ export async function withExternal<T>(
     opts: ExternalCallOptions,
     fn: (signal: AbortSignal) => Promise<T>
 ): Promise<T> {
-    const { dep, op } = opts;
+    const { dep, op } = opts; // keep option name for compatibility
+    const service = dep; // expose as 'service' label in metrics per docs
     const start = performance.now();
     const controller = new AbortController();
     let timeout: any;
@@ -24,22 +25,26 @@ export async function withExternal<T>(
     }
     try {
         const res = await fn(controller.signal);
-        metrics.inc('external.calls_total', 1, { dep, op, status: 'ok' });
+        metrics.inc('external.calls_total', 1, {
+            service,
+            op,
+            outcome: 'ok',
+        });
         metrics.observe('external.call_latency_ms', performance.now() - start, {
-            dep,
+            service,
             op,
         });
         return res;
     } catch (e) {
         const code = classifyExternalError(e, opts.classifyError);
         metrics.inc('external.calls_total', 1, {
-            dep,
+            service,
             op,
-            status: 'err',
+            outcome: 'err',
             code,
         });
         metrics.observe('external.call_latency_ms', performance.now() - start, {
-            dep,
+            service,
             op,
         });
         throw e;

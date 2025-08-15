@@ -75,7 +75,7 @@ Assume counters are exposed to a Prometheus scraper via future adapter (Task 15.
 -   Job Completion Latency (burn alert): histogram_quantile(0.95, sum(rate(jobs.total_latency_ms_bucket[5m])) by (le)) < 300000
 -   ASR Success Rate: sum(rate(asr.completed[5m])) / (sum(rate(asr.completed[5m])) + sum(rate(asr.failures[5m])))
 -   Event Persistence Failure Ratio: sum(rate(events.persist_failures_total[5m])) / sum(rate(events.persist_failures_total[5m]) + 1) (Alert when > 0.0001)
--   External Failure Ratio: sum(rate(external.failures_total[5m])) / sum(rate(external.calls_total[5m])) (Naming illustrative; actual labels depend on wrapper implementation)
+-   External Failure Ratio: sum(rate(external.calls_total{outcome="err"}[5m])) / sum(rate(external.calls_total[5m]))
 
 ### Burn Rate Alert Examples (Pseudo)
 
@@ -93,3 +93,24 @@ Where availability_error_ratio = sum(rate(http.errors_total{code=~"5.."}[window]
 ## Adding New Metrics
 
 Follow naming: `<domain>.<action>[_<unit>]` with `_ms` for millisecond durations, plural nouns for counts (e.g., `jobs.created`). Keep domain sets small & stable.
+
+## Worker Stages (Req 4)
+
+-   worker.stage_latency_ms{stage} (histogram) — Duration for stages: resolve, clip, upload, asr.
+-   worker.stage_failures_total{stage,code} (counter) — Classified stage failures (timeout|not_found|network|error...).
+
+## External Dependencies (Req 5)
+
+-   external.calls_total{service,op,outcome[,code]} (counter) — Upstream call attempts (service: yt_dlp|ffprobe|storage|asr; outcome: ok|err; code on error: timeout|not_found|auth|network|too_large|error|custom).
+-   external.call_latency_ms{service,op} (histogram) — Duration per external operation.
+
+## Worker Gauges
+
+-   worker.inflight_jobs (gauge) — Current number of active jobs being processed by this worker instance.
+
+## Process & Runtime (Req 6)
+
+-   proc.memory_rss_mb (gauge) — Resident memory in MB.
+-   proc.open_fds (gauge) — Open file descriptor count (best-effort; -1 if unavailable).
+-   scratch.disk_used_pct (gauge) — % usage of scratch directory (or -1 if unknown).
+-   event_loop.lag_ms (histogram) — Event loop delay; measures scheduling latency of the sampler.

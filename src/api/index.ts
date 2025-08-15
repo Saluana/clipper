@@ -26,6 +26,7 @@ import {
     createSupabaseStorageRepo,
 } from '@clipper/data';
 import { InMemoryMetrics, normalizeRoute } from '@clipper/common/metrics';
+import { startResourceSampler } from '@clipper/common/resource-sampler';
 import { PgBossQueueAdapter } from '@clipper/queue';
 
 export const metrics = new InMemoryMetrics();
@@ -529,7 +530,10 @@ export const app = addHttpInstrumentation(baseApp)
             if (job.status === 'failed') {
                 const code = job.errorCode || 'INTERNAL';
                 // Map worker/job error codes to HTTP
-                const map: Record<string, { status: number; code: string; msg?: string }> = {
+                const map: Record<
+                    string,
+                    { status: number; code: string; msg?: string }
+                > = {
                     OUTPUT_VERIFICATION_FAILED: {
                         status: 422,
                         code: 'OUTPUT_VERIFICATION_FAILED',
@@ -615,6 +619,8 @@ export const app = addHttpInstrumentation(baseApp)
 
 if (import.meta.main) {
     const port = Number(readIntEnv('PORT', 3000));
+    // Start lightweight resource sampler (CPU/mem/event-loop) (Req 6)
+    startResourceSampler(metrics, { intervalMs: 15000 });
     const server = Bun.serve({ fetch: app.fetch, port });
     log.info('API started', { port });
     const stop = async () => {
