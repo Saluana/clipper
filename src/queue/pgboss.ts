@@ -63,7 +63,10 @@ export class PgBossQueueAdapter implements QueueAdapter {
             )
         );
         const retryLimit = Number(
-            readIntEnv('QUEUE_MAX_ATTEMPTS', this.opts.maxAttempts ?? 3)
+            readIntEnv(
+                'MAX_RETRIES',
+                readIntEnv('QUEUE_MAX_ATTEMPTS', this.opts.maxAttempts ?? 3)
+            )
         );
         try {
             await this.boss.createQueue(this.topic, {
@@ -103,7 +106,10 @@ export class PgBossQueueAdapter implements QueueAdapter {
             )
         );
         const attemptLimit = Number(
-            readIntEnv('QUEUE_MAX_ATTEMPTS', this.opts.maxAttempts ?? 3)
+            readIntEnv(
+                'MAX_RETRIES',
+                readIntEnv('QUEUE_MAX_ATTEMPTS', this.opts.maxAttempts ?? 3)
+            )
         );
         const priority = priorityMap[msg.priority ?? 'normal'];
         await this.boss!.send(this.topic, msg as object, {

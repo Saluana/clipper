@@ -36,9 +36,9 @@ artifact_id: 6c8db0e8-2db6-4c4c-8e6e-3a4c7e4f9d5e
 
 ## 6. Retry Classification
 
--   [ ] 6.1 Implement `classifyError` and wire into worker retry policy (Req 6)
--   [ ] 6.2 Respect MAX_RETRIES and backoff; mark RETRY_EXHAUSTED (Req 6)
--   [ ] 6.3 Unit tests for classification (Req 6)
+-   [x] 6.1 Implement `classifyError` and wire into worker retry policy (Req 6)
+-   [x] 6.2 Respect MAX_RETRIES and backoff; mark RETRY_EXHAUSTED (Req 6)
+-   [x] 6.3 Unit tests for classification (Req 6)
 
 ## 7. Cleanup Consistency
 
