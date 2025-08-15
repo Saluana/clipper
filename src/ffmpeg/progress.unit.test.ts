@@ -35,4 +35,27 @@ describe('parseFfmpegProgress', () => {
         }
         expect(seen).toEqual([100]);
     });
+
+    it('caps at 99% until exit even if ffmpeg reports >=100%', async () => {
+        const totalSec = 10;
+        const times = [9_900_000, 10_000_000, 11_000_000];
+        const stream = makeProgressStream(times);
+        const seen: number[] = [];
+        for await (const pct of parseFfmpegProgress(stream, totalSec)) {
+            seen.push(pct);
+        }
+        // The last before 100 should be 99
+        expect(seen[seen.length - 2]).toBe(99);
+        expect(seen.at(-1)).toBe(100);
+    });
+
+    it('emits 100 immediately for near-zero durations (< MIN_DURATION_SEC)', async () => {
+        // Default MIN_DURATION_SEC in env.ts readers is 0.5; use 0.5 behavior
+        const s = makeProgressStream([100_000]);
+        const seen: number[] = [];
+        for await (const pct of parseFfmpegProgress(s, 0.25)) {
+            seen.push(pct);
+        }
+        expect(seen).toEqual([100]);
+    });
 });

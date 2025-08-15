@@ -5,14 +5,21 @@
  * - Input: raw ReadableStream<Uint8Array> from ffmpeg stdout configured with `-progress pipe:1`.
  * - Emits: monotonically increasing integers 0..100 (holding at 99 until process exit) then a final 100.
  * - Zero / invalid total duration → emits 100 immediately.
+ * - Near-zero total duration (< MIN_DURATION_SEC) → emits 100 immediately.
  *
  * Parsing focuses on `out_time_ms` lines; other lines are ignored.
  */
+import { readFloatEnv } from '@clipper/common/env';
 export async function* parseFfmpegProgress(
     stream: ReadableStream<Uint8Array>,
     totalDurationSec: number
 ): AsyncIterable<number> {
-    if (totalDurationSec <= 0 || !Number.isFinite(totalDurationSec)) {
+    const minDur = readFloatEnv('MIN_DURATION_SEC', 0.5) ?? 0.5;
+    if (
+        totalDurationSec <= 0 ||
+        !Number.isFinite(totalDurationSec) ||
+        totalDurationSec < minDur
+    ) {
         // Degenerate case: emit 100 immediately
         yield 100;
         return;
