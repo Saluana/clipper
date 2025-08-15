@@ -22,6 +22,27 @@ Fast, reliable sub-clipping of source media while:
 7. Upload artifact.
 8. Emit final job completion (future: attach performance metrics, source metadata, waveform, subtitles).
 
+## Verification Gate (OutputVerifier)
+
+Every produced output is validated before upload using a strict verifier:
+
+-   Duration within tolerance of target segment
+-   Presence of required streams (video or audio)
+-   For MP4/MOV: faststart (moov before mdat) is required
+-   For re-encoded outputs: codec allowlists (video=h264, audio=aac)
+
+Behavior by path:
+
+-   Copy success → verify with tolerance 1.0s → on failure, the file is deleted and we fallback to re-encode
+-   Re-encode success → verify with tolerance 0.5s plus codec allowlists → on failure, delete and surface OUTPUT_VERIFICATION_FAILED
+
+Related env flags (defaults in parentheses):
+
+-   VERIFY_TOLERANCE_SEC (0.5) — base tolerance; copy path passes 1.0 explicitly
+-   VERIFY_REQUIRE_FASTSTART (true) — require +faststart for MP4/MOV
+
+Failure code surfaced to API (via worker): `OUTPUT_VERIFICATION_FAILED` (HTTP 422)
+
 ## Progress Parsing
 
 FFmpeg with `-progress pipe:1 -nostats` yields lines like:
@@ -41,9 +62,24 @@ Edge cases handled:
 -   Non-monotonic or duplicated `out_time_ms` (ignored if lower than previous)
 -   Duration overrun (clamped to 99)
 
+## Keyframe Guardrails (Copy Decision)
+
+Stream copy is only attempted when keyframes are near the requested start if enabled:
+
+-   REQUIRE_KEYFRAME_FOR_COPY (false) — when true, copy path runs only if a keyframe is close to start
+-   KEYFRAME_PROXIMITY_SEC (0.5) — maximum allowed keyframe distance from start
+
+Mechanics: we ask ffprobe to scan keyframes near the requested start using `-read_intervals <start>%+#2` and compute the first keyframe timestamp ahead of the start. If the delta exceeds the proximity window, we skip copy and go straight to re-encode for accuracy.
+
 ## Error Strategy
 
-Copy attempt failure automatically triggers fallback. Re-encode failure surfaces a structured ServiceError (consider specialized code FFMPEG_FAILED). Stderr is truncated (first N lines) to avoid bloating logs.
+-   Copy attempt failure automatically triggers fallback (no user-visible error)
+-   Re-encode failure (or verification failure) surfaces a structured ServiceError which maps to API error envelopes.
+    -   Verification failure → `OUTPUT_VERIFICATION_FAILED`
+    -   Source unreadable at probe → `SOURCE_UNREADABLE`
+    -   Both attempts fail (rare) → `BAD_REQUEST` with an ffmpeg exit summary
+    -   The API maps failures to stable HTTP codes: 422/503/etc.
+    -   Stderr is truncated to avoid bloating logs.
 
 ## Concurrency & Temp Files
 
@@ -51,7 +87,7 @@ Each job gets an isolated scratch subdirectory: `${SCRATCH_DIR}/jobs/<jobId>/`. 
 
 ## Potential Improvements
 
--   Smart keyframe alignment: probe first keyframe after start to decide copy viability before running attempt
+-   Smarter keyframe alignment heuristics (pre-checked via ffprobe already; could expand window/backtracking)
 -   Waveform generation (`-filter_complex astats|showwavespic`) for preview thumbnails
 -   Thumbnail sprite extraction
 -   Subtitle burn-in option (if SRT present)
@@ -67,9 +103,9 @@ Each job gets an isolated scratch subdirectory: `${SCRATCH_DIR}/jobs/<jobId>/`. 
 
 ## Observability TODOs
 
--   Emit timing metrics: copy_attempt_ms, transcode_attempt_ms
--   Record whether fallback was required (boolean) for optimization insights
--   Count errors by failure phase (copy vs reencode)
+-   Stage timers recorded via worker.stage_latency_ms{stage}
+-   External call timings via external.call_latency_ms{service,op}
+-   Clip totals and upload timings via clip.total_ms and clip.upload_ms
 
 ## Security Considerations
 
@@ -78,4 +114,4 @@ Each job gets an isolated scratch subdirectory: `${SCRATCH_DIR}/jobs/<jobId>/`. 
 
 ---
 
-Last updated: (add date when editing)
+Last updated: 2025-08-15

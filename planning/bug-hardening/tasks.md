@@ -48,19 +48,19 @@ artifact_id: 6c8db0e8-2db6-4c4c-8e6e-3a4c7e4f9d5e
 
 ## 8. Error Envelope & Codes
 
--   [ ] 8.1 Ensure API maps worker errors to stable codes and envelopes (Req 8)
--   [ ] 8.2 Add tests verifying error shapes (Req 8)
+-   [x] 8.1 Ensure API maps worker errors to stable codes and envelopes (Req 8)
+-   [x] 8.2 Add tests verifying error shapes (Req 8)
 
 ## 9. Metrics & Observability
 
--   [ ] 9.1 Add counters/histograms as specified (Req 9)
--   [ ] 9.2 Update docs/metrics.md with new series (Req 9,10)
+-   [x] 9.1 Add counters/histograms as specified (Req 9)
+-   [x] 9.2 Update docs/metrics.md with new series (Req 9,10)
 -   [ ] 9.3 Dashboards/alerts placeholders (optional) (Req 9)
 
 ## 10. Documentation
 
--   [ ] 10.1 Update docs/ffmpeg.md: verification, keyframe guardrails, flags (Req 10)
--   [ ] 10.2 Update docs/guide.md: near-zero handling and errors (Req 10)
+-   [x] 10.1 Update docs/ffmpeg.md: verification, keyframe guardrails, flags (Req 10)
+-   [x] 10.2 Update docs/guide.md: near-zero handling and errors (Req 10)
 
 ## Mapping to Requirements
 

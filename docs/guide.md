@@ -74,6 +74,13 @@ You will see `status` change to `processing`, progress values, then `done`.
 
 Events show lifecycle: `created`, `processing`, `source:ready`, periodic `progress`, `uploaded`, `done`.
 
+Near‑zero duration handling: If your requested duration is below the configured minimum, the service can optionally coerce it up to a minimum window.
+
+-   MIN_DURATION_SEC (default 0.5)
+-   COERCE_MIN_DURATION (false by default). When true, end time is extended to meet MIN_DURATION_SEC.
+
+If coercion is disabled and the duration is below the minimum, the request will be rejected by validation.
+
 ---
 
 ## 5. Fetch the Result
@@ -89,6 +96,19 @@ curl -L "<signedUrl>" -o clip.mp4
 ```
 
 Play it to verify.
+
+Error envelopes: When a job fails, the API returns a stable error shape:
+
+```
+{ "error": { "code": "...", "message": "...", "correlationId": "..." } }
+```
+
+Common codes:
+
+-   OUTPUT_VERIFICATION_FAILED (422)
+-   SOURCE_UNREADABLE (422)
+-   RETRYABLE_ERROR (503)
+-   RETRIES_EXHAUSTED (422)
 
 ---
 
@@ -121,13 +141,15 @@ The result endpoint will include `burnedVideo` alongside `video` and optional `s
 
 ## 8. Troubleshooting
 
-| Symptom                 | Action                                                           |
-| ----------------------- | ---------------------------------------------------------------- |
-| `YTDLP_NOT_FOUND`       | Install `yt-dlp` or set `YTDLP_BIN` env path                     |
-| `INPUT_TOO_LARGE`       | Adjust `MAX_INPUT_MB` / download smaller format (`YTDLP_FORMAT`) |
-| Stuck at `queued`       | Ensure worker process running and queue connected (DATABASE_URL) |
-| `STORAGE_UPLOAD_FAILED` | Verify Supabase credentials & bucket; check object size limit    |
-| Wrong duration          | Re-encode fallback now auto-corrects; ensure ffmpeg in PATH      |
+| Symptom                      | Action                                                                              |
+| ---------------------------- | ----------------------------------------------------------------------------------- |
+| `YTDLP_NOT_FOUND`            | Install `yt-dlp` or set `YTDLP_BIN` env path                                        |
+| `INPUT_TOO_LARGE`            | Adjust `MAX_INPUT_MB` / download smaller format (`YTDLP_FORMAT`)                    |
+| `OUTPUT_VERIFICATION_FAILED` | Ensure ffmpeg present; try enabling re-encode path (it’s automatic on copy failure) |
+| `SOURCE_UNREADABLE`          | Input could not be probed/read. Verify file exists and is supported.                |
+| Stuck at `queued`            | Ensure worker process running and queue connected (DATABASE_URL)                    |
+| `STORAGE_UPLOAD_FAILED`      | Verify Supabase credentials & bucket; check object size limit                       |
+| Wrong duration               | Re-encode fallback now auto-corrects; ensure ffmpeg in PATH                         |
 
 View logs with `LOG_LEVEL=debug` for granular ffmpeg / yt-dlp details.
 
