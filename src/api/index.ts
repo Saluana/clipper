@@ -525,6 +525,34 @@ export const app = addHttpInstrumentation(baseApp)
                     correlationId
                 );
             }
+            // If job failed, map worker error to stable API envelope
+            if (job.status === 'failed') {
+                const code = job.errorCode || 'INTERNAL';
+                // Map worker/job error codes to HTTP
+                const map: Record<string, { status: number; code: string; msg?: string }> = {
+                    OUTPUT_VERIFICATION_FAILED: {
+                        status: 422,
+                        code: 'OUTPUT_VERIFICATION_FAILED',
+                    },
+                    SOURCE_UNREADABLE: {
+                        status: 422,
+                        code: 'SOURCE_UNREADABLE',
+                    },
+                    RETRYABLE_ERROR: { status: 503, code: 'RETRYABLE_ERROR' },
+                    RETRIES_EXHAUSTED: {
+                        status: 422,
+                        code: 'RETRIES_EXHAUSTED',
+                    },
+                };
+                const m = map[code] || { status: 500, code: 'INTERNAL' };
+                return buildError(
+                    set,
+                    m.status,
+                    m.code,
+                    job.errorMessage || m.code,
+                    correlationId
+                );
+            }
             if (!job.resultVideoKey || job.status !== 'done') {
                 return buildError(
                     set,
