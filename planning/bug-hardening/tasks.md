@@ -17,9 +17,9 @@ artifact_id: 6c8db0e8-2db6-4c4c-8e6e-3a4c7e4f9d5e
 
 ## 3. Copy Decision Guardrails
 
--   [ ] 3.1 Add `shouldAttemptCopy` utility + feature flag (Req 3)
--   [ ] 3.2 Integrate into `clipper.ts` path selection (Req 3)
--   [ ] 3.3 Unit tests for decision logic (Req 3)
+-   [x] 3.1 Add `shouldAttemptCopy` utility + feature flag (Req 3)
+-   [x] 3.2 Integrate into `clipper.ts` path selection (Req 3)
+-   [x] 3.3 Unit tests for decision logic (Req 3)
 
 ## 4. Output Verification
 

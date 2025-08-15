@@ -10,6 +10,7 @@ import { createLogger, readEnv } from '@clipper/common';
 import { mkdir } from 'node:fs/promises';
 import { ServiceError } from '@clipper/common/errors';
 import { probeSource } from './probe';
+import { shouldAttemptCopy } from './copy-decision.ts';
 
 const log = createLogger((readEnv('LOG_LEVEL') as any) || 'info').with({
     mod: 'ffmpeg',
@@ -219,8 +220,19 @@ export class BunClipper implements Clipper {
             return { attempt: attemptRes, progress$ };
         };
 
-        // Fast path attempt
-        const copyResult = await attempt('copy');
+        // Decide whether to attempt copy first based on keyframe proximity
+        let copyAllowed = true;
+        try {
+            copyAllowed = await shouldAttemptCopy({
+                inputPath: args.input,
+                startSec: args.startSec,
+            });
+        } catch {}
+
+        // Fast path attempt (conditionally)
+        const copyResult = copyAllowed
+            ? await attempt('copy')
+            : { attempt: { ok: false, code: -1 } };
         if (copyResult.attempt.ok) {
             // Validate duration accuracy; tolerate +/- 1s drift; if larger drift fallback to precise re-encode
             const observed = await probeDuration(outPath);
