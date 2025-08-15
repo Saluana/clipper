@@ -22,6 +22,7 @@ import { AsrFacade } from '@clipper/asr/facade';
 import { InMemoryMetrics } from '@clipper/common/metrics';
 import { withStage } from './stage';
 import os from 'os';
+import { classifyError as _classifyErrorUtil, getMaxRetries } from './retry';
 export * from './asr.ts';
 
 const log = createLogger((readEnv('LOG_LEVEL') as any) || 'info').with({
@@ -230,16 +231,7 @@ async function maybeShortCircuitIdempotent(
 // ------------------ Retry Classification (Req 8) ------------------
 type RetryClass = 'retryable' | 'fatal';
 function classifyError(e: any): RetryClass {
-    const msg = String(e?.message || e || '');
-    if (
-        /CLIP_TIMEOUT|STORAGE_NOT_AVAILABLE|storage_upload_failed|timeout|fetch|network|ECONN|EAI_AGAIN|ENOTFOUND|5\d{2}/i.test(
-            msg
-        )
-    ) {
-        return 'retryable';
-    }
-    if (/OUTPUT_EMPTY|OUTPUT_MISSING/i.test(msg)) return 'fatal';
-    return 'fatal';
+    return _classifyErrorUtil(e);
 }
 async function handleRetryError(
     jobId: string,
@@ -249,7 +241,7 @@ async function handleRetryError(
     const now = new Date();
     const clazz = classifyError(err);
     if (clazz === 'retryable') {
-        const maxAttempts = Number(readEnv('JOB_MAX_ATTEMPTS') || 3);
+        const maxAttempts = getMaxRetries();
         let attemptCountOut = 0;
         let statusOut = 'queued';
         await (sharedDb as any).transaction(async (tx: any) => {
@@ -689,7 +681,7 @@ async function main() {
         } catch (e) {
             const clazz = classifyError(e);
             if (clazz === 'retryable') {
-                const maxAttempts = Number(readEnv('JOB_MAX_ATTEMPTS') || 3);
+                const maxAttempts = getMaxRetries();
                 const updated = await (sharedDb as any)
                     .update(jobsTable)
                     .set({
@@ -867,7 +859,7 @@ async function runRecoveryScan(now = new Date()) {
         readEnv('WORKER_LEASE_TIMEOUT_SEC') ||
             Math.ceil((heartbeatIntervalMs / 1000) * 3)
     );
-    const maxAttempts = Number(readEnv('JOB_MAX_ATTEMPTS') || 3);
+    const maxAttempts = getMaxRetries();
     const staleCutoff = new Date(now.getTime() - leaseTimeoutSec * 1000);
     const start = Date.now();
     let requeued: { id: string }[] = [];

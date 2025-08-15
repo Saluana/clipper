@@ -30,9 +30,9 @@ artifact_id: 6c8db0e8-2db6-4c4c-8e6e-3a4c7e4f9d5e
 
 ## 5. Progress Semantics
 
--   [ ] 5.1 Ensure progress parser caps at 99% until exit and emits final 100% (Req 5)
--   [ ] 5.2 Near-zero duration fast-path to 100% (Req 5)
--   [ ] 5.3 Unit tests for progress logic (Req 5)
+-   [x] 5.1 Ensure progress parser caps at 99% until exit and emits final 100% (Req 5)
+-   [x] 5.2 Near-zero duration fast-path to 100% (Req 5)
+-   [x] 5.3 Unit tests for progress logic (Req 5)
 
 ## 6. Retry Classification
 
