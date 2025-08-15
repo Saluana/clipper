@@ -4,9 +4,16 @@ import { readFile, writeFile, stat } from 'node:fs/promises';
 import { spawn as nodeSpawn } from 'node:child_process';
 
 if (!(globalThis as any).Bun) {
-    (globalThis as any).Bun = {
+    const BunShim: any = {
         version: '1.0.0-test',
-        env: process.env,
+        // env is defined as an accessor to stay in sync with process.env mutations in tests
+        get env() {
+            return process.env as any;
+        },
+        set env(v: any) {
+            process.env = v;
+        },
+        gc: () => {},
         async write(path: string, data: any) {
             const buf =
                 data instanceof Uint8Array || Buffer.isBuffer(data)
@@ -39,11 +46,20 @@ if (!(globalThis as any).Bun) {
                 stream() {
                     const fs = require('node:fs');
                     const rs = fs.createReadStream(path);
-                    return (async function* () {
-                        for await (const chunk of rs) {
-                            yield new Uint8Array(chunk as any);
-                        }
-                    })();
+                    return new ReadableStream<Uint8Array>({
+                        start(controller) {
+                            rs.on('data', (chunk: any) =>
+                                controller.enqueue(new Uint8Array(chunk))
+                            );
+                            rs.on('end', () => controller.close());
+                            rs.on('error', (e: any) => controller.error(e));
+                        },
+                        cancel() {
+                            try {
+                                rs.destroy();
+                            } catch {}
+                        },
+                    });
                 },
                 get size() {
                     try {
@@ -87,13 +103,29 @@ if (!(globalThis as any).Bun) {
             } as any;
         },
     };
+    (globalThis as any).Bun = BunShim;
 } else {
     // Ensure version exists for libraries calling Bun.version.split
     if (!(globalThis as any).Bun.version) {
         (globalThis as any).Bun.version = '1.0.0-test';
     }
-    // Ensure Bun.env is present for tests that mutably set flags
-    if (!(globalThis as any).Bun.env) {
+    // Ensure Bun.env stays in sync with process.env
+    try {
+        Object.defineProperty((globalThis as any).Bun, 'env', {
+            configurable: true,
+            get() {
+                return process.env as any;
+            },
+            set(v: any) {
+                process.env = v;
+            },
+        });
+    } catch {
+        // fallback assignment if defineProperty fails
         (globalThis as any).Bun.env = process.env;
+    }
+    // Stub gc to avoid crashes in libs referencing it
+    if (typeof (globalThis as any).Bun.gc !== 'function') {
+        (globalThis as any).Bun.gc = () => {};
     }
 }

@@ -1,4 +1,8 @@
 import { describe, it, expect, vi } from 'vitest';
+// Mock output verifier to avoid depending on ffprobe/faststart in this unit test
+vi.mock('./verify.ts', () => ({
+    outputVerifier: { verify: vi.fn().mockResolvedValue({ ok: true }) },
+}));
 import { BunClipper } from './clipper';
 
 // We simulate fallback by providing a fake input that causes copy attempt to fail.
@@ -8,13 +12,29 @@ function makeSpawnMock() {
     let attempt = 0;
     return vi.fn((args: string[], opts: any) => {
         const isCopy = args.includes('-c') && args.includes('copy');
+        const isFfprobe = args[0] === 'ffprobe';
         attempt++;
         const shouldFail = isCopy; // fail copy attempt
         const stdout = new ReadableStream<Uint8Array>({
             start(controller) {
-                // emit minimal progress lines for parser
                 const enc = new TextEncoder();
-                controller.enqueue(enc.encode('out_time_ms=1000000\n'));
+                if (isFfprobe) {
+                    // Minimal ffprobe JSON to let probeSource succeed
+                    controller.enqueue(
+                        enc.encode(
+                            JSON.stringify({
+                                format: { duration: '2', format_name: 'mp4' },
+                                streams: [
+                                    { codec_type: 'video', codec_name: 'h264' },
+                                    { codec_type: 'audio', codec_name: 'aac' },
+                                ],
+                            })
+                        )
+                    );
+                } else {
+                    // emit minimal progress lines for parser
+                    controller.enqueue(enc.encode('out_time_ms=1000000\n'));
+                }
                 controller.close();
             },
         });
@@ -59,10 +79,13 @@ describe('BunClipper fallback logic', () => {
         const seen: number[] = [];
         for await (const p of res.progress$) seen.push(p);
         expect(seen.at(-1)).toBe(100);
-        // Ensure spawn called twice: copy then reencode
-        expect(spawnMock.mock.calls.length).toBe(2);
-        const firstArgs = spawnMock.mock.calls[0]![0] as string[];
-        const secondArgs = spawnMock.mock.calls[1]![0] as string[];
+        // Ensure ffmpeg was invoked twice (copy then reencode); ignore ffprobe call
+        const ffmpegCalls = spawnMock.mock.calls.filter(
+            (c) => (c[0] as string[])[0] === 'ffmpeg'
+        );
+        expect(ffmpegCalls.length).toBe(2);
+        const firstArgs = ffmpegCalls[0]![0] as string[];
+        const secondArgs = ffmpegCalls[1]![0] as string[];
         expect(firstArgs).toContain('copy');
         expect(secondArgs).not.toContain('copy');
     });
