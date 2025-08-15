@@ -7,10 +7,11 @@
 import type { ClipArgs, ClipResult, Clipper } from './types';
 import { parseFfmpegProgress } from './progress';
 import { createLogger, readEnv } from '@clipper/common';
-import { mkdir } from 'node:fs/promises';
+import { mkdir, unlink } from 'node:fs/promises';
 import { ServiceError } from '@clipper/common/errors';
 import { probeSource } from './probe';
 import { shouldAttemptCopy } from './copy-decision.ts';
+import { outputVerifier } from './verify.ts';
 
 const log = createLogger((readEnv('LOG_LEVEL') as any) || 'info').with({
     mod: 'ffmpeg',
@@ -94,15 +95,7 @@ export class BunClipper implements Clipper {
             );
         }
         const srcFile = Bun.file(args.input);
-        // Bun.file(...).size will throw if not exists; so optionally check via try/catch
-        let fileExists = false;
-        try {
-            // @ts-ignore size triggers stat
-            await srcFile.arrayBuffer(); // minimal read (will allocate). If large file this is heavy; prefer stat when Bun exposes. For now just check existence via stream open.
-            fileExists = true;
-        } catch {
-            fileExists = false;
-        }
+        const fileExists = await srcFile.exists();
         if (!fileExists) {
             throw new ServiceError(
                 'VALIDATION_FAILED',
@@ -234,22 +227,27 @@ export class BunClipper implements Clipper {
             ? await attempt('copy')
             : { attempt: { ok: false, code: -1 } };
         if (copyResult.attempt.ok) {
-            // Validate duration accuracy; tolerate +/- 1s drift; if larger drift fallback to precise re-encode
-            const observed = await probeDuration(outPath);
-            if (
-                observed != null &&
-                (observed > totalDuration + 1 || observed < totalDuration - 1)
-            ) {
+            // Output verification gate
+            const verify = await outputVerifier.verify(outPath, {
+                expectDurationSec: totalDuration,
+                // allow slightly higher tolerance for copy path
+                toleranceSec: 1,
+                requireFastStart: true,
+                requireVideoOrAudio: 'either',
+            });
+            if (verify.ok) {
+                return { localPath: outPath, progress$: copyResult.progress$! };
+            } else {
                 log.info(
-                    'copy duration inaccurate; re-encoding for precision',
+                    'copy verification failed; re-encoding for precision',
                     {
                         jobId: args.jobId,
-                        expected: totalDuration,
-                        observed,
+                        reason: verify.reason,
                     }
                 );
-            } else {
-                return { localPath: outPath, progress$: copyResult.progress$! };
+                try {
+                    await unlink(outPath);
+                } catch {}
             }
         }
 
@@ -260,7 +258,26 @@ export class BunClipper implements Clipper {
         });
         const reResult = await attempt('reencode');
         if (reResult.attempt.ok) {
-            return { localPath: outPath, progress$: reResult.progress$! };
+            // Verify re-encoded output strictly with codec allowlists
+            const verify = await outputVerifier.verify(outPath, {
+                expectDurationSec: totalDuration,
+                toleranceSec: 0.5,
+                requireFastStart: true,
+                requireVideoOrAudio: 'either',
+                allowedVideoCodecs: ['h264'],
+                allowedAudioCodecs: ['aac'],
+            });
+            if (verify.ok) {
+                return { localPath: outPath, progress$: reResult.progress$! };
+            } else {
+                try {
+                    await unlink(outPath);
+                } catch {}
+                throw new ServiceError(
+                    'OUTPUT_VERIFICATION_FAILED',
+                    verify.reason || 'verification_failed'
+                );
+            }
         }
         // Both failed
         const msg = `ffmpeg failed (copy code=${copyResult.attempt.code}, reencode code=${reResult.attempt.code})`;

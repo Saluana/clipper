@@ -23,10 +23,10 @@ artifact_id: 6c8db0e8-2db6-4c4c-8e6e-3a4c7e4f9d5e
 
 ## 4. Output Verification
 
--   [ ] 4.1 Implement `OutputVerifier` in `src/ffmpeg/verify.ts` (Req 4)
--   [ ] 4.2 Wire verification after copy and encode, before upload (Req 4)
--   [ ] 4.3 Delete invalid outputs and surface OUTPUT_VERIFICATION_FAILED (Req 4,7,8)
--   [ ] 4.4 Unit tests with fixtures (Req 4)
+-   [x] 4.1 Implement `OutputVerifier` in `src/ffmpeg/verify.ts` (Req 4)
+-   [x] 4.2 Wire verification after copy and encode, before upload (Req 4)
+-   [x] 4.3 Delete invalid outputs and surface OUTPUT_VERIFICATION_FAILED (Req 4,7,8)
+-   [x] 4.4 Unit tests with fixtures (Req 4)
 
 ## 5. Progress Semantics
 

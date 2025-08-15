@@ -9,7 +9,8 @@ export type ServiceErrorCode =
     | 'INTERNAL'
     | 'INVALID_STATE'
     | 'VALIDATION_FAILED'
-    | 'SOURCE_UNREADABLE';
+    | 'SOURCE_UNREADABLE'
+    | 'OUTPUT_VERIFICATION_FAILED';
 
 export interface ErrorEnvelope {
     code: ServiceErrorCode;
