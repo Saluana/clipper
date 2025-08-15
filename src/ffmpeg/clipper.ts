@@ -9,6 +9,7 @@ import { parseFfmpegProgress } from './progress';
 import { createLogger, readEnv } from '@clipper/common';
 import { mkdir } from 'node:fs/promises';
 import { ServiceError } from '@clipper/common/errors';
+import { probeSource } from './probe';
 
 const log = createLogger((readEnv('LOG_LEVEL') as any) || 'info').with({
     mod: 'ffmpeg',
@@ -105,6 +106,14 @@ export class BunClipper implements Clipper {
             throw new ServiceError(
                 'VALIDATION_FAILED',
                 'input file does not exist'
+            );
+        }
+        // Probe source early to catch unreadable/unsupported inputs
+        const probe = await probeSource(args.input, 3000);
+        if (!probe) {
+            throw new ServiceError(
+                'SOURCE_UNREADABLE',
+                'Unable to read source'
             );
         }
 

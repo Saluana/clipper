@@ -4,16 +4,16 @@ artifact_id: 6c8db0e8-2db6-4c4c-8e6e-3a4c7e4f9d5e
 
 ## 1. Validation & Config
 
--   [ ] 1.1 Add env flags with defaults in `src/common/env.ts` (Req 1,10)
--   [ ] 1.2 Strengthen API zod validation for start/end and max duration (Req 1)
--   [ ] 1.3 Implement optional coercion in request handling or worker (Req 1)
--   [ ] 1.4 Unit tests for validation/coercion (Req 1)
+-   [x] 1.1 Add env flags with defaults in `src/common/env.ts` (Req 1,10)
+-   [x] 1.2 Strengthen API zod validation for start/end and max duration (Req 1)
+-   [x] 1.3 Implement optional coercion in request handling or worker (Req 1)
+-   [x] 1.4 Unit tests for validation/coercion (Req 1)
 
 ## 2. Probe Layer
 
--   [ ] 2.1 Implement `Prober` using ffprobe in `src/ffmpeg/probe.ts` (Req 2)
--   [ ] 2.2 Integrate probe before processing; fail fast on unreadable (Req 2)
--   [ ] 2.3 Unit tests with mocked ffprobe output (Req 2)
+-   [x] 2.1 Implement `Prober` using ffprobe in `src/ffmpeg/probe.ts` (Req 2)
+-   [x] 2.2 Integrate probe before processing; fail fast on unreadable (Req 2)
+-   [x] 2.3 Unit tests with mocked ffprobe output (Req 2)
 
 ## 3. Copy Decision Guardrails
 

@@ -8,7 +8,8 @@ export type ServiceErrorCode =
     | 'RATE_LIMITED'
     | 'INTERNAL'
     | 'INVALID_STATE'
-    | 'VALIDATION_FAILED';
+    | 'VALIDATION_FAILED'
+    | 'SOURCE_UNREADABLE';
 
 export interface ErrorEnvelope {
     code: ServiceErrorCode;
