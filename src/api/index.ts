@@ -382,6 +382,10 @@ export const app = addHttpInstrumentation(baseApp)
             });
             startSec = coerced.startSec;
             endSec = coerced.endSec;
+            // Persist as integer seconds in DB; enforce end > start
+            const startInt = Math.floor(startSec);
+            let endInt = Math.ceil(endSec);
+            if (endInt <= startInt) endInt = startInt + 1;
             const retentionHours = Number(readIntEnv('RETENTION_HOURS', 72));
             const expiresAt = new Date(Date.now() + retentionHours * 3600_000);
             const row = await jobsRepo.create({
@@ -391,8 +395,8 @@ export const app = addHttpInstrumentation(baseApp)
                 sourceType: input.sourceType,
                 sourceKey: input.uploadKey,
                 sourceUrl: input.youtubeUrl,
-                startSec,
-                endSec,
+                startSec: startInt,
+                endSec: endInt,
                 withSubtitles: input.withSubtitles,
                 burnSubtitles: input.burnSubtitles,
                 subtitleLang: input.subtitleLang,

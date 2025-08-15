@@ -66,5 +66,5 @@ describe('yt-dlp download (integration, requires ENABLE_YTDLP=true)', () => {
         const size = path ? Bun.file(path).size : 0;
         expect(size).toBeGreaterThan(0);
         console.log('Downloaded file:', path, 'size:', size);
-    });
+    }, 20_000);
 });

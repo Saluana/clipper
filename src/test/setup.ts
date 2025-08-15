@@ -1,10 +1,12 @@
-// Global test setup: minimal Bun polyfill for vitest environment
+// Global test setup: load env and minimal Bun polyfill for vitest environment
+import 'dotenv/config';
 import { readFile, writeFile, stat } from 'node:fs/promises';
 import { spawn as nodeSpawn } from 'node:child_process';
 
 if (!(globalThis as any).Bun) {
     (globalThis as any).Bun = {
         version: '1.0.0-test',
+        env: process.env,
         async write(path: string, data: any) {
             const buf =
                 data instanceof Uint8Array || Buffer.isBuffer(data)
@@ -89,5 +91,9 @@ if (!(globalThis as any).Bun) {
     // Ensure version exists for libraries calling Bun.version.split
     if (!(globalThis as any).Bun.version) {
         (globalThis as any).Bun.version = '1.0.0-test';
+    }
+    // Ensure Bun.env is present for tests that mutably set flags
+    if (!(globalThis as any).Bun.env) {
+        (globalThis as any).Bun.env = process.env;
     }
 }

@@ -23,6 +23,11 @@ import { InMemoryMetrics } from '@clipper/common/metrics';
 import { withStage } from './stage';
 import os from 'os';
 import { classifyError as _classifyErrorUtil, getMaxRetries } from './retry';
+import {
+    cleanupScratch as cleanupScratchNew,
+    measureDirSizeBytes as measureDirSizeBytesNew,
+    cleanupStorageOnFailure,
+} from './cleanup';
 export * from './asr.ts';
 
 const log = createLogger((readEnv('LOG_LEVEL') as any) || 'info').with({
@@ -345,44 +350,22 @@ class Semaphore {
 let semGlobal: { inflight: number } | null = null;
 
 // ------------------ Scratch lifecycle helpers (Req 10) ------------------
-async function measureDirSizeBytes(dir: string): Promise<number> {
-    try {
-        const out = await Bun.$`du -sk ${dir} | cut -f1`.text();
-        const kb = Number((out || '').trim() || '0');
-        return isNaN(kb) ? 0 : kb * 1024;
-    } catch {
-        return 0;
-    }
-}
-async function cleanupScratch(dir: string, success: boolean) {
-    if (!dir) return { deleted: false, sizeBytes: 0 } as const;
-    const keepOnSuccess =
-        String(readEnv('KEEP_SCRATCH_ON_SUCCESS') || '0') === '1';
-    if (success) {
-        if (keepOnSuccess) {
-            log.info('scratch kept on success by config', { dir });
-            return {
-                deleted: false,
-                sizeBytes: await measureDirSizeBytes(dir),
-            } as const;
-        }
-        try {
-            await Bun.spawn(['rm', '-rf', dir]).exited;
-            return { deleted: true, sizeBytes: 0 } as const;
-        } catch (e) {
-            log.warn('failed to delete scratch dir', { dir, error: String(e) });
-            return {
-                deleted: false,
-                sizeBytes: await measureDirSizeBytes(dir),
-            } as const;
-        }
-    } else {
-        const size = await measureDirSizeBytes(dir);
-        log.info('scratch preserved after failure', { dir, sizeBytes: size });
-        return { deleted: false, sizeBytes: size } as const;
-    }
-}
+const measureDirSizeBytes = measureDirSizeBytesNew;
+const cleanupScratch = cleanupScratchNew;
 (globalThis as any).__scratchTest = { measureDirSizeBytes, cleanupScratch };
+
+// Remove partial storage objects and scratch on failure, respecting KEEP_FAILED
+async function cleanupOnFailure(opts: {
+    scratchDir?: string | null;
+    storage?: { remove: (key: string) => Promise<void> } | null;
+    storageKey?: string | null;
+}) {
+    await cleanupStorageOnFailure(opts.storage as any, opts.storageKey || null);
+    if (opts.scratchDir) {
+        await cleanupScratch(opts.scratchDir, false);
+    }
+}
+(globalThis as any).__cleanupTest = { cleanupOnFailure };
 async function main() {
     await queue.start();
     startHeartbeatLoop();
@@ -681,6 +664,13 @@ async function main() {
         } catch (e) {
             const clazz = classifyError(e);
             if (clazz === 'retryable') {
+                // Best-effort remove partial object on retryable failure, unless KEEP_FAILED
+                try {
+                    await cleanupStorageOnFailure(
+                        storage as any,
+                        storageKeys.resultVideo(jobId)
+                    );
+                } catch {}
                 const maxAttempts = getMaxRetries();
                 const updated = await (sharedDb as any)
                     .update(jobsTable)
@@ -722,6 +712,14 @@ async function main() {
                     correlationId: cid,
                 });
                 metrics.inc('clip.failures');
+                // Best-effort cleanup of partial storage and scratch if not keeping failed
+                try {
+                    await cleanupOnFailure({
+                        scratchDir,
+                        storage,
+                        storageKey: storageKeys.resultVideo(jobId),
+                    });
+                } catch {}
                 try {
                     await jobs.update(jobId, {
                         status: 'failed',

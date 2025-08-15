@@ -42,9 +42,9 @@ artifact_id: 6c8db0e8-2db6-4c4c-8e6e-3a4c7e4f9d5e
 
 ## 7. Cleanup Consistency
 
--   [ ] 7.1 Centralize cleanup helpers; honor KEEP_FAILED (Req 7)
--   [ ] 7.2 Ensure partial storage uploads are removed on failure (Req 7)
--   [ ] 7.3 Integration test for cleanup after verification failure (Req 7)
+-   [x] 7.1 Centralize cleanup helpers; honor KEEP_FAILED (Req 7)
+-   [x] 7.2 Ensure partial storage uploads are removed on failure (Req 7)
+-   [x] 7.3 Integration test for cleanup after verification failure (Req 7)
 
 ## 8. Error Envelope & Codes
 
