@@ -310,11 +310,15 @@ export const app = addHttpInstrumentation(baseApp)
         metrics: queue.getMetrics(),
         correlationId: (store as any).correlationId,
     }))
-    .get('/metrics', () => {
+    .get('/metrics', ({ store }) => {
         const snap = metrics.snapshot();
         // merge queue metrics (Req 3.4)
         const queueMetrics = queue.getMetrics?.() || {};
-        return { ...snap, queue: queueMetrics };
+        return {
+            ...snap,
+            queue: queueMetrics,
+            correlationId: (store as any).correlationId,
+        };
     })
     .post('/api/jobs', async ({ body, set, store, request }) => {
         const correlationId = (store as any).correlationId;
