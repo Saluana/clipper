@@ -59,7 +59,7 @@ async function submitJob() {
         const txt = await res.text();
         throw new Error(`Create failed ${res.status}: ${txt}`);
     }
-    const data = await res.json();
+    const data = (await res.json()) as any;
     const id = data?.job?.id || data?.id || data?.jobId;
     if (!id) throw new Error(`No job id in response: ${JSON.stringify(data)}`);
     return id as string;
@@ -70,7 +70,7 @@ async function getResult(id: string) {
     if (res.status === 404) return null; // not ready
     if (!res.ok)
         throw new Error(`Result failed ${res.status}: ${await res.text()}`);
-    return await res.json();
+    return (await res.json()) as any;
 }
 
 async function main() {
