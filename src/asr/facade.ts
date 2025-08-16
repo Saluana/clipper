@@ -47,6 +47,32 @@ export class AsrFacade {
             modelVersion
         );
         if (reusable) {
+            // Even when reusing, publish a lightweight ASR task so the ASR worker
+            // can attach artifacts to the clip job, perform burn-in if requested,
+            // and finalize the clip job. This avoids leaving the clip "processing".
+            if (this.deps.queue) {
+                try {
+                    const payload = {
+                        asrJobId: reusable.id,
+                        clipJobId: req.clipJobId,
+                        languageHint: req.languageHint,
+                    };
+                    const parsed = AsrQueuePayloadSchema.parse(payload);
+                    if (this.deps.queue.publishTo) {
+                        await this.deps.queue.publishTo(
+                            QUEUE_TOPIC_ASR,
+                            parsed
+                        );
+                    } else {
+                        await this.deps.queue.publish({
+                            jobId: reusable.id,
+                            priority: 'normal',
+                        });
+                    }
+                } catch (e) {
+                    // Non-fatal; reuse still returned, but ASR worker won't run
+                }
+            }
             return {
                 asrJobId: reusable.id,
                 status: 'reused',

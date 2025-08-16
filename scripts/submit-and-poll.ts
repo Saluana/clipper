@@ -80,7 +80,7 @@ async function main() {
     const id = await submitJob();
     console.log(`[submit] job id: ${id}`);
     const startTs = Date.now();
-    const timeoutMs = 15 * 60_000; // 15 minutes
+    const timeoutMs = Number(process.env.SUBMIT_TIMEOUT_MS || 15 * 60_000);
     const pollMs = 5_000;
     while (true) {
         if (Date.now() - startTs > timeoutMs)

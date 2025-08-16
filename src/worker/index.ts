@@ -35,6 +35,52 @@ const log = createLogger((readEnv('LOG_LEVEL') as any) || 'info').with({
     mod: 'worker',
 });
 
+// Local helper for burning subtitles during inline reuse path
+function escapeForSubtitlesFilterLocal(path: string): string {
+    return path
+        .replace(/\\/g, '\\\\')
+        .replace(/:/g, '\\:')
+        .replace(/'/g, "\\'")
+        .replace(/,/g, '\\,')
+        .replace(/ /g, '\\ ');
+}
+async function burnInSubtitlesLocal(args: {
+    srcVideoPath: string;
+    srtPath: string;
+    outPath: string;
+    ffmpegBin?: string;
+}): Promise<boolean> {
+    const escapedSrt = escapeForSubtitlesFilterLocal(args.srtPath);
+    const ffArgs = [
+        args.ffmpegBin ?? 'ffmpeg',
+        '-y',
+        '-i',
+        args.srcVideoPath,
+        '-vf',
+        `subtitles=${escapedSrt}:force_style='FontSize=18,Outline=1,Shadow=0,MarginV=18'`,
+        '-c:v',
+        'libx264',
+        '-preset',
+        'veryfast',
+        '-pix_fmt',
+        'yuv420p',
+        '-c:a',
+        'copy',
+        args.outPath,
+    ];
+    const proc = Bun.spawn(ffArgs, { stderr: 'pipe' });
+    try {
+        // Drain stderr to avoid backpressure if ffmpeg is verbose
+        if (proc.stderr) {
+            for await (const _ of proc.stderr) {
+                // no-op
+            }
+        }
+    } catch {}
+    const code = await proc.exited;
+    return code === 0;
+}
+
 const metrics = new InMemoryMetrics();
 const sharedDb = createDb();
 const jobs = new DrizzleJobsRepo(sharedDb, metrics);
@@ -640,6 +686,8 @@ async function main() {
             }
 
             let asrRequested = false;
+            let asrStatus: 'queued' | 'reused' | null = null;
+            let asrArtifacts: Array<{ kind: string; storageKey: string }> = [];
             if (job.withSubtitles) {
                 await withStage(metrics, 'asr', async () => {
                     try {
@@ -652,6 +700,16 @@ async function main() {
                             languageHint: job.subtitleLang || 'auto',
                         });
                         asrRequested = true;
+                        asrStatus = asrRes.status;
+                        if (
+                            asrRes.status === 'reused' &&
+                            Array.isArray(asrRes.artifacts)
+                        ) {
+                            asrArtifacts = asrRes.artifacts.map((a: any) => ({
+                                kind: a.kind,
+                                storageKey: a.storageKey,
+                            }));
+                        }
                         await events.add({
                             jobId,
                             ts: nowIso(),
@@ -671,6 +729,75 @@ async function main() {
                         });
                     }
                 });
+            }
+
+            // Fast-path: if ASR returned a reused artifact set, attach SRT and optionally burn-in here
+            if (asrStatus === 'reused') {
+                try {
+                    const srtKey = asrArtifacts.find(
+                        (a) => a.kind === 'srt'
+                    )?.storageKey;
+                    if (srtKey) {
+                        try {
+                            await jobs.update(jobId, {
+                                resultSrtKey: srtKey,
+                            } as any);
+                        } catch {}
+                    }
+                    if (job.burnSubtitles && srtKey && storage && key) {
+                        // Emit started event
+                        try {
+                            await events.add({
+                                jobId,
+                                ts: nowIso(),
+                                type: 'burnin:started',
+                                data: { srtKey, in: key },
+                            });
+                        } catch {}
+                        const burnedKey = storageKeys.resultVideoBurned(jobId);
+                        const localIn = await storage.download(key);
+                        const localSrt = await storage.download(srtKey);
+                        const outLocal = `/tmp/${jobId}.subbed.mp4`;
+                        const ok = await burnInSubtitlesLocal({
+                            srcVideoPath: localIn,
+                            srtPath: localSrt,
+                            outPath: outLocal,
+                        });
+                        if (ok) {
+                            await storage.upload(
+                                outLocal,
+                                burnedKey,
+                                'video/mp4'
+                            );
+                            try {
+                                await jobs.update(jobId, {
+                                    resultVideoBurnedKey: burnedKey,
+                                } as any);
+                            } catch {}
+                            try {
+                                await events.add({
+                                    jobId,
+                                    ts: nowIso(),
+                                    type: 'burnin:completed',
+                                    data: { key: burnedKey },
+                                });
+                            } catch {}
+                        } else {
+                            try {
+                                await events.add({
+                                    jobId,
+                                    ts: nowIso(),
+                                    type: 'burnin:failed',
+                                    data: { srtKey, in: key },
+                                });
+                            } catch {}
+                        }
+                    }
+                } catch (e) {
+                    // Non-fatal, proceed to finalize with whatever we have
+                }
+                // We handled reuse inline; don't wait on ASR worker to finalize
+                asrRequested = false;
             }
 
             // If burn-in was requested, let the ASR worker finalize the job

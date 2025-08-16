@@ -10,6 +10,6 @@ const queue = new PgBossQueueAdapter({
     connectionString: requireEnv('DATABASE_URL'),
 });
 
+log.info('ASR worker starting');
 await startAsrWorker({ queue });
-
 log.info('ASR worker started');

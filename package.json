@@ -16,7 +16,10 @@
         "start:api": "bun src/api/index.ts",
         "start:worker": "bun src/worker/index.ts",
         "start:asr": "bun src/worker/asr.start.ts",
-        "start:dlq": "bun src/queue/dlq-consumer.ts"
+        "start:dlq": "bun src/queue/dlq-consumer.ts",
+        "test:vitest": "bunx vitest run --exclude \"**/*.bun.test.ts\"",
+        "test:bun": "bun test ./src/**/*.bun.test.ts",
+        "test:all": "bun run test:vitest && bun run test:bun"
     },
     "devDependencies": {
         "@types/bun": "latest"

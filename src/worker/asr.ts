@@ -67,14 +67,16 @@ export async function startAsrWorker(deps: AsrWorkerDeps) {
                 return null as any;
             }
         })();
-    const provider = deps?.provider ?? new GroqWhisperProvider();
-
     const timeoutMs = Number(readEnv('ASR_REQUEST_TIMEOUT_MS') || 120_000);
     const includeJson =
         (readEnv('ASR_JSON_SEGMENTS') || 'false').toLowerCase() === 'true';
     const mergeGapMs = Number(readEnv('MERGE_GAP_MS') || 150);
 
     await deps.queue.consumeFrom(QUEUE_TOPIC_ASR, async (msg: any) => {
+        // Trace message arrival for visibility
+        try {
+            log.info('asr msg received', { topic: QUEUE_TOPIC_ASR, msg });
+        } catch {}
         const parse = AsrQueuePayloadSchema.safeParse(msg as AsrQueuePayload);
         if (!parse.success) {
             log.warn('invalid asr payload', { issues: parse.error.issues });
@@ -90,147 +92,241 @@ export async function startAsrWorker(deps: AsrWorkerDeps) {
                 log.warn('asr job not found', { asrJobId });
                 return;
             }
-            if (job.status === 'done') return; // idempotent
+            const jobWasAlreadyDone = job.status === 'done';
             if (job.status === 'queued') {
                 await asrJobs.patch(asrJobId, { status: 'processing' });
             }
 
-            // Locate media: prefer clip resultVideoKey
-            let inputLocal: string;
+            log.info('asr job started', {
+                asrJobId,
+                clipJobId,
+                languageHint: languageHint || job.languageHint,
+            });
+
+            // Locate media: prefer clip resultVideoKey (needed for burn-in later)
+            let inputLocal: string | null = null;
+            let clip: any = null;
             if (clipJobId) {
-                const clip = await clipJobs.get(clipJobId);
+                clip = await clipJobs.get(clipJobId);
                 if (!clip?.resultVideoKey) throw new Error('NO_CLIP_RESULT');
                 if (!storage) throw new Error('STORAGE_NOT_AVAILABLE');
                 inputLocal = await storage.download(clip.resultVideoKey);
                 tmpLocal = inputLocal;
-            } else {
-                throw new Error('NO_INPUT_PROVIDED');
             }
 
-            // Transcribe
-            const res = await withExternal(
-                metrics as any,
-                {
-                    dep: 'asr',
-                    op: 'transcribe',
-                    timeoutMs,
-                    classifyError: (e) => {
-                        const msg = String(e?.message || e);
-                        if (msg === 'TIMEOUT' || /abort/i.test(msg))
-                            return 'timeout';
-                        if (msg === 'VALIDATION_FAILED') return 'validation';
-                        if (msg === 'UPSTREAM_FAILURE') return 'upstream';
-                        if (e instanceof ProviderHttpError) {
-                            if (e.status === 400) return 'validation';
-                            if (e.status === 0) return 'network';
-                            if (e.status >= 500) return 'upstream';
-                        }
-                        return undefined;
-                    },
-                },
-                async (signal) => {
+            // If ASR job already completed, reuse its artifacts; else transcribe now
+            let srtKey: string | null = null;
+            let res: any = null;
+            if (jobWasAlreadyDone) {
+                const arts = await artifacts.list(asrJobId);
+                srtKey = arts.find((a) => a.kind === 'srt')?.storageKey || null;
+                if (srtKey) {
+                    // Verify artifact actually exists in storage; if not, force refresh
                     try {
-                        return await provider.transcribe(inputLocal, {
-                            timeoutMs,
-                            languageHint,
-                            signal,
-                        });
-                    } catch (err: any) {
-                        if (err?.name === 'AbortError')
-                            throw new Error('TIMEOUT');
-                        if (err instanceof ProviderHttpError) {
-                            if (err.status === 0)
-                                throw new Error('UPSTREAM_FAILURE');
-                            if (err.status >= 500)
-                                throw new Error('UPSTREAM_FAILURE');
-                            if (err.status === 400)
-                                throw new Error('VALIDATION_FAILED');
-                            throw new Error('UPSTREAM_FAILURE');
-                        }
-                        throw err;
+                        const verifyPath = `/tmp/${
+                            clipJobId ?? asrJobId
+                        }.verify.srt`;
+                        await storage.download(srtKey, verifyPath);
+                    } catch {
+                        try {
+                            log.warn(
+                                'reused srt missing in storage; forcing refresh',
+                                {
+                                    asrJobId,
+                                    clipJobId,
+                                    srtKey,
+                                }
+                            );
+                        } catch {}
+                        srtKey = null;
                     }
                 }
-            );
+            }
+
+            if (!jobWasAlreadyDone || !srtKey) {
+                const tr = await withExternal(
+                    metrics as any,
+                    {
+                        dep: 'asr',
+                        op: 'transcribe',
+                        timeoutMs,
+                        classifyError: (e) => {
+                            const msg = String(e?.message || e);
+                            if (msg === 'TIMEOUT' || /abort/i.test(msg))
+                                return 'timeout';
+                            if (msg === 'VALIDATION_FAILED')
+                                return 'validation';
+                            if (msg === 'UPSTREAM_FAILURE') return 'upstream';
+                            if (e instanceof ProviderHttpError) {
+                                if (e.status === 400) return 'validation';
+                                if (e.status === 0) return 'network';
+                                if (e.status >= 500) return 'upstream';
+                            }
+                            return undefined;
+                        },
+                    },
+                    async (signal) => {
+                        log.info('groq transcribe begin', {
+                            asrJobId,
+                            clipJobId,
+                            timeoutMs,
+                            languageHint: languageHint || job.languageHint,
+                        });
+                        // lazily construct provider per job to avoid crashing worker when env is missing
+                        const provider =
+                            deps?.provider ?? new GroqWhisperProvider();
+                        try {
+                            const out = await provider.transcribe(inputLocal!, {
+                                timeoutMs,
+                                languageHint,
+                                signal,
+                            });
+                            try {
+                                log.info('groq transcribe done', {
+                                    asrJobId,
+                                    clipJobId,
+                                    detectedLanguage: out.detectedLanguage,
+                                    durationSec: out.durationSec,
+                                    model: out.modelVersion,
+                                });
+                            } catch {}
+                            return out;
+                        } catch (err: any) {
+                            if (err?.name === 'AbortError')
+                                throw new Error('TIMEOUT');
+                            if (err instanceof ProviderHttpError) {
+                                if (err.status === 0)
+                                    throw new Error('UPSTREAM_FAILURE');
+                                if (err.status >= 500)
+                                    throw new Error('UPSTREAM_FAILURE');
+                                if (err.status === 400)
+                                    throw new Error('VALIDATION_FAILED');
+                                throw new Error('UPSTREAM_FAILURE');
+                            }
+                            throw err;
+                        }
+                    }
+                );
+                res = tr;
+            }
 
             // Build artifacts
-            const built = buildArtifacts(res.segments, {
-                includeJson,
-                mergeGapMs,
-            });
+            if (!srtKey) {
+                // Build and upload fresh artifacts
+                const built = buildArtifacts(res.segments, {
+                    includeJson,
+                    mergeGapMs,
+                });
+                try {
+                    log.info('asr artifacts built', {
+                        asrJobId,
+                        clipJobId,
+                        segments: res.segments?.length ?? 0,
+                    });
+                } catch {}
 
-            // Upload artifacts
-            if (!storage) throw new Error('STORAGE_NOT_AVAILABLE');
-            const owner = clipJobId ?? asrJobId;
-            const srtKey = storageKeys.transcriptSrt(owner);
-            const txtKey = storageKeys.transcriptText(owner);
-            const jsonKey = includeJson
-                ? storageKeys.transcriptJson(owner)
-                : null;
-            const srtPath = `/tmp/${owner}.srt`;
-            const txtPath = `/tmp/${owner}.txt`;
-            await Bun.write(srtPath, built.srt);
-            await Bun.write(txtPath, built.text);
-            await storage.upload(srtPath, srtKey, 'application/x-subrip');
-            await storage.upload(txtPath, txtKey, 'text/plain; charset=utf-8');
-            if (includeJson && jsonKey) {
-                const jsonPath = `/tmp/${owner}.json`;
-                await Bun.write(
-                    jsonPath,
-                    JSON.stringify(built.json || [], null, 0)
+                if (!storage) throw new Error('STORAGE_NOT_AVAILABLE');
+                const owner = clipJobId ?? asrJobId;
+                srtKey = storageKeys.transcriptSrt(owner);
+                const txtKey = storageKeys.transcriptText(owner);
+                const jsonKey = includeJson
+                    ? storageKeys.transcriptJson(owner)
+                    : null;
+                const srtPath = `/tmp/${owner}.srt`;
+                const txtPath = `/tmp/${owner}.txt`;
+                await Bun.write(srtPath, built.srt);
+                await Bun.write(txtPath, built.text);
+                await storage.upload(srtPath, srtKey, 'application/x-subrip');
+                await storage.upload(
+                    txtPath,
+                    txtKey,
+                    'text/plain; charset=utf-8'
                 );
-                await storage.upload(jsonPath, jsonKey, 'application/json');
+                if (includeJson && jsonKey) {
+                    const jsonPath = `/tmp/${owner}.json`;
+                    await Bun.write(
+                        jsonPath,
+                        JSON.stringify(built.json || [], null, 0)
+                    );
+                    await storage.upload(jsonPath, jsonKey, 'application/json');
+                }
+                try {
+                    log.info('asr artifacts uploaded', {
+                        asrJobId,
+                        clipJobId,
+                        srtKey,
+                    });
+                } catch {}
             }
 
             // Persist artifacts
-            await artifacts.put({
-                asrJobId,
-                kind: 'srt',
-                storageKey: srtKey,
-                createdAt: new Date().toISOString(),
-            });
-            await artifacts.put({
-                asrJobId,
-                kind: 'text',
-                storageKey: txtKey,
-                createdAt: new Date().toISOString(),
-            });
-            if (includeJson && jsonKey)
-                await artifacts.put({
-                    asrJobId,
-                    kind: 'json',
-                    storageKey: jsonKey,
-                    createdAt: new Date().toISOString(),
-                });
+            // Persist artifacts (only when freshly created)
+            try {
+                if (!jobWasAlreadyDone) {
+                    await artifacts.put({
+                        asrJobId,
+                        kind: 'srt',
+                        storageKey: srtKey!,
+                        createdAt: new Date().toISOString(),
+                    });
+                    await artifacts.put({
+                        asrJobId,
+                        kind: 'text',
+                        storageKey: storageKeys.transcriptText(
+                            clipJobId ?? asrJobId
+                        ),
+                        createdAt: new Date().toISOString(),
+                    });
+                    if (includeJson) {
+                        await artifacts.put({
+                            asrJobId,
+                            kind: 'json',
+                            storageKey: storageKeys.transcriptJson(
+                                clipJobId ?? asrJobId
+                            ),
+                            createdAt: new Date().toISOString(),
+                        });
+                    }
+                }
+            } catch {}
 
-            // Finalize job
-            await asrJobs.patch(asrJobId, {
-                status: 'done',
-                detectedLanguage: res.detectedLanguage,
-                durationSec: Math.round(res.durationSec),
-                completedAt: new Date().toISOString(),
-            });
-            metrics.observe('asr.duration_ms', Date.now() - startedAt);
-            metrics.inc('asr.completed');
+            // Finalize job if we ran transcription now
+            if (!jobWasAlreadyDone && res) {
+                await asrJobs.patch(asrJobId, {
+                    status: 'done',
+                    detectedLanguage: res.detectedLanguage,
+                    durationSec: Math.round(res.durationSec),
+                    completedAt: new Date().toISOString(),
+                });
+                metrics.observe('asr.duration_ms', Date.now() - startedAt);
+                metrics.inc('asr.completed');
+                try {
+                    log.info('asr job completed', { asrJobId, clipJobId });
+                } catch {}
+            }
 
             // Update originating clip job with transcript key if available
             if (clipJobId) {
                 try {
-                    await clipJobs.update(clipJobId, {
-                        resultSrtKey: srtKey,
-                    } as any);
+                    if (srtKey) {
+                        await clipJobs.update(clipJobId, {
+                            resultSrtKey: srtKey,
+                        } as any);
+                    }
                 } catch {}
             }
 
             // Burn-in subtitles if the originating clip requested it
             if (clipJobId) {
-                try {
-                    const clip = await clipJobs.get(clipJobId);
-                    if (clip?.burnSubtitles && clip?.resultVideoKey) {
+                clip = clip ?? (await clipJobs.get(clipJobId));
+                if (clip?.burnSubtitles && clip?.resultVideoKey) {
+                    try {
                         const burnedKey =
                             storageKeys.resultVideoBurned(clipJobId);
                         const clipLocal = await storage.download(
                             clip.resultVideoKey
                         );
+                        if (!srtKey) throw new Error('NO_SRT_FOR_BURNIN');
                         const srtLocal = await storage.download(srtKey);
 
                         const burnedPath = `/tmp/${clipJobId}.subbed.mp4`;
@@ -252,29 +348,18 @@ export async function startAsrWorker(deps: AsrWorkerDeps) {
                             srtPath: srtLocal,
                             outPath: burnedPath,
                         });
+                        try {
+                            log.info('burn-in invoked', {
+                                asrJobId,
+                                clipJobId,
+                                inKey: clip.resultVideoKey,
+                                srtKey,
+                            });
+                        } catch {}
                         metrics.observe(
                             'burnin.duration_ms',
                             Math.max(0, Date.now() - t0)
                         );
-
-                        // After burn-in attempt, finalize the clip job if not already done
-                        try {
-                            const latest = await clipJobs.get(clipJobId);
-                            if (latest && latest.status !== 'done') {
-                                await clipJobs.update(clipJobId, {
-                                    status: 'done',
-                                    progress: 100,
-                                } as any);
-                                try {
-                                    await events.add({
-                                        jobId: clipJobId,
-                                        ts: new Date().toISOString(),
-                                        type: 'done',
-                                        data: {},
-                                    });
-                                } catch {}
-                            }
-                        } catch {}
                         if (!burnRes.ok) {
                             metrics.inc('burnin.failed');
                             log.warn('burn-in failed (non-fatal)', {
@@ -306,6 +391,13 @@ export async function startAsrWorker(deps: AsrWorkerDeps) {
                             } as any);
                             metrics.inc('burnin.completed');
                             try {
+                                log.info('burn-in uploaded', {
+                                    asrJobId,
+                                    clipJobId,
+                                    burnedKey,
+                                });
+                            } catch {}
+                            try {
                                 await events.add({
                                     jobId: clipJobId,
                                     ts: new Date().toISOString(),
@@ -314,35 +406,38 @@ export async function startAsrWorker(deps: AsrWorkerDeps) {
                                 });
                             } catch {}
                         }
+                    } catch (e) {
+                        log.warn('burn-in stage error (non-fatal)', {
+                            asrJobId,
+                            e: String(e),
+                        });
                     }
-                    // Whether burn-in succeeded or failed, if the clip job
-                    // is not yet marked done, mark it as done now so the API
-                    // result endpoint becomes available. Keep original video
-                    // and optionally burned variant.
-                    try {
-                        const refreshed = await clipJobs.get(clipJobId);
-                        if (refreshed && refreshed.status !== 'done') {
-                            await clipJobs.update(clipJobId, {
-                                status: 'done',
-                                progress: 100,
-                                resultVideoKey: refreshed.resultVideoKey,
-                            } as any);
-                            try {
-                                await events.add({
-                                    jobId: clipJobId,
-                                    ts: new Date().toISOString(),
-                                    type: 'done',
-                                    data: {},
-                                });
-                            } catch {}
-                        }
-                    } catch {}
-                } catch (e) {
-                    log.warn('burn-in stage error (non-fatal)', {
-                        asrJobId,
-                        e: String(e),
-                    });
                 }
+                // Finalize clip job as done now (after burn-in attempt or skipped),
+                // so API result includes burnedVideo if available, or at least the original.
+                try {
+                    const refreshed = await clipJobs.get(clipJobId);
+                    if (refreshed && refreshed.status !== 'done') {
+                        await clipJobs.update(clipJobId, {
+                            status: 'done',
+                            progress: 100,
+                        } as any);
+                        try {
+                            log.info('clip job finalized by asr', {
+                                clipJobId,
+                                asrJobId,
+                            });
+                        } catch {}
+                        try {
+                            await events.add({
+                                jobId: clipJobId,
+                                ts: new Date().toISOString(),
+                                type: 'done',
+                                data: {},
+                            });
+                        } catch {}
+                    }
+                } catch {}
             }
         } catch (e) {
             const err = fromException(e, asrJobId);
@@ -356,6 +451,35 @@ export async function startAsrWorker(deps: AsrWorkerDeps) {
                     errorMessage:
                         (err.error && (err.error as any).message) || String(e),
                 });
+            } catch {}
+            // Non-fatal to main clip: finalize clip job as done so API can return original even if ASR failed
+            try {
+                if (clipJobId) {
+                    const cur = await clipJobs.get(clipJobId);
+                    if (cur && cur.status !== 'done') {
+                        await clipJobs.update(clipJobId, {
+                            status: 'done',
+                            progress: 100,
+                        } as any);
+                        try {
+                            log.warn(
+                                'asr failed; clip finalized without subtitles',
+                                {
+                                    clipJobId,
+                                    asrJobId,
+                                }
+                            );
+                        } catch {}
+                        try {
+                            await events.add({
+                                jobId: clipJobId,
+                                ts: new Date().toISOString(),
+                                type: 'asr:failed',
+                                data: { err: String(e) },
+                            });
+                        } catch {}
+                    }
+                }
             } catch {}
             throw e; // let PgBoss retry
         } finally {
@@ -381,10 +505,11 @@ async function burnInSubtitles(args: {
     srcVideoPath: string;
     srtPath: string;
     outPath: string;
+    ffmpegBin?: string;
 }): Promise<{ ok: true } | { ok: false; stderr?: string }> {
     const escapedSrt = escapeForSubtitlesFilter(args.srtPath);
     const ffArgs = [
-        'ffmpeg',
+        args.ffmpegBin ?? 'ffmpeg',
         '-y',
         '-i',
         args.srcVideoPath,
