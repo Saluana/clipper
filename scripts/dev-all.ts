@@ -17,6 +17,7 @@ async function run() {
         { label: 'worker', cmd: ['bun', '--watch', 'src/worker/index.ts'] },
         { label: 'asr', cmd: ['bun', '--watch', 'src/worker/asr.start.ts'] },
         { label: 'dlq', cmd: ['bun', '--watch', 'src/queue/dlq-consumer.ts'] },
+        { label: 'reaper', cmd: ['bun', '--watch', 'scripts/reaper.ts'] },
     ];
 
     for (const { label, cmd } of cmds) {
