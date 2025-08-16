@@ -2676,25 +2676,6 @@ if (import.meta.main) {
 }
 ```
 
-## File: src/worker/asr.start.ts
-```typescript
-import { PgBossQueueAdapter } from '@clipper/queue';
-import { requireEnv, createLogger, readEnv } from '@clipper/common';
-import { startAsrWorker } from './asr';
-
-const log = createLogger((readEnv('LOG_LEVEL') as any) || 'info').with({
-    mod: 'asr.start',
-});
-
-const queue = new PgBossQueueAdapter({
-    connectionString: requireEnv('DATABASE_URL'),
-});
-
-log.info('ASR worker starting');
-await startAsrWorker({ queue });
-log.info('ASR worker started');
-```
-
 ## File: src/worker/cleanup.ts
 ```typescript
 import { readEnv } from '@clipper/common';
@@ -3031,227 +3012,6 @@ console.log("Hello via Bun!");
     "noUnusedParameters": false,
     "noPropertyAccessFromIndexSignature": false
   }
-}
-```
-
-## File: scripts/submit-and-poll.ts
-```typescript
-#!/usr/bin/env bun
-/**
- * Submit a clip job to the local API and poll until result is ready.
- * Usage:
- *  bun scripts/submit-and-poll.ts --url <youtubeUrl> --start 00:01:00 --end 00:01:45 --lang en [--burn]
- */
-
-function parseArgs() {
-    const args = new Map<string, string | boolean>();
-    const argv = process.argv.slice(2);
-    for (let i = 0; i < argv.length; i++) {
-        const a = argv[i]!;
-        if (a.startsWith('--')) {
-            const key = a.slice(2);
-            const next = argv[i + 1];
-            if (!next || next.startsWith('--')) {
-                args.set(key, true);
-            } else {
-                args.set(key, next);
-                i++;
-            }
-        }
-    }
-    return args;
-}
-
-const args = parseArgs();
-const youtubeUrl = String(args.get('url') || args.get('youtube') || '');
-const start = String(args.get('start') || '');
-const end = String(args.get('end') || '');
-const lang = String(args.get('lang') || 'en');
-const burn = Boolean(args.get('burn') || false);
-
-if (!youtubeUrl || !start || !end) {
-    console.error(
-        'Usage: bun scripts/submit-and-poll.ts --url <youtubeUrl> --start 00:MM:SS --end 00:MM:SS --lang en [--burn]'
-    );
-    process.exit(2);
-}
-
-const API = process.env.API_BASE_URL || 'http://localhost:3000';
-
-async function submitJob() {
-    const payload = {
-        sourceType: 'youtube',
-        youtubeUrl,
-        start,
-        end,
-        withSubtitles: true,
-        subtitleLang: lang,
-        burnSubtitles: burn,
-    };
-    const res = await fetch(`${API}/api/jobs`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(payload),
-    });
-    if (!res.ok) {
-        const txt = await res.text();
-        throw new Error(`Create failed ${res.status}: ${txt}`);
-    }
-    const data = (await res.json()) as any;
-    const id = data?.job?.id || data?.id || data?.jobId;
-    if (!id) throw new Error(`No job id in response: ${JSON.stringify(data)}`);
-    return id as string;
-}
-
-async function getResult(id: string) {
-    const res = await fetch(`${API}/api/jobs/${id}/result`);
-    if (res.status === 404) return null; // not ready
-    if (!res.ok)
-        throw new Error(`Result failed ${res.status}: ${await res.text()}`);
-    return (await res.json()) as any;
-}
-
-async function main() {
-    console.log(
-        `[submit] creating job for ${youtubeUrl} from ${start} to ${end} (lang=${lang}, burn=${burn})`
-    );
-    const id = await submitJob();
-    console.log(`[submit] job id: ${id}`);
-    const startTs = Date.now();
-    const timeoutMs = Number(process.env.SUBMIT_TIMEOUT_MS || 15 * 60_000);
-    const pollMs = 5_000;
-    while (true) {
-        if (Date.now() - startTs > timeoutMs)
-            throw new Error('Timed out waiting for result');
-        const res = await getResult(id);
-        if (res) {
-            const r = res.result || res;
-            console.log('\n=== Clip Ready ===');
-            console.log(`Job: ${r.id || id}`);
-            if (r.video?.url) console.log(`Video: ${r.video.url}`);
-            if (r.burnedVideo?.url) console.log(`Burned: ${r.burnedVideo.url}`);
-            if (r.srt?.url) console.log(`SRT: ${r.srt.url}`);
-            return;
-        }
-        process.stdout.write('.');
-        await new Promise((r) => setTimeout(r, pollMs));
-    }
-}
-
-main().catch((e) => {
-    console.error('\n[submit] error:', e?.message || e);
-    process.exit(1);
-});
-```
-
-## File: src/asr/facade.ts
-```typescript
-import { createHash } from 'crypto';
-import type {
-    AsrArtifactsRepository,
-    AsrArtifactRow,
-    AsrJobsRepository,
-} from '@clipper/data';
-import type { QueueAdapter } from '@clipper/queue';
-import { QUEUE_TOPIC_ASR } from '@clipper/queue';
-import { AsrQueuePayloadSchema } from '@clipper/queue/asr';
-
-export interface AsrFacadeDeps {
-    asrJobs: AsrJobsRepository;
-    asrArtifacts?: AsrArtifactsRepository;
-    queue?: QueueAdapter; // optional for now; Task 5 will formalize ASR topic
-}
-
-export interface AsrRequest {
-    localPath: string; // required: scratch media file to hash & transcribe
-    clipJobId?: string;
-    sourceType?: string; // upload | youtube | internal (default internal)
-    sourceKey?: string; // optional storage key
-    modelVersion?: string; // default from env or whisper-large-v3-turbo
-    languageHint?: string; // 'auto' or ISO 639-1
-}
-
-export interface AsrRequestResult {
-    asrJobId: string;
-    status: 'reused' | 'queued';
-    artifacts?: AsrArtifactRow[];
-    mediaHash: string;
-    modelVersion: string;
-}
-
-export class AsrFacade {
-    constructor(private readonly deps: AsrFacadeDeps) {}
-
-    async request(req: AsrRequest): Promise<AsrRequestResult> {
-        const modelVersion =
-            req.modelVersion ||
-            process.env.GROQ_MODEL ||
-            'whisper-large-v3-turbo';
-        const mediaHash = await sha256File(req.localPath);
-
-        // Try reuse shortcut
-        const reusable = await this.deps.asrJobs.getReusable(
-            mediaHash,
-            modelVersion
-        );
-        if (reusable) {
-            return {
-                asrJobId: reusable.id,
-                status: 'reused',
-                artifacts: reusable.artifacts,
-                mediaHash,
-                modelVersion,
-            };
-        }
-
-        // Create a new ASR job row (queued)
-        const id = crypto.randomUUID();
-        await this.deps.asrJobs.create({
-            id,
-            clipJobId: req.clipJobId,
-            sourceType: req.sourceType || 'internal',
-            sourceKey: req.sourceKey,
-            mediaHash,
-            modelVersion,
-            languageHint: req.languageHint,
-            status: 'queued',
-        });
-
-        // Fire-and-forget enqueue (Task 5 will add dedicated ASR queue/topic)
-        if (this.deps.queue) {
-            try {
-                const payload = {
-                    asrJobId: id,
-                    clipJobId: req.clipJobId,
-                    languageHint: req.languageHint,
-                };
-                const parsed = AsrQueuePayloadSchema.parse(payload);
-                if (this.deps.queue.publishTo) {
-                    await this.deps.queue.publishTo(QUEUE_TOPIC_ASR, parsed);
-                } else {
-                    // fallback: publish to default topic if multi-topic not supported
-                    await this.deps.queue.publish({
-                        jobId: id,
-                        priority: 'normal',
-                    });
-                }
-            } catch (e) {
-                // Non-fatal here; job remains queued for a future publisher
-            }
-        }
-
-        return { asrJobId: id, status: 'queued', mediaHash, modelVersion };
-    }
-}
-
-async function sha256File(filePath: string): Promise<string> {
-    const hasher = createHash('sha256');
-    const file = Bun.file(filePath);
-    const stream = file.stream();
-    for await (const chunk of stream as any) {
-        hasher.update(chunk);
-    }
-    return hasher.digest('hex');
 }
 ```
 
@@ -4064,6 +3824,272 @@ export interface QueueAdapter {
 // Queue topics used in the system
 export const QUEUE_TOPIC_CLIPS = 'clips';
 export const QUEUE_TOPIC_ASR = 'asr';
+```
+
+## File: src/worker/asr.start.ts
+```typescript
+import { PgBossQueueAdapter } from '@clipper/queue';
+import { requireEnv, createLogger, readEnv } from '@clipper/common';
+import { startAsrWorker } from './asr';
+
+const log = createLogger((readEnv('LOG_LEVEL') as any) || 'info').with({
+    mod: 'asr.start',
+});
+
+const queue = new PgBossQueueAdapter({
+    connectionString: requireEnv('DATABASE_URL'),
+});
+
+log.info('ASR worker starting');
+await startAsrWorker({ queue });
+log.info('ASR worker started');
+```
+
+## File: scripts/submit-and-poll.ts
+```typescript
+#!/usr/bin/env bun
+/**
+ * Submit a clip job to the local API and poll until result is ready.
+ * Usage:
+ *  bun scripts/submit-and-poll.ts --url <youtubeUrl> --start 00:01:00 --end 00:01:45 --lang en [--burn]
+ */
+
+function parseArgs() {
+    const args = new Map<string, string | boolean>();
+    const argv = process.argv.slice(2);
+    for (let i = 0; i < argv.length; i++) {
+        const a = argv[i]!;
+        if (a.startsWith('--')) {
+            const key = a.slice(2);
+            const next = argv[i + 1];
+            if (!next || next.startsWith('--')) {
+                args.set(key, true);
+            } else {
+                args.set(key, next);
+                i++;
+            }
+        }
+    }
+    return args;
+}
+
+const args = parseArgs();
+const youtubeUrl = String(args.get('url') || args.get('youtube') || '');
+const start = String(args.get('start') || '');
+const end = String(args.get('end') || '');
+const lang = String(args.get('lang') || 'en');
+const burn = Boolean(args.get('burn') || false);
+
+if (!youtubeUrl || !start || !end) {
+    console.error(
+        'Usage: bun scripts/submit-and-poll.ts --url <youtubeUrl> --start 00:MM:SS --end 00:MM:SS --lang en [--burn]'
+    );
+    process.exit(2);
+}
+
+const API = process.env.API_BASE_URL || 'http://localhost:3000';
+
+async function submitJob() {
+    const payload = {
+        sourceType: 'youtube',
+        youtubeUrl,
+        start,
+        end,
+        withSubtitles: true,
+        subtitleLang: lang,
+        burnSubtitles: burn,
+    };
+    const res = await fetch(`${API}/api/jobs`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(payload),
+    });
+    if (!res.ok) {
+        const txt = await res.text();
+        throw new Error(`Create failed ${res.status}: ${txt}`);
+    }
+    const data = (await res.json()) as any;
+    const id = data?.job?.id || data?.id || data?.jobId;
+    if (!id) throw new Error(`No job id in response: ${JSON.stringify(data)}`);
+    return id as string;
+}
+
+async function getResult(id: string) {
+    const res = await fetch(`${API}/api/jobs/${id}/result`);
+    if (res.status === 404) return null; // not ready
+    if (!res.ok)
+        throw new Error(`Result failed ${res.status}: ${await res.text()}`);
+    return (await res.json()) as any;
+}
+
+async function main() {
+    console.log(
+        `[submit] creating job for ${youtubeUrl} from ${start} to ${end} (lang=${lang}, burn=${burn})`
+    );
+    const id = await submitJob();
+    console.log(`[submit] job id: ${id}`);
+    const startTs = Date.now();
+    const timeoutMs = Number(process.env.SUBMIT_TIMEOUT_MS || 15 * 60_000);
+    const pollMs = 5_000;
+    while (true) {
+        if (Date.now() - startTs > timeoutMs)
+            throw new Error('Timed out waiting for result');
+        const res = await getResult(id);
+        if (res) {
+            const r = res.result || res;
+            console.log('\n=== Clip Ready ===');
+            console.log(`Job: ${r.id || id}`);
+            if (r.video?.url) console.log(`Video: ${r.video.url}`);
+            if (r.burnedVideo?.url) console.log(`Burned: ${r.burnedVideo.url}`);
+            if (r.srt?.url) console.log(`SRT: ${r.srt.url}`);
+            return;
+        }
+        process.stdout.write('.');
+        await new Promise((r) => setTimeout(r, pollMs));
+    }
+}
+
+main().catch((e) => {
+    console.error('\n[submit] error:', e?.message || e);
+    process.exit(1);
+});
+```
+
+## File: src/asr/facade.ts
+```typescript
+import { createHash } from 'crypto';
+import type {
+    AsrArtifactsRepository,
+    AsrArtifactRow,
+    AsrJobsRepository,
+} from '@clipper/data';
+import type { QueueAdapter } from '@clipper/queue';
+import { QUEUE_TOPIC_ASR } from '@clipper/queue';
+import { AsrQueuePayloadSchema } from '@clipper/queue/asr';
+
+export interface AsrFacadeDeps {
+    asrJobs: AsrJobsRepository;
+    asrArtifacts?: AsrArtifactsRepository;
+    queue?: QueueAdapter; // optional for now; Task 5 will formalize ASR topic
+}
+
+export interface AsrRequest {
+    localPath: string; // required: scratch media file to hash & transcribe
+    clipJobId?: string;
+    sourceType?: string; // upload | youtube | internal (default internal)
+    sourceKey?: string; // optional storage key
+    modelVersion?: string; // default from env or whisper-large-v3-turbo
+    languageHint?: string; // 'auto' or ISO 639-1
+}
+
+export interface AsrRequestResult {
+    asrJobId: string;
+    status: 'reused' | 'queued';
+    artifacts?: AsrArtifactRow[];
+    mediaHash: string;
+    modelVersion: string;
+}
+
+export class AsrFacade {
+    constructor(private readonly deps: AsrFacadeDeps) {}
+
+    async request(req: AsrRequest): Promise<AsrRequestResult> {
+        const modelVersion =
+            req.modelVersion ||
+            process.env.GROQ_MODEL ||
+            'whisper-large-v3-turbo';
+        const mediaHash = await sha256File(req.localPath);
+
+        // Try reuse shortcut
+        const reusable = await this.deps.asrJobs.getReusable(
+            mediaHash,
+            modelVersion
+        );
+        if (reusable) {
+            // Even when reusing, publish a lightweight ASR task so the ASR worker
+            // can attach artifacts to the clip job, perform burn-in if requested,
+            // and finalize the clip job. This avoids leaving the clip "processing".
+            if (this.deps.queue) {
+                try {
+                    const payload = {
+                        asrJobId: reusable.id,
+                        clipJobId: req.clipJobId,
+                        languageHint: req.languageHint,
+                    };
+                    const parsed = AsrQueuePayloadSchema.parse(payload);
+                    if (this.deps.queue.publishTo) {
+                        await this.deps.queue.publishTo(
+                            QUEUE_TOPIC_ASR,
+                            parsed
+                        );
+                    } else {
+                        await this.deps.queue.publish({
+                            jobId: reusable.id,
+                            priority: 'normal',
+                        });
+                    }
+                } catch (e) {
+                    // Non-fatal; reuse still returned, but ASR worker won't run
+                }
+            }
+            return {
+                asrJobId: reusable.id,
+                status: 'reused',
+                artifacts: reusable.artifacts,
+                mediaHash,
+                modelVersion,
+            };
+        }
+
+        // Create a new ASR job row (queued)
+        const id = crypto.randomUUID();
+        await this.deps.asrJobs.create({
+            id,
+            clipJobId: req.clipJobId,
+            sourceType: req.sourceType || 'internal',
+            sourceKey: req.sourceKey,
+            mediaHash,
+            modelVersion,
+            languageHint: req.languageHint,
+            status: 'queued',
+        });
+
+        // Fire-and-forget enqueue (Task 5 will add dedicated ASR queue/topic)
+        if (this.deps.queue) {
+            try {
+                const payload = {
+                    asrJobId: id,
+                    clipJobId: req.clipJobId,
+                    languageHint: req.languageHint,
+                };
+                const parsed = AsrQueuePayloadSchema.parse(payload);
+                if (this.deps.queue.publishTo) {
+                    await this.deps.queue.publishTo(QUEUE_TOPIC_ASR, parsed);
+                } else {
+                    // fallback: publish to default topic if multi-topic not supported
+                    await this.deps.queue.publish({
+                        jobId: id,
+                        priority: 'normal',
+                    });
+                }
+            } catch (e) {
+                // Non-fatal here; job remains queued for a future publisher
+            }
+        }
+
+        return { asrJobId: id, status: 'queued', mediaHash, modelVersion };
+    }
+}
+
+async function sha256File(filePath: string): Promise<string> {
+    const hasher = createHash('sha256');
+    const file = Bun.file(filePath);
+    const stream = file.stream();
+    for await (const chunk of stream as any) {
+        hasher.update(chunk);
+    }
+    return hasher.digest('hex');
+}
 ```
 
 ## File: src/common/errors.ts
@@ -6038,50 +6064,6 @@ export async function resolveYouTubeSource(
 }
 ```
 
-## File: package.json
-```json
-{
-    "name": "clipper",
-    "module": "index.ts",
-    "type": "module",
-    "private": true,
-    "scripts": {
-        "test": "bunx vitest run",
-        "db:generate": "bunx drizzle-kit generate --config=drizzle.config.ts",
-        "db:migrate": "bunx drizzle-kit migrate --config=drizzle.config.ts",
-        "db:push": "bunx drizzle-kit push --config=drizzle.config.ts",
-        "dev": "bun --watch src/api/index.ts",
-        "dev:worker": "bun --watch src/worker/index.ts",
-        "dev:asr": "bun --watch src/worker/asr.start.ts",
-        "dev:dlq": "bun --watch src/queue/dlq-consumer.ts",
-        "dev:all": "bun scripts/dev-all.ts",
-        "start:api": "bun src/api/index.ts",
-        "start:worker": "bun src/worker/index.ts",
-        "start:asr": "bun src/worker/asr.start.ts",
-        "start:dlq": "bun src/queue/dlq-consumer.ts"
-    },
-    "devDependencies": {
-        "@types/bun": "latest"
-    },
-    "peerDependencies": {
-        "typescript": "^5"
-    },
-    "dependencies": {
-        "@elysiajs/cors": "^1.3.3",
-        "@supabase/supabase-js": "^2.54.0",
-        "@types/pg": "^8.15.5",
-        "dotenv": "^17.2.1",
-        "drizzle-kit": "^0.31.4",
-        "drizzle-orm": "^0.44.4",
-        "elysia": "^1.3.8",
-        "pg": "^8.16.3",
-        "pg-boss": "^10.3.2",
-        "zod": "^4.0.17",
-        "zod-to-openapi": "^0.2.1"
-    }
-}
-```
-
 ## File: src/data/repo.ts
 ```typescript
 import type { JobStatus } from '@clipper/contracts';
@@ -6548,6 +6530,53 @@ export class BunClipper implements Clipper {
 }
 ```
 
+## File: package.json
+```json
+{
+    "name": "clipper",
+    "module": "index.ts",
+    "type": "module",
+    "private": true,
+    "scripts": {
+        "test": "bunx vitest run",
+        "db:generate": "bunx drizzle-kit generate --config=drizzle.config.ts",
+        "db:migrate": "bunx drizzle-kit migrate --config=drizzle.config.ts",
+        "db:push": "bunx drizzle-kit push --config=drizzle.config.ts",
+        "dev": "bun --watch src/api/index.ts",
+        "dev:worker": "bun --watch src/worker/index.ts",
+        "dev:asr": "bun --watch src/worker/asr.start.ts",
+        "dev:dlq": "bun --watch src/queue/dlq-consumer.ts",
+        "dev:all": "bun scripts/dev-all.ts",
+        "start:api": "bun src/api/index.ts",
+        "start:worker": "bun src/worker/index.ts",
+        "start:asr": "bun src/worker/asr.start.ts",
+        "start:dlq": "bun src/queue/dlq-consumer.ts",
+        "test:vitest": "bunx vitest run --exclude \"**/*.bun.test.ts\"",
+        "test:bun": "bun test ./src/**/*.bun.test.ts",
+        "test:all": "bun run test:vitest && bun run test:bun"
+    },
+    "devDependencies": {
+        "@types/bun": "latest"
+    },
+    "peerDependencies": {
+        "typescript": "^5"
+    },
+    "dependencies": {
+        "@elysiajs/cors": "^1.3.3",
+        "@supabase/supabase-js": "^2.54.0",
+        "@types/pg": "^8.15.5",
+        "dotenv": "^17.2.1",
+        "drizzle-kit": "^0.31.4",
+        "drizzle-orm": "^0.44.4",
+        "elysia": "^1.3.8",
+        "pg": "^8.16.3",
+        "pg-boss": "^10.3.2",
+        "zod": "^4.0.17",
+        "zod-to-openapi": "^0.2.1"
+    }
+}
+```
+
 ## File: src/worker/asr.ts
 ```typescript
 import {
@@ -6644,7 +6673,7 @@ export async function startAsrWorker(deps: AsrWorkerDeps) {
                 log.warn('asr job not found', { asrJobId });
                 return;
             }
-            if (job.status === 'done') return; // idempotent
+            const jobWasAlreadyDone = job.status === 'done';
             if (job.status === 'queued') {
                 await asrJobs.patch(asrJobId, { status: 'processing' });
             }
@@ -6655,178 +6684,230 @@ export async function startAsrWorker(deps: AsrWorkerDeps) {
                 languageHint: languageHint || job.languageHint,
             });
 
-            // Locate media: prefer clip resultVideoKey
-            let inputLocal: string;
+            // Locate media: prefer clip resultVideoKey (needed for burn-in later)
+            let inputLocal: string | null = null;
+            let clip: any = null;
             if (clipJobId) {
-                const clip = await clipJobs.get(clipJobId);
+                clip = await clipJobs.get(clipJobId);
                 if (!clip?.resultVideoKey) throw new Error('NO_CLIP_RESULT');
                 if (!storage) throw new Error('STORAGE_NOT_AVAILABLE');
                 inputLocal = await storage.download(clip.resultVideoKey);
                 tmpLocal = inputLocal;
-            } else {
-                throw new Error('NO_INPUT_PROVIDED');
             }
 
-            // Transcribe
-            const res = await withExternal(
-                metrics as any,
-                {
-                    dep: 'asr',
-                    op: 'transcribe',
-                    timeoutMs,
-                    classifyError: (e) => {
-                        const msg = String(e?.message || e);
-                        if (msg === 'TIMEOUT' || /abort/i.test(msg))
-                            return 'timeout';
-                        if (msg === 'VALIDATION_FAILED') return 'validation';
-                        if (msg === 'UPSTREAM_FAILURE') return 'upstream';
-                        if (e instanceof ProviderHttpError) {
-                            if (e.status === 400) return 'validation';
-                            if (e.status === 0) return 'network';
-                            if (e.status >= 500) return 'upstream';
-                        }
-                        return undefined;
-                    },
-                },
-                async (signal) => {
-                    log.info('groq transcribe begin', {
-                        asrJobId,
-                        clipJobId,
-                        timeoutMs,
-                        languageHint: languageHint || job.languageHint,
-                    });
-                    // lazily construct provider per job to avoid crashing worker when env is missing
-                    const provider =
-                        deps?.provider ?? new GroqWhisperProvider();
+            // If ASR job already completed, reuse its artifacts; else transcribe now
+            let srtKey: string | null = null;
+            let res: any = null;
+            if (jobWasAlreadyDone) {
+                const arts = await artifacts.list(asrJobId);
+                srtKey = arts.find((a) => a.kind === 'srt')?.storageKey || null;
+                if (srtKey) {
+                    // Verify artifact actually exists in storage; if not, force refresh
                     try {
-                        const out = await provider.transcribe(inputLocal, {
-                            timeoutMs,
-                            languageHint,
-                            signal,
-                        });
+                        const verifyPath = `/tmp/${
+                            clipJobId ?? asrJobId
+                        }.verify.srt`;
+                        await storage.download(srtKey, verifyPath);
+                    } catch {
                         try {
-                            log.info('groq transcribe done', {
-                                asrJobId,
-                                clipJobId,
-                                detectedLanguage: out.detectedLanguage,
-                                durationSec: out.durationSec,
-                                model: out.modelVersion,
-                            });
+                            log.warn(
+                                'reused srt missing in storage; forcing refresh',
+                                {
+                                    asrJobId,
+                                    clipJobId,
+                                    srtKey,
+                                }
+                            );
                         } catch {}
-                        return out;
-                    } catch (err: any) {
-                        if (err?.name === 'AbortError')
-                            throw new Error('TIMEOUT');
-                        if (err instanceof ProviderHttpError) {
-                            if (err.status === 0)
-                                throw new Error('UPSTREAM_FAILURE');
-                            if (err.status >= 500)
-                                throw new Error('UPSTREAM_FAILURE');
-                            if (err.status === 400)
-                                throw new Error('VALIDATION_FAILED');
-                            throw new Error('UPSTREAM_FAILURE');
-                        }
-                        throw err;
+                        srtKey = null;
                     }
                 }
-            );
+            }
+
+            if (!jobWasAlreadyDone || !srtKey) {
+                const tr = await withExternal(
+                    metrics as any,
+                    {
+                        dep: 'asr',
+                        op: 'transcribe',
+                        timeoutMs,
+                        classifyError: (e) => {
+                            const msg = String(e?.message || e);
+                            if (msg === 'TIMEOUT' || /abort/i.test(msg))
+                                return 'timeout';
+                            if (msg === 'VALIDATION_FAILED')
+                                return 'validation';
+                            if (msg === 'UPSTREAM_FAILURE') return 'upstream';
+                            if (e instanceof ProviderHttpError) {
+                                if (e.status === 400) return 'validation';
+                                if (e.status === 0) return 'network';
+                                if (e.status >= 500) return 'upstream';
+                            }
+                            return undefined;
+                        },
+                    },
+                    async (signal) => {
+                        log.info('groq transcribe begin', {
+                            asrJobId,
+                            clipJobId,
+                            timeoutMs,
+                            languageHint: languageHint || job.languageHint,
+                        });
+                        // lazily construct provider per job to avoid crashing worker when env is missing
+                        const provider =
+                            deps?.provider ?? new GroqWhisperProvider();
+                        try {
+                            const out = await provider.transcribe(inputLocal!, {
+                                timeoutMs,
+                                languageHint,
+                                signal,
+                            });
+                            try {
+                                log.info('groq transcribe done', {
+                                    asrJobId,
+                                    clipJobId,
+                                    detectedLanguage: out.detectedLanguage,
+                                    durationSec: out.durationSec,
+                                    model: out.modelVersion,
+                                });
+                            } catch {}
+                            return out;
+                        } catch (err: any) {
+                            if (err?.name === 'AbortError')
+                                throw new Error('TIMEOUT');
+                            if (err instanceof ProviderHttpError) {
+                                if (err.status === 0)
+                                    throw new Error('UPSTREAM_FAILURE');
+                                if (err.status >= 500)
+                                    throw new Error('UPSTREAM_FAILURE');
+                                if (err.status === 400)
+                                    throw new Error('VALIDATION_FAILED');
+                                throw new Error('UPSTREAM_FAILURE');
+                            }
+                            throw err;
+                        }
+                    }
+                );
+                res = tr;
+            }
 
             // Build artifacts
-            const built = buildArtifacts(res.segments, {
-                includeJson,
-                mergeGapMs,
-            });
-            try {
-                log.info('asr artifacts built', {
-                    asrJobId,
-                    clipJobId,
-                    segments: res.segments?.length ?? 0,
+            if (!srtKey) {
+                // Build and upload fresh artifacts
+                const built = buildArtifacts(res.segments, {
+                    includeJson,
+                    mergeGapMs,
                 });
-            } catch {}
+                try {
+                    log.info('asr artifacts built', {
+                        asrJobId,
+                        clipJobId,
+                        segments: res.segments?.length ?? 0,
+                    });
+                } catch {}
 
-            // Upload artifacts
-            if (!storage) throw new Error('STORAGE_NOT_AVAILABLE');
-            const owner = clipJobId ?? asrJobId;
-            const srtKey = storageKeys.transcriptSrt(owner);
-            const txtKey = storageKeys.transcriptText(owner);
-            const jsonKey = includeJson
-                ? storageKeys.transcriptJson(owner)
-                : null;
-            const srtPath = `/tmp/${owner}.srt`;
-            const txtPath = `/tmp/${owner}.txt`;
-            await Bun.write(srtPath, built.srt);
-            await Bun.write(txtPath, built.text);
-            await storage.upload(srtPath, srtKey, 'application/x-subrip');
-            await storage.upload(txtPath, txtKey, 'text/plain; charset=utf-8');
-            if (includeJson && jsonKey) {
-                const jsonPath = `/tmp/${owner}.json`;
-                await Bun.write(
-                    jsonPath,
-                    JSON.stringify(built.json || [], null, 0)
+                if (!storage) throw new Error('STORAGE_NOT_AVAILABLE');
+                const owner = clipJobId ?? asrJobId;
+                srtKey = storageKeys.transcriptSrt(owner);
+                const txtKey = storageKeys.transcriptText(owner);
+                const jsonKey = includeJson
+                    ? storageKeys.transcriptJson(owner)
+                    : null;
+                const srtPath = `/tmp/${owner}.srt`;
+                const txtPath = `/tmp/${owner}.txt`;
+                await Bun.write(srtPath, built.srt);
+                await Bun.write(txtPath, built.text);
+                await storage.upload(srtPath, srtKey, 'application/x-subrip');
+                await storage.upload(
+                    txtPath,
+                    txtKey,
+                    'text/plain; charset=utf-8'
                 );
-                await storage.upload(jsonPath, jsonKey, 'application/json');
+                if (includeJson && jsonKey) {
+                    const jsonPath = `/tmp/${owner}.json`;
+                    await Bun.write(
+                        jsonPath,
+                        JSON.stringify(built.json || [], null, 0)
+                    );
+                    await storage.upload(jsonPath, jsonKey, 'application/json');
+                }
+                try {
+                    log.info('asr artifacts uploaded', {
+                        asrJobId,
+                        clipJobId,
+                        srtKey,
+                    });
+                } catch {}
             }
-            try {
-                log.info('asr artifacts uploaded', {
-                    asrJobId,
-                    clipJobId,
-                    srtKey,
-                });
-            } catch {}
 
             // Persist artifacts
-            await artifacts.put({
-                asrJobId,
-                kind: 'srt',
-                storageKey: srtKey,
-                createdAt: new Date().toISOString(),
-            });
-            await artifacts.put({
-                asrJobId,
-                kind: 'text',
-                storageKey: txtKey,
-                createdAt: new Date().toISOString(),
-            });
-            if (includeJson && jsonKey)
-                await artifacts.put({
-                    asrJobId,
-                    kind: 'json',
-                    storageKey: jsonKey,
-                    createdAt: new Date().toISOString(),
-                });
-
-            // Finalize job
-            await asrJobs.patch(asrJobId, {
-                status: 'done',
-                detectedLanguage: res.detectedLanguage,
-                durationSec: Math.round(res.durationSec),
-                completedAt: new Date().toISOString(),
-            });
-            metrics.observe('asr.duration_ms', Date.now() - startedAt);
-            metrics.inc('asr.completed');
+            // Persist artifacts (only when freshly created)
             try {
-                log.info('asr job completed', { asrJobId, clipJobId });
+                if (!jobWasAlreadyDone) {
+                    await artifacts.put({
+                        asrJobId,
+                        kind: 'srt',
+                        storageKey: srtKey!,
+                        createdAt: new Date().toISOString(),
+                    });
+                    await artifacts.put({
+                        asrJobId,
+                        kind: 'text',
+                        storageKey: storageKeys.transcriptText(
+                            clipJobId ?? asrJobId
+                        ),
+                        createdAt: new Date().toISOString(),
+                    });
+                    if (includeJson) {
+                        await artifacts.put({
+                            asrJobId,
+                            kind: 'json',
+                            storageKey: storageKeys.transcriptJson(
+                                clipJobId ?? asrJobId
+                            ),
+                            createdAt: new Date().toISOString(),
+                        });
+                    }
+                }
             } catch {}
+
+            // Finalize job if we ran transcription now
+            if (!jobWasAlreadyDone && res) {
+                await asrJobs.patch(asrJobId, {
+                    status: 'done',
+                    detectedLanguage: res.detectedLanguage,
+                    durationSec: Math.round(res.durationSec),
+                    completedAt: new Date().toISOString(),
+                });
+                metrics.observe('asr.duration_ms', Date.now() - startedAt);
+                metrics.inc('asr.completed');
+                try {
+                    log.info('asr job completed', { asrJobId, clipJobId });
+                } catch {}
+            }
 
             // Update originating clip job with transcript key if available
             if (clipJobId) {
                 try {
-                    await clipJobs.update(clipJobId, {
-                        resultSrtKey: srtKey,
-                    } as any);
+                    if (srtKey) {
+                        await clipJobs.update(clipJobId, {
+                            resultSrtKey: srtKey,
+                        } as any);
+                    }
                 } catch {}
             }
 
             // Burn-in subtitles if the originating clip requested it
             if (clipJobId) {
-                try {
-                    const clip = await clipJobs.get(clipJobId);
-                    if (clip?.burnSubtitles && clip?.resultVideoKey) {
+                clip = clip ?? (await clipJobs.get(clipJobId));
+                if (clip?.burnSubtitles && clip?.resultVideoKey) {
+                    try {
                         const burnedKey =
                             storageKeys.resultVideoBurned(clipJobId);
                         const clipLocal = await storage.download(
                             clip.resultVideoKey
                         );
+                        if (!srtKey) throw new Error('NO_SRT_FOR_BURNIN');
                         const srtLocal = await storage.download(srtKey);
 
                         const burnedPath = `/tmp/${clipJobId}.subbed.mp4`;
@@ -6906,38 +6987,38 @@ export async function startAsrWorker(deps: AsrWorkerDeps) {
                                 });
                             } catch {}
                         }
+                    } catch (e) {
+                        log.warn('burn-in stage error (non-fatal)', {
+                            asrJobId,
+                            e: String(e),
+                        });
                     }
-                    // Finalize clip job as done now (after burn-in attempt completed),
-                    // so API result includes burnedVideo if available.
-                    try {
-                        const refreshed = await clipJobs.get(clipJobId);
-                        if (refreshed && refreshed.status !== 'done') {
-                            await clipJobs.update(clipJobId, {
-                                status: 'done',
-                                progress: 100,
-                            } as any);
-                            try {
-                                log.info('clip job finalized by asr', {
-                                    clipJobId,
-                                    asrJobId,
-                                });
-                            } catch {}
-                            try {
-                                await events.add({
-                                    jobId: clipJobId,
-                                    ts: new Date().toISOString(),
-                                    type: 'done',
-                                    data: {},
-                                });
-                            } catch {}
-                        }
-                    } catch {}
-                } catch (e) {
-                    log.warn('burn-in stage error (non-fatal)', {
-                        asrJobId,
-                        e: String(e),
-                    });
                 }
+                // Finalize clip job as done now (after burn-in attempt or skipped),
+                // so API result includes burnedVideo if available, or at least the original.
+                try {
+                    const refreshed = await clipJobs.get(clipJobId);
+                    if (refreshed && refreshed.status !== 'done') {
+                        await clipJobs.update(clipJobId, {
+                            status: 'done',
+                            progress: 100,
+                        } as any);
+                        try {
+                            log.info('clip job finalized by asr', {
+                                clipJobId,
+                                asrJobId,
+                            });
+                        } catch {}
+                        try {
+                            await events.add({
+                                jobId: clipJobId,
+                                ts: new Date().toISOString(),
+                                type: 'done',
+                                data: {},
+                            });
+                        } catch {}
+                    }
+                } catch {}
             }
         } catch (e) {
             const err = fromException(e, asrJobId);
@@ -6962,10 +7043,13 @@ export async function startAsrWorker(deps: AsrWorkerDeps) {
                             progress: 100,
                         } as any);
                         try {
-                            log.warn('asr failed; clip finalized without subtitles', {
-                                clipJobId,
-                                asrJobId,
-                            });
+                            log.warn(
+                                'asr failed; clip finalized without subtitles',
+                                {
+                                    clipJobId,
+                                    asrJobId,
+                                }
+                            );
                         } catch {}
                         try {
                             await events.add({
@@ -8194,6 +8278,52 @@ const log = createLogger((readEnv('LOG_LEVEL') as any) || 'info').with({
     mod: 'worker',
 });
 
+// Local helper for burning subtitles during inline reuse path
+function escapeForSubtitlesFilterLocal(path: string): string {
+    return path
+        .replace(/\\/g, '\\\\')
+        .replace(/:/g, '\\:')
+        .replace(/'/g, "\\'")
+        .replace(/,/g, '\\,')
+        .replace(/ /g, '\\ ');
+}
+async function burnInSubtitlesLocal(args: {
+    srcVideoPath: string;
+    srtPath: string;
+    outPath: string;
+    ffmpegBin?: string;
+}): Promise<boolean> {
+    const escapedSrt = escapeForSubtitlesFilterLocal(args.srtPath);
+    const ffArgs = [
+        args.ffmpegBin ?? 'ffmpeg',
+        '-y',
+        '-i',
+        args.srcVideoPath,
+        '-vf',
+        `subtitles=${escapedSrt}:force_style='FontSize=18,Outline=1,Shadow=0,MarginV=18'`,
+        '-c:v',
+        'libx264',
+        '-preset',
+        'veryfast',
+        '-pix_fmt',
+        'yuv420p',
+        '-c:a',
+        'copy',
+        args.outPath,
+    ];
+    const proc = Bun.spawn(ffArgs, { stderr: 'pipe' });
+    try {
+        // Drain stderr to avoid backpressure if ffmpeg is verbose
+        if (proc.stderr) {
+            for await (const _ of proc.stderr) {
+                // no-op
+            }
+        }
+    } catch {}
+    const code = await proc.exited;
+    return code === 0;
+}
+
 const metrics = new InMemoryMetrics();
 const sharedDb = createDb();
 const jobs = new DrizzleJobsRepo(sharedDb, metrics);
@@ -8814,7 +8944,10 @@ async function main() {
                         });
                         asrRequested = true;
                         asrStatus = asrRes.status;
-                        if (asrRes.status === 'reused' && Array.isArray(asrRes.artifacts)) {
+                        if (
+                            asrRes.status === 'reused' &&
+                            Array.isArray(asrRes.artifacts)
+                        ) {
                             asrArtifacts = asrRes.artifacts.map((a: any) => ({
                                 kind: a.kind,
                                 storageKey: a.storageKey,
@@ -8844,10 +8977,14 @@ async function main() {
             // Fast-path: if ASR returned a reused artifact set, attach SRT and optionally burn-in here
             if (asrStatus === 'reused') {
                 try {
-                    const srtKey = asrArtifacts.find((a) => a.kind === 'srt')?.storageKey;
+                    const srtKey = asrArtifacts.find(
+                        (a) => a.kind === 'srt'
+                    )?.storageKey;
                     if (srtKey) {
                         try {
-                            await jobs.update(jobId, { resultSrtKey: srtKey } as any);
+                            await jobs.update(jobId, {
+                                resultSrtKey: srtKey,
+                            } as any);
                         } catch {}
                     }
                     if (job.burnSubtitles && srtKey && storage && key) {
@@ -8870,9 +9007,15 @@ async function main() {
                             outPath: outLocal,
                         });
                         if (ok) {
-                            await storage.upload(outLocal, burnedKey, 'video/mp4');
+                            await storage.upload(
+                                outLocal,
+                                burnedKey,
+                                'video/mp4'
+                            );
                             try {
-                                await jobs.update(jobId, { resultVideoBurnedKey: burnedKey } as any);
+                                await jobs.update(jobId, {
+                                    resultVideoBurnedKey: burnedKey,
+                                } as any);
                             } catch {}
                             try {
                                 await events.add({
