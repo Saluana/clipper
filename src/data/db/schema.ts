@@ -46,6 +46,8 @@ export const jobs = pgTable(
         resultSrtKey: text('result_srt_key'),
         errorCode: text('error_code'),
         errorMessage: text('error_message'),
+        // Reaper/lease fields
+        lockedBy: text('locked_by'),
         createdAt: timestamp('created_at', { withTimezone: true })
             .notNull()
             .defaultNow(),
@@ -53,16 +55,26 @@ export const jobs = pgTable(
             .notNull()
             .defaultNow(),
         expiresAt: timestamp('expires_at', { withTimezone: true }),
+        leaseExpiresAt: timestamp('lease_expires_at', { withTimezone: true }),
         lastHeartbeatAt: timestamp('last_heartbeat_at', { withTimezone: true }),
         attemptCount: integer('attempt_count').notNull().default(0),
+        maxAttempts: integer('max_attempts').default(3),
         processingStartedAt: timestamp('processing_started_at', {
             withTimezone: true,
         }),
+        failCode: text('fail_code'),
+        failReason: text('fail_reason'),
+        stage: text('stage'),
+        nextEarliestRunAt: timestamp('next_earliest_run_at', {
+            withTimezone: true,
+        }),
+        expectedDurationMs: integer('expected_duration_ms'),
     },
     (t) => [
         index('idx_jobs_status_created_at').on(t.status, t.createdAt),
         index('idx_jobs_expires_at').on(t.expiresAt),
         index('idx_jobs_status_last_hb').on(t.status, t.lastHeartbeatAt),
+        index('idx_jobs_status_lease').on(t.status, t.leaseExpiresAt),
     ]
 );
 
@@ -108,6 +120,8 @@ export const asrJobs = pgTable(
         status: asrJobStatus('status').notNull().default('queued'),
         errorCode: text('error_code'),
         errorMessage: text('error_message'),
+        // Reaper/lease fields (mirrored for ASR attempts and heartbeats)
+        lockedBy: text('locked_by'),
         createdAt: timestamp('created_at', { withTimezone: true })
             .notNull()
             .defaultNow(),
@@ -116,10 +130,22 @@ export const asrJobs = pgTable(
             .defaultNow(),
         completedAt: timestamp('completed_at', { withTimezone: true }),
         expiresAt: timestamp('expires_at', { withTimezone: true }),
+        leaseExpiresAt: timestamp('lease_expires_at', { withTimezone: true }),
+        lastHeartbeatAt: timestamp('last_heartbeat_at', { withTimezone: true }),
+        attemptCount: integer('attempt_count').notNull().default(0),
+        maxAttempts: integer('max_attempts').default(3),
+        failCode: text('fail_code'),
+        failReason: text('fail_reason'),
+        stage: text('stage'),
+        nextEarliestRunAt: timestamp('next_earliest_run_at', {
+            withTimezone: true,
+        }),
+        expectedDurationMs: integer('expected_duration_ms'),
     },
     (t) => [
         index('idx_asr_jobs_status_created_at').on(t.status, t.createdAt),
         index('idx_asr_jobs_expires_at').on(t.expiresAt),
+        index('idx_asr_jobs_status_lease').on(t.status, t.leaseExpiresAt),
         // Unique partial index handled via raw SQL migration (media_hash, model_version) where status='done'
     ]
 );

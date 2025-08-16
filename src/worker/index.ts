@@ -34,6 +34,15 @@ export * from './asr.ts';
 const log = createLogger((readEnv('LOG_LEVEL') as any) || 'info').with({
     mod: 'worker',
 });
+const workerId = `${os.hostname?.() || 'host'}-${process.pid}`;
+// Default lease extension per heartbeat (sec): prefer JOB_LEASE_SEC, fallback to QUEUE_VISIBILITY_SEC, else 300s
+const DEFAULT_LEASE_SEC = (() => {
+    const a = Number(readEnv('JOB_LEASE_SEC'));
+    if (Number.isFinite(a) && a > 0) return Math.floor(a);
+    const b = Number(readEnv('QUEUE_VISIBILITY_SEC'));
+    if (Number.isFinite(b) && b > 0) return Math.floor(b);
+    return 300;
+})();
 
 // Local helper for burning subtitles during inline reuse path
 function escapeForSubtitlesFilterLocal(path: string): string {
@@ -125,9 +134,12 @@ function startHeartbeatLoop(opts: HeartbeatLoopOpts = {}) {
     const updater =
         opts.updater ||
         (async (ids: string[], now: Date) => {
+            const nextLease = new Date(
+                now.getTime() + DEFAULT_LEASE_SEC * 1000
+            );
             await (sharedDb as any)
                 .update(jobsTable)
-                .set({ lastHeartbeatAt: now })
+                .set({ lastHeartbeatAt: now, leaseExpiresAt: nextLease })
                 .where(inArray(jobsTable.id, ids));
         });
     (async () => {
@@ -429,7 +441,12 @@ async function main() {
                 const r = await (sharedDb as any)
                     .select({ c: sql<number>`count(*)` })
                     .from(jobsTable)
-                    .where(eq(jobsTable.status, 'queued'));
+                    .where(
+                        and(
+                            eq(jobsTable.status, 'queued'),
+                            sql`${jobsTable.nextEarliestRunAt} IS NULL OR ${jobsTable.nextEarliestRunAt} <= NOW()`
+                        )
+                    );
                 return Number(r[0]?.c || 0);
             } catch (e) {
                 log.warn('queue depth query failed', { error: String(e) });
@@ -465,7 +482,12 @@ async function main() {
         let success = false;
 
         const finish = async (status: 'done' | 'failed', patch: any = {}) => {
-            await jobs.update(jobId, { status, ...patch });
+            await jobs.update(jobId, {
+                status,
+                leaseExpiresAt: null,
+                lockedBy: null,
+                ...patch,
+            });
             await events.add({
                 jobId,
                 ts: nowIso(),
@@ -509,12 +531,18 @@ async function main() {
                         status: sql`'processing'::job_status`,
                         processingStartedAt: new Date(),
                         lastHeartbeatAt: new Date(),
+                        leaseExpiresAt: new Date(
+                            Date.now() + DEFAULT_LEASE_SEC * 1000
+                        ),
+                        attemptCount: sql`${jobsTable.attemptCount} + 1`,
+                        lockedBy: workerId,
                         updatedAt: new Date(),
                     })
                     .where(
                         and(
                             eq(jobsTable.id, jobId),
-                            eq(jobsTable.status, 'queued')
+                            eq(jobsTable.status, 'queued'),
+                            sql`${jobsTable.nextEarliestRunAt} IS NULL OR ${jobsTable.nextEarliestRunAt} <= NOW()`
                         )
                     )
                     .returning({ id: jobsTable.id });

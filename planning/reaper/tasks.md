@@ -2,33 +2,35 @@
 
 artifact_id: 9c2d1a4f-6e7b-4aaf-8f4f-2c3e9b0d4a11
 
-1. Reaper service (core) [ ]
+1. Reaper service (core) [x]
 
-    - Create `scripts/reaper.ts` that runs every `REAPER_INTERVAL_SEC` and calls `reap(table)` for `jobs` and `asr_jobs`. (Requirements: 1,2,6,7)
-    - Implement `reap(table)` to perform two `UPDATE ... RETURNING` statements (requeue and fail). Insert `job_events` rows and emit metrics. (Requirements: 1,2,6)
-    - Add `start:reaper` to `package.json` scripts and docs. (Requirements: 7)
+    - Create `scripts/reaper.ts` that runs every `REAPER_INTERVAL_SEC` and calls `reap(table)` for `jobs` and `asr_jobs`. (Requirements: 1,2,6,7) — Done
+    - Implement `reap(table)` to perform two `UPDATE ... RETURNING` statements (requeue and fail). Insert `job_events` rows (metrics in Task 6). (Requirements: 1,2,6) — Done
+    - Add `start:reaper` to `package.json` scripts and docs. (Requirements: 7) — Done
 
-2. Schema migrations [ ]
+2. Schema migrations [x]
 
     - Add nullable fields to `jobs` and `asr_jobs`: `locked_by`, `lease_expires_at`, `last_heartbeat_at`, `attempt_count` (default 0), `max_attempts` (default 3), `fail_code`, `fail_reason`, `stage`, `next_earliest_run_at`, `expected_duration_ms`. Create indexes on `(status, lease_expires_at)`. (Requirements: 3,8)
     - Reuse existing `job_events(job_id, data)` for logging reaper actions; no new table. (Requirements: 6)
 
-3. Worker changes (claim + heartbeat) [ ]
+3. Worker changes (claim + heartbeat) [x]
 
-    - Update worker claim logic to set `status`, `locked_by`, `attempt_count=attempt_count+1`, `lease_expires_at`, `last_heartbeat_at`, and `processing_started_at` in a single UPDATE. Use `SKIP LOCKED` selection to avoid races. (Requirements: 2,3,4)
-    - Add heartbeat timer (10-15s) in workers that extend `lease_expires_at`. (Requirements: 4)
-    - On finish or error, clear lock fields and set `state=done|failed`. (Requirements: 2,5)
+    - Update worker claim logic to set `status`, `locked_by`, `attempt_count=attempt_count+1`, `lease_expires_at`, `last_heartbeat_at`, and `processing_started_at` in a single UPDATE. Use `SKIP LOCKED` selection to avoid races. (Requirements: 2,3,4) — Done
+    - Add heartbeat timer (10-15s) in workers that extend `lease_expires_at`. (Requirements: 4) — Done
+    - On finish or error, clear lock fields and set `state=done|failed`. (Requirements: 2,5) — Done
 
-4. Backoff & scheduling [ ]
+4. Backoff & scheduling [x]
 
     - On requeue, set `next_earliest_run_at` with exponential backoff per attempt. Ensure workers respect `next_earliest_run_at` when selecting jobs. Use `QUEUE_RETRY_BACKOFF_MS_BASE/MAX` as defaults; allow overrides. (Requirements: 5)
 
-5. Tests [ ]
+5. Tests [x]
 
     - Unit tests for backoff calculation and SLA calculations. (Requirement: 10)
     - Integration tests for reaper behavior (requeue vs fail). (Requirement: 10)
 
-6. Observability [ ]
+6. Observability [x]
+    - Emit reaper.requeued_total, reaper.failed_total, reaper.scan_duration_ms with {table} labels. (Requirement: 6)
+    - For ASR jobs, skip job_events due to FK to jobs; rely on metrics and asr_jobs state. (Requirement: 6)
     - Add metrics emission to existing metrics system for reaper counts and latency. (Requirement: 6)
     - If queuing is mediated via pg-boss, ensure requeue path fits the dispatcher: status='queued' + backoff respected by poller, or optionally republish via queue adapter. (Requirement: 7)
     - Ensure `job_events` are written with `reaper:requeued` / `reaper:failed(timeout)` and necessary details. (Requirement: 6)

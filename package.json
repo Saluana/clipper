@@ -13,6 +13,7 @@
         "dev:asr": "bun --watch src/worker/asr.start.ts",
         "dev:dlq": "bun --watch src/queue/dlq-consumer.ts",
         "dev:all": "bun scripts/dev-all.ts",
+        "start:reaper": "bun scripts/reaper.ts",
         "start:api": "bun src/api/index.ts",
         "start:worker": "bun src/worker/index.ts",
         "start:asr": "bun src/worker/asr.start.ts",
