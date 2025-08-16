@@ -320,6 +320,22 @@ export const app = addHttpInstrumentation(baseApp)
             correlationId: (store as any).correlationId,
         };
     })
+    .get('/openapi.json', async ({ set }) => {
+        try {
+            const doc = await (
+                await import('@clipper/contracts')
+            ).maybeGenerateOpenApi();
+            if (!doc) {
+                set.status = 404;
+                return { error: 'OpenAPI generation disabled' };
+            }
+            set.headers['content-type'] = 'application/json';
+            return doc;
+        } catch (e) {
+            set.status = 500;
+            return { error: 'Failed to generate OpenAPI document' };
+        }
+    })
     .post('/api/jobs', async ({ body, set, store, request }) => {
         const correlationId = (store as any).correlationId;
         // Rate limit (only on creation endpoint)

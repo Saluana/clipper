@@ -37,6 +37,7 @@ The content is organized as follows:
 ```
 scripts/
   dev-all.ts
+  reaper.ts
   submit-and-poll.ts
 src/
   api/
@@ -75,12 +76,16 @@ src/
         _journal.json
         0000_snapshot.json
         0002_snapshot.json
+        0003_snapshot.json
+        0004_snapshot.json
       0000_tense_yellow_claw.sql
       0001_asr_jobs.sql
       0002_add_last_heartbeat.sql
       0002_happy_nomad.sql
       0003_attempt_and_processing.sql
+      0003_noisy_lily_hollister.sql
       0004_add_burned_video_key.sql
+      0004_shiny_ma_gnuci.sql
     scripts/
       admin-jobs.ts
       backfill-expires.ts
@@ -132,76 +137,257 @@ vitest.config.ts
 
 # Files
 
-## File: scripts/dev-all.ts
+## File: scripts/reaper.ts
 ```typescript
 #!/usr/bin/env bun
 /**
- * Dev orchestrator: runs API, worker, ASR worker, and DLQ consumer in watch mode.
- * Uses Bun.spawn to manage child processes; forwards signals for clean shutdown.
+ * Reaper: requeues or fails jobs with expired leases.
+ * - Works for both jobs and asr_jobs tables (if required columns exist).
+ * - Uses exponential backoff for next_earliest_run_at (base/max from QUEUE_* or JOB_* envs).
+ * - Writes structured JSON into job_events.data for observability.
  */
+import { Pool } from 'pg';
+import { readEnv } from '@clipper/common';
+import { InMemoryMetrics } from '@clipper/common/metrics';
+import { createLogger } from '@clipper/common/logger';
 
-type Proc = {
-    label: string;
-    p: ReturnType<typeof Bun.spawn>;
-};
+const log = (createLogger as any)((readEnv('LOG_LEVEL') as any) || 'info');
 
-const procs: Proc[] = [];
-
-async function run() {
-    const cmds: { label: string; cmd: string[] }[] = [
-        { label: 'api', cmd: ['bun', '--watch', 'src/api/index.ts'] },
-        { label: 'worker', cmd: ['bun', '--watch', 'src/worker/index.ts'] },
-        { label: 'asr', cmd: ['bun', '--watch', 'src/worker/asr.start.ts'] },
-        { label: 'dlq', cmd: ['bun', '--watch', 'src/queue/dlq-consumer.ts'] },
-    ];
-
-    for (const { label, cmd } of cmds) {
-        const child = Bun.spawn({
-            cmd,
-            stdout: 'inherit',
-            stderr: 'inherit',
-            stdin: 'inherit',
-        });
-        procs.push({ label, p: child });
-        console.log(`[dev-all] started ${label} (pid ${child.pid})`);
-    }
-
-    const shutdown = async (signal: string) => {
-        console.log(`\n[dev-all] received ${signal}, shutting down...`);
-        for (const { label, p } of procs) {
-            try {
-                console.log(
-                    `[dev-all] sending terminate to ${label} (pid ${p.pid})`
-                );
-                // Send default termination signal
-                p.kill();
-            } catch (err) {
-                console.error(`[dev-all] error signaling ${label}:`, err);
-            }
-        }
-        await Promise.allSettled(procs.map(({ p }) => p.exited));
-        process.exit(0);
-    };
-
-    process.on('SIGINT', () => shutdown('SIGINT'));
-    process.on('SIGTERM', () => shutdown('SIGTERM'));
-
-    // If any child exits, shut down the rest and exit non-zero.
-    await Promise.race(
-        procs.map(({ label, p }) =>
-            p.exited.then((code: number) => {
-                console.error(`[dev-all] ${label} exited with code ${code}`);
-                return { label, code } as const;
-            })
-        )
-    );
-    await shutdown('child-exit');
+// Env helpers with sensible defaults
+function int(key: string, def: number): number {
+    const v = Number(readEnv(key));
+    return Number.isFinite(v) && v > 0 ? Math.floor(v) : def;
 }
 
-run().catch((err) => {
-    console.error('[dev-all] fatal error:', err);
+function getConfig() {
+    const INTERVAL_SEC = int('REAPER_INTERVAL_SEC', 60);
+    const MAX_ATTEMPTS_DEFAULT = int(
+        'JOB_MAX_ATTEMPTS',
+        int('QUEUE_MAX_ATTEMPTS', 3)
+    );
+    const BACKOFF_BASE_MS = int(
+        'JOB_BACKOFF_MS_BASE',
+        int('QUEUE_RETRY_BACKOFF_MS_BASE', 30_000)
+    );
+    const BACKOFF_MAX_MS = int(
+        'JOB_BACKOFF_MS_MAX',
+        int('QUEUE_RETRY_BACKOFF_MS_MAX', 600_000)
+    );
+    return {
+        INTERVAL_SEC,
+        MAX_ATTEMPTS_DEFAULT,
+        BACKOFF_BASE_MS,
+        BACKOFF_MAX_MS,
+    } as const;
+}
+
+const DATABASE_URL = readEnv('DATABASE_URL');
+if (!DATABASE_URL) {
+    console.error('[reaper] Missing DATABASE_URL');
     process.exit(1);
-});
+}
+
+const pool = new Pool({ connectionString: DATABASE_URL });
+
+export type TableName = 'jobs' | 'asr_jobs';
+
+async function columnExists(
+    table: TableName,
+    column: string
+): Promise<boolean> {
+    const q = `SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name=$1 AND column_name=$2 LIMIT 1`;
+    const r = await pool.query(q, [table, column]);
+    const rc = (r as any)?.rowCount ?? 0;
+    return rc > 0;
+}
+
+async function tableCapabilities(table: TableName) {
+    const required = ['status', 'attempt_count', 'lease_expires_at'];
+    const optional = ['max_attempts', 'next_earliest_run_at', 'locked_by'];
+    const present: Record<string, boolean> = {} as any;
+    for (const c of [...required, ...optional])
+        present[c] = await columnExists(table, c);
+    const ok = required.every((c) => present[c]);
+    return { ok, present } as const;
+}
+
+function backoffExprSQL(): string {
+    // LEAST(max, base * POWER(2, attempt_count)) in milliseconds
+    return `LEAST($2::bigint, ($1::bigint * POWER(2, GREATEST(attempt_count,0))))`;
+}
+
+const metrics = new InMemoryMetrics();
+
+async function requeueExpired(
+    table: TableName,
+    useMaxAttemptsCol: boolean,
+    hasNextRun: boolean,
+    hasLockedBy: boolean,
+    cfg: {
+        BACKOFF_BASE_MS: number;
+        BACKOFF_MAX_MS: number;
+        MAX_ATTEMPTS_DEFAULT: number;
+    }
+) {
+    // Build UPDATE with dynamic pieces guarded by capability flags.
+    const nextRunSet = hasNextRun
+        ? `, next_earliest_run_at = NOW() + (${backoffExprSQL()}) * interval '1 millisecond'`
+        : '';
+    const clearLockedBy = hasLockedBy ? `, locked_by = NULL` : '';
+    const attemptsCond = useMaxAttemptsCol
+        ? `attempt_count < COALESCE(max_attempts, $3)`
+        : `attempt_count < $3`;
+    const nextRunWhere = hasNextRun
+        ? `AND (next_earliest_run_at IS NULL OR next_earliest_run_at <= NOW())`
+        : '';
+
+    const sql = `
+    UPDATE ${table}
+       SET status='queued'
+         ${clearLockedBy}
+         , lease_expires_at = NULL
+         ${nextRunSet}
+     WHERE status = 'processing'
+       AND lease_expires_at IS NOT NULL
+       AND lease_expires_at < NOW()
+       AND ${attemptsCond}
+       ${nextRunWhere}
+     RETURNING id, attempt_count`;
+
+    const res = await pool.query(sql, [
+        cfg.BACKOFF_BASE_MS,
+        cfg.BACKOFF_MAX_MS,
+        cfg.MAX_ATTEMPTS_DEFAULT,
+    ]);
+
+    // Insert job_events rows
+    for (const row of res.rows as Array<{
+        id: string;
+        attempt_count: number;
+    }>) {
+        const data = {
+            type: 'reaper:requeued',
+            table,
+            details: { reason: 'lease_expired' },
+            attempt_count: row.attempt_count,
+            at: new Date().toISOString(),
+        };
+        if (table === 'jobs') {
+            await pool.query(
+                `INSERT INTO job_events (job_id, type, data) VALUES ($1, $2, $3::jsonb)`,
+                [row.id, 'reaper:requeued', JSON.stringify(data)]
+            );
+        }
+    }
+    const count = res.rowCount ?? 0;
+    if (count > 0) metrics.inc('reaper.requeued_total', count, { table });
+    return count;
+}
+
+async function failExpired(
+    table: TableName,
+    useMaxAttemptsCol: boolean,
+    hasLockedBy: boolean,
+    cfg: { MAX_ATTEMPTS_DEFAULT: number }
+) {
+    const clearLockedBy = hasLockedBy ? `, locked_by = NULL` : '';
+    const attemptsCond = useMaxAttemptsCol
+        ? `attempt_count >= COALESCE(max_attempts, $1)`
+        : `attempt_count >= $1`;
+
+    const sql = `
+    UPDATE ${table}
+       SET status='failed'
+         , fail_code='timeout'
+         , fail_reason='lease_expired'
+         ${clearLockedBy}
+         , lease_expires_at=NULL
+     WHERE status='processing'
+       AND lease_expires_at IS NOT NULL
+       AND lease_expires_at < NOW()
+       AND ${attemptsCond}
+     RETURNING id`;
+
+    const res = await pool.query(sql, [cfg.MAX_ATTEMPTS_DEFAULT]);
+    for (const row of res.rows as Array<{ id: string }>) {
+        const data = {
+            type: 'reaper:failed(timeout)',
+            table,
+            details: { reason: 'lease_expired' },
+            at: new Date().toISOString(),
+        };
+        if (table === 'jobs') {
+            await pool.query(
+                `INSERT INTO job_events (job_id, type, data) VALUES ($1, $2, $3::jsonb)`,
+                [row.id, 'reaper:failed(timeout)', JSON.stringify(data)]
+            );
+        }
+    }
+    const count = res.rowCount ?? 0;
+    if (count > 0)
+        metrics.inc('reaper.failed_total', count, { table, code: 'timeout' });
+    return count;
+}
+
+export async function reap(table: TableName) {
+    const { MAX_ATTEMPTS_DEFAULT, BACKOFF_BASE_MS, BACKOFF_MAX_MS } =
+        getConfig();
+    const caps = await tableCapabilities(table);
+    if (!caps.ok) {
+        (log as any).warn?.(
+            `[reaper] skipping ${table}: missing columns`,
+            caps.present
+        );
+        return { requeued: 0, failed: 0 } as const;
+    }
+    const start = Date.now();
+    const requeued = await requeueExpired(
+        table,
+        !!caps.present['max_attempts'],
+        !!caps.present['next_earliest_run_at'],
+        !!caps.present['locked_by'],
+        { BACKOFF_BASE_MS, BACKOFF_MAX_MS, MAX_ATTEMPTS_DEFAULT }
+    );
+    const failed = await failExpired(
+        table,
+        !!caps.present['max_attempts'],
+        !!caps.present['locked_by'],
+        { MAX_ATTEMPTS_DEFAULT }
+    );
+    const dur = Date.now() - start;
+    metrics.observe('reaper.scan_duration_ms', dur, { table });
+    (log as any).info?.(
+        `[reaper] ${table}: requeued=${requeued} failed=${failed} in ${dur}ms`
+    );
+    return { requeued, failed } as const;
+}
+
+async function tick() {
+    try {
+        await reap('jobs');
+    } catch (e) {
+        (log as any).error?.('[reaper] error on jobs', { err: String(e) });
+    }
+    try {
+        await reap('asr_jobs');
+    } catch (e) {
+        (log as any).error?.('[reaper] error on asr_jobs', { err: String(e) });
+    }
+}
+
+if ((import.meta as any).main) {
+    const {
+        INTERVAL_SEC,
+        BACKOFF_BASE_MS,
+        BACKOFF_MAX_MS,
+        MAX_ATTEMPTS_DEFAULT,
+    } = getConfig();
+    (log as any).info?.(
+        `[reaper] starting. interval=${INTERVAL_SEC}s base=${BACKOFF_BASE_MS}ms max=${BACKOFF_MAX_MS}ms maxAttempts=${MAX_ATTEMPTS_DEFAULT}`
+    );
+    await tick();
+    setInterval(tick, INTERVAL_SEC * 1000);
+}
 ```
 
 ## File: src/asr/formatter.ts
@@ -1769,6 +1955,1550 @@ export { maybeGenerateOpenApi } from './openapi';
 }
 ```
 
+## File: src/data/drizzle/meta/0003_snapshot.json
+```json
+{
+  "id": "3ca134da-64c7-40ee-a855-2b0fdc84c4db",
+  "prevId": "f9103973-8623-4ab9-8417-35fc73e53814",
+  "version": "7",
+  "dialect": "postgresql",
+  "tables": {
+    "public.api_keys": {
+      "name": "api_keys",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "name": {
+          "name": "name",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "key_hash": {
+          "name": "key_hash",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "revoked": {
+          "name": "revoked",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true,
+          "default": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "last_used_at": {
+          "name": "last_used_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.asr_artifacts": {
+      "name": "asr_artifacts",
+      "schema": "",
+      "columns": {
+        "asr_job_id": {
+          "name": "asr_job_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "kind": {
+          "name": "kind",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "storage_key": {
+          "name": "storage_key",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "size_bytes": {
+          "name": "size_bytes",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "asr_artifacts_asr_job_id_asr_jobs_id_fk": {
+          "name": "asr_artifacts_asr_job_id_asr_jobs_id_fk",
+          "tableFrom": "asr_artifacts",
+          "tableTo": "asr_jobs",
+          "columnsFrom": [
+            "asr_job_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {
+        "asr_artifacts_asr_job_id_kind_pk": {
+          "name": "asr_artifacts_asr_job_id_kind_pk",
+          "columns": [
+            "asr_job_id",
+            "kind"
+          ]
+        }
+      },
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.asr_jobs": {
+      "name": "asr_jobs",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "clip_job_id": {
+          "name": "clip_job_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "source_type": {
+          "name": "source_type",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "source_key": {
+          "name": "source_key",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "media_hash": {
+          "name": "media_hash",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "model_version": {
+          "name": "model_version",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "language_hint": {
+          "name": "language_hint",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "detected_language": {
+          "name": "detected_language",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "duration_sec": {
+          "name": "duration_sec",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "status": {
+          "name": "status",
+          "type": "asr_job_status",
+          "typeSchema": "public",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'queued'"
+        },
+        "error_code": {
+          "name": "error_code",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "error_message": {
+          "name": "error_message",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "locked_by": {
+          "name": "locked_by",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "completed_at": {
+          "name": "completed_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "expires_at": {
+          "name": "expires_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "lease_expires_at": {
+          "name": "lease_expires_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "last_heartbeat_at": {
+          "name": "last_heartbeat_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "attempt_count": {
+          "name": "attempt_count",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "max_attempts": {
+          "name": "max_attempts",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 3
+        },
+        "fail_code": {
+          "name": "fail_code",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "fail_reason": {
+          "name": "fail_reason",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "stage": {
+          "name": "stage",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "next_earliest_run_at": {
+          "name": "next_earliest_run_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "expected_duration_ms": {
+          "name": "expected_duration_ms",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false
+        }
+      },
+      "indexes": {
+        "idx_asr_jobs_status_created_at": {
+          "name": "idx_asr_jobs_status_created_at",
+          "columns": [
+            {
+              "expression": "status",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "created_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_asr_jobs_expires_at": {
+          "name": "idx_asr_jobs_expires_at",
+          "columns": [
+            {
+              "expression": "expires_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_asr_jobs_status_lease": {
+          "name": "idx_asr_jobs_status_lease",
+          "columns": [
+            {
+              "expression": "status",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "lease_expires_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "asr_jobs_clip_job_id_jobs_id_fk": {
+          "name": "asr_jobs_clip_job_id_jobs_id_fk",
+          "tableFrom": "asr_jobs",
+          "tableTo": "jobs",
+          "columnsFrom": [
+            "clip_job_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.job_events": {
+      "name": "job_events",
+      "schema": "",
+      "columns": {
+        "job_id": {
+          "name": "job_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "ts": {
+          "name": "ts",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "type": {
+          "name": "type",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "data": {
+          "name": "data",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": false
+        }
+      },
+      "indexes": {
+        "idx_job_events_job_id_ts": {
+          "name": "idx_job_events_job_id_ts",
+          "columns": [
+            {
+              "expression": "job_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "ts",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "job_events_job_id_jobs_id_fk": {
+          "name": "job_events_job_id_jobs_id_fk",
+          "tableFrom": "job_events",
+          "tableTo": "jobs",
+          "columnsFrom": [
+            "job_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.jobs": {
+      "name": "jobs",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "status": {
+          "name": "status",
+          "type": "job_status",
+          "typeSchema": "public",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'queued'"
+        },
+        "progress": {
+          "name": "progress",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "source_type": {
+          "name": "source_type",
+          "type": "source_type",
+          "typeSchema": "public",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "source_key": {
+          "name": "source_key",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "source_url": {
+          "name": "source_url",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "start_sec": {
+          "name": "start_sec",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "end_sec": {
+          "name": "end_sec",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "with_subtitles": {
+          "name": "with_subtitles",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true,
+          "default": false
+        },
+        "burn_subtitles": {
+          "name": "burn_subtitles",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true,
+          "default": false
+        },
+        "subtitle_lang": {
+          "name": "subtitle_lang",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "result_video_key": {
+          "name": "result_video_key",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "result_video_burned_key": {
+          "name": "result_video_burned_key",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "result_srt_key": {
+          "name": "result_srt_key",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "error_code": {
+          "name": "error_code",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "error_message": {
+          "name": "error_message",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "locked_by": {
+          "name": "locked_by",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "expires_at": {
+          "name": "expires_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "lease_expires_at": {
+          "name": "lease_expires_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "last_heartbeat_at": {
+          "name": "last_heartbeat_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "attempt_count": {
+          "name": "attempt_count",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "max_attempts": {
+          "name": "max_attempts",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 3
+        },
+        "processing_started_at": {
+          "name": "processing_started_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "fail_code": {
+          "name": "fail_code",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "fail_reason": {
+          "name": "fail_reason",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "stage": {
+          "name": "stage",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "next_earliest_run_at": {
+          "name": "next_earliest_run_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "expected_duration_ms": {
+          "name": "expected_duration_ms",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false
+        }
+      },
+      "indexes": {
+        "idx_jobs_status_created_at": {
+          "name": "idx_jobs_status_created_at",
+          "columns": [
+            {
+              "expression": "status",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "created_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_jobs_expires_at": {
+          "name": "idx_jobs_expires_at",
+          "columns": [
+            {
+              "expression": "expires_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_jobs_status_last_hb": {
+          "name": "idx_jobs_status_last_hb",
+          "columns": [
+            {
+              "expression": "status",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "last_heartbeat_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_jobs_status_lease": {
+          "name": "idx_jobs_status_lease",
+          "columns": [
+            {
+              "expression": "status",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "lease_expires_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    }
+  },
+  "enums": {
+    "public.asr_job_status": {
+      "name": "asr_job_status",
+      "schema": "public",
+      "values": [
+        "queued",
+        "processing",
+        "done",
+        "failed"
+      ]
+    },
+    "public.job_status": {
+      "name": "job_status",
+      "schema": "public",
+      "values": [
+        "queued",
+        "processing",
+        "done",
+        "failed"
+      ]
+    },
+    "public.source_type": {
+      "name": "source_type",
+      "schema": "public",
+      "values": [
+        "upload",
+        "youtube"
+      ]
+    }
+  },
+  "schemas": {},
+  "sequences": {},
+  "roles": {},
+  "policies": {},
+  "views": {},
+  "_meta": {
+    "columns": {},
+    "schemas": {},
+    "tables": {}
+  }
+}
+```
+
+## File: src/data/drizzle/meta/0004_snapshot.json
+```json
+{
+  "id": "f30ef160-b192-48b6-91d3-2074d32aee95",
+  "prevId": "3ca134da-64c7-40ee-a855-2b0fdc84c4db",
+  "version": "7",
+  "dialect": "postgresql",
+  "tables": {
+    "public.api_keys": {
+      "name": "api_keys",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "name": {
+          "name": "name",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "key_hash": {
+          "name": "key_hash",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "revoked": {
+          "name": "revoked",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true,
+          "default": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "last_used_at": {
+          "name": "last_used_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.asr_artifacts": {
+      "name": "asr_artifacts",
+      "schema": "",
+      "columns": {
+        "asr_job_id": {
+          "name": "asr_job_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "kind": {
+          "name": "kind",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "storage_key": {
+          "name": "storage_key",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "size_bytes": {
+          "name": "size_bytes",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "asr_artifacts_asr_job_id_asr_jobs_id_fk": {
+          "name": "asr_artifacts_asr_job_id_asr_jobs_id_fk",
+          "tableFrom": "asr_artifacts",
+          "tableTo": "asr_jobs",
+          "columnsFrom": [
+            "asr_job_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {
+        "asr_artifacts_asr_job_id_kind_pk": {
+          "name": "asr_artifacts_asr_job_id_kind_pk",
+          "columns": [
+            "asr_job_id",
+            "kind"
+          ]
+        }
+      },
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.asr_jobs": {
+      "name": "asr_jobs",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "clip_job_id": {
+          "name": "clip_job_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "source_type": {
+          "name": "source_type",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "source_key": {
+          "name": "source_key",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "media_hash": {
+          "name": "media_hash",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "model_version": {
+          "name": "model_version",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "language_hint": {
+          "name": "language_hint",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "detected_language": {
+          "name": "detected_language",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "duration_sec": {
+          "name": "duration_sec",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "status": {
+          "name": "status",
+          "type": "asr_job_status",
+          "typeSchema": "public",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'queued'"
+        },
+        "error_code": {
+          "name": "error_code",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "error_message": {
+          "name": "error_message",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "locked_by": {
+          "name": "locked_by",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "completed_at": {
+          "name": "completed_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "expires_at": {
+          "name": "expires_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "lease_expires_at": {
+          "name": "lease_expires_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "last_heartbeat_at": {
+          "name": "last_heartbeat_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "attempt_count": {
+          "name": "attempt_count",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "max_attempts": {
+          "name": "max_attempts",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "default": 3
+        },
+        "fail_code": {
+          "name": "fail_code",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "fail_reason": {
+          "name": "fail_reason",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "stage": {
+          "name": "stage",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "next_earliest_run_at": {
+          "name": "next_earliest_run_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "expected_duration_ms": {
+          "name": "expected_duration_ms",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false
+        }
+      },
+      "indexes": {
+        "idx_asr_jobs_status_created_at": {
+          "name": "idx_asr_jobs_status_created_at",
+          "columns": [
+            {
+              "expression": "status",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "created_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_asr_jobs_expires_at": {
+          "name": "idx_asr_jobs_expires_at",
+          "columns": [
+            {
+              "expression": "expires_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_asr_jobs_status_lease": {
+          "name": "idx_asr_jobs_status_lease",
+          "columns": [
+            {
+              "expression": "status",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "lease_expires_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "asr_jobs_clip_job_id_jobs_id_fk": {
+          "name": "asr_jobs_clip_job_id_jobs_id_fk",
+          "tableFrom": "asr_jobs",
+          "tableTo": "jobs",
+          "columnsFrom": [
+            "clip_job_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.job_events": {
+      "name": "job_events",
+      "schema": "",
+      "columns": {
+        "job_id": {
+          "name": "job_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "ts": {
+          "name": "ts",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "type": {
+          "name": "type",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "data": {
+          "name": "data",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": false
+        }
+      },
+      "indexes": {
+        "idx_job_events_job_id_ts": {
+          "name": "idx_job_events_job_id_ts",
+          "columns": [
+            {
+              "expression": "job_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "ts",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "job_events_job_id_jobs_id_fk": {
+          "name": "job_events_job_id_jobs_id_fk",
+          "tableFrom": "job_events",
+          "tableTo": "jobs",
+          "columnsFrom": [
+            "job_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.jobs": {
+      "name": "jobs",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "status": {
+          "name": "status",
+          "type": "job_status",
+          "typeSchema": "public",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'queued'"
+        },
+        "progress": {
+          "name": "progress",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "source_type": {
+          "name": "source_type",
+          "type": "source_type",
+          "typeSchema": "public",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "source_key": {
+          "name": "source_key",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "source_url": {
+          "name": "source_url",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "start_sec": {
+          "name": "start_sec",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "end_sec": {
+          "name": "end_sec",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "with_subtitles": {
+          "name": "with_subtitles",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true,
+          "default": false
+        },
+        "burn_subtitles": {
+          "name": "burn_subtitles",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true,
+          "default": false
+        },
+        "subtitle_lang": {
+          "name": "subtitle_lang",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "result_video_key": {
+          "name": "result_video_key",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "result_video_burned_key": {
+          "name": "result_video_burned_key",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "result_srt_key": {
+          "name": "result_srt_key",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "error_code": {
+          "name": "error_code",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "error_message": {
+          "name": "error_message",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "locked_by": {
+          "name": "locked_by",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "expires_at": {
+          "name": "expires_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "lease_expires_at": {
+          "name": "lease_expires_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "last_heartbeat_at": {
+          "name": "last_heartbeat_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "attempt_count": {
+          "name": "attempt_count",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "max_attempts": {
+          "name": "max_attempts",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "default": 3
+        },
+        "processing_started_at": {
+          "name": "processing_started_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "fail_code": {
+          "name": "fail_code",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "fail_reason": {
+          "name": "fail_reason",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "stage": {
+          "name": "stage",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "next_earliest_run_at": {
+          "name": "next_earliest_run_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "expected_duration_ms": {
+          "name": "expected_duration_ms",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false
+        }
+      },
+      "indexes": {
+        "idx_jobs_status_created_at": {
+          "name": "idx_jobs_status_created_at",
+          "columns": [
+            {
+              "expression": "status",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "created_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_jobs_expires_at": {
+          "name": "idx_jobs_expires_at",
+          "columns": [
+            {
+              "expression": "expires_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_jobs_status_last_hb": {
+          "name": "idx_jobs_status_last_hb",
+          "columns": [
+            {
+              "expression": "status",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "last_heartbeat_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_jobs_status_lease": {
+          "name": "idx_jobs_status_lease",
+          "columns": [
+            {
+              "expression": "status",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "lease_expires_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    }
+  },
+  "enums": {
+    "public.asr_job_status": {
+      "name": "asr_job_status",
+      "schema": "public",
+      "values": [
+        "queued",
+        "processing",
+        "done",
+        "failed"
+      ]
+    },
+    "public.job_status": {
+      "name": "job_status",
+      "schema": "public",
+      "values": [
+        "queued",
+        "processing",
+        "done",
+        "failed"
+      ]
+    },
+    "public.source_type": {
+      "name": "source_type",
+      "schema": "public",
+      "values": [
+        "upload",
+        "youtube"
+      ]
+    }
+  },
+  "schemas": {},
+  "sequences": {},
+  "roles": {},
+  "policies": {},
+  "views": {},
+  "_meta": {
+    "columns": {},
+    "schemas": {},
+    "tables": {}
+  }
+}
+```
+
 ## File: src/data/drizzle/0002_add_last_heartbeat.sql
 ```sql
 -- Add last_heartbeat_at column to jobs
@@ -1791,10 +3521,40 @@ ALTER TABLE "jobs" ADD COLUMN IF NOT EXISTS "processing_started_at" timestamp wi
 CREATE INDEX IF NOT EXISTS "idx_jobs_status_last_hb" ON "jobs" USING btree ("status","last_heartbeat_at");
 ```
 
+## File: src/data/drizzle/0003_noisy_lily_hollister.sql
+```sql
+ALTER TABLE "asr_jobs" ADD COLUMN "locked_by" text;--> statement-breakpoint
+ALTER TABLE "asr_jobs" ADD COLUMN "lease_expires_at" timestamp with time zone;--> statement-breakpoint
+ALTER TABLE "asr_jobs" ADD COLUMN "last_heartbeat_at" timestamp with time zone;--> statement-breakpoint
+ALTER TABLE "asr_jobs" ADD COLUMN "attempt_count" integer DEFAULT 0 NOT NULL;--> statement-breakpoint
+ALTER TABLE "asr_jobs" ADD COLUMN "max_attempts" integer DEFAULT 3 NOT NULL;--> statement-breakpoint
+ALTER TABLE "asr_jobs" ADD COLUMN "fail_code" text;--> statement-breakpoint
+ALTER TABLE "asr_jobs" ADD COLUMN "fail_reason" text;--> statement-breakpoint
+ALTER TABLE "asr_jobs" ADD COLUMN "stage" text;--> statement-breakpoint
+ALTER TABLE "asr_jobs" ADD COLUMN "next_earliest_run_at" timestamp with time zone;--> statement-breakpoint
+ALTER TABLE "asr_jobs" ADD COLUMN "expected_duration_ms" integer;--> statement-breakpoint
+ALTER TABLE "jobs" ADD COLUMN "locked_by" text;--> statement-breakpoint
+ALTER TABLE "jobs" ADD COLUMN "lease_expires_at" timestamp with time zone;--> statement-breakpoint
+ALTER TABLE "jobs" ADD COLUMN "max_attempts" integer DEFAULT 3 NOT NULL;--> statement-breakpoint
+ALTER TABLE "jobs" ADD COLUMN "fail_code" text;--> statement-breakpoint
+ALTER TABLE "jobs" ADD COLUMN "fail_reason" text;--> statement-breakpoint
+ALTER TABLE "jobs" ADD COLUMN "stage" text;--> statement-breakpoint
+ALTER TABLE "jobs" ADD COLUMN "next_earliest_run_at" timestamp with time zone;--> statement-breakpoint
+ALTER TABLE "jobs" ADD COLUMN "expected_duration_ms" integer;--> statement-breakpoint
+CREATE INDEX "idx_asr_jobs_status_lease" ON "asr_jobs" USING btree ("status","lease_expires_at");--> statement-breakpoint
+CREATE INDEX "idx_jobs_status_lease" ON "jobs" USING btree ("status","lease_expires_at");
+```
+
 ## File: src/data/drizzle/0004_add_burned_video_key.sql
 ```sql
 -- Add optional burned video key column to jobs
 ALTER TABLE "jobs" ADD COLUMN IF NOT EXISTS "result_video_burned_key" text;
+```
+
+## File: src/data/drizzle/0004_shiny_ma_gnuci.sql
+```sql
+ALTER TABLE "asr_jobs" ALTER COLUMN "max_attempts" DROP NOT NULL;--> statement-breakpoint
+ALTER TABLE "jobs" ALTER COLUMN "max_attempts" DROP NOT NULL;
 ```
 
 ## File: src/data/scripts/admin-jobs.ts
@@ -2858,57 +4618,6 @@ export async function withStage<T>(
 export { classifyError };
 ```
 
-## File: .env.example
-```
-## Example .env for yt-clipper
-# Copy to .env and fill in required values. Never commit real secrets.
-
-SIGNED_URL_TTL_SEC=600
-RETENTION_HOURS=72
-MAX_CLIP_SECONDS=120
-LOG_LEVEL=info
-ADMIN_ENABLED=false
-
-# --- Database / Supabase ---
-# Fill these with your project values (do not commit secrets publicly)
-# DATABASE_URL format (example): postgres://user:password@host:5432/db?sslmode=require
-DATABASE_URL=postgresql://<user>:<password>@<host>:6543/postgres?sslmode=require
-SUPABASE_URL=https://<your_project>.supabase.co
-SUPABASE_SERVICE_ROLE_KEY=<your_supabase_service_role_key>
-SUPABASE_SOURCES_BUCKET=sources
-SUPABASE_RESULTS_BUCKET=results
-SUPABASE_STORAGE_BUCKET=sources
-
-# --- Queue (pg-boss) ---
-QUEUE_PROVIDER=pgboss
-PG_BOSS_SCHEMA=pgboss
-QUEUE_NAME=clips
-QUEUE_VISIBILITY_SEC=90
-QUEUE_MAX_ATTEMPTS=3
-QUEUE_RETRY_BACKOFF_MS_BASE=1000
-QUEUE_RETRY_BACKOFF_MS_MAX=60000
-QUEUE_CONCURRENCY=4
-GROQ_API_KEY=
-GROQ_MODEL=whisper-large-v3-turbo
-NODE_ENV=development
-DB_PASSWORD=
-
-# --- Media IO / Resolver ---
-# Local scratch directory for resolved sources (NVMe if available)
-SCRATCH_DIR=/tmp/ytc
-# Enable YouTube fetching via yt-dlp (false by default)
-ENABLE_YTDLP=false
-# Max input file size in megabytes (enforced by ffprobe / yt-dlp)
-MAX_INPUT_MB=1024
-# Max input duration in seconds (ffprobe validation)
-MAX_CLIP_INPUT_DURATION_SEC=7200
-# Optional comma-separated domain allowlist for external fetches
-ALLOWLIST_HOSTS=
-
-# Keep API clip limit for request validation (separate from input caps)
-CLIP_MAX_DURATION_SEC=120
-```
-
 ## File: .gitignore
 ```
 # dependencies (bun install)
@@ -3013,6 +4722,79 @@ console.log("Hello via Bun!");
     "noPropertyAccessFromIndexSignature": false
   }
 }
+```
+
+## File: scripts/dev-all.ts
+```typescript
+#!/usr/bin/env bun
+/**
+ * Dev orchestrator: runs API, worker, ASR worker, and DLQ consumer in watch mode.
+ * Uses Bun.spawn to manage child processes; forwards signals for clean shutdown.
+ */
+
+type Proc = {
+    label: string;
+    p: ReturnType<typeof Bun.spawn>;
+};
+
+const procs: Proc[] = [];
+
+async function run() {
+    const cmds: { label: string; cmd: string[] }[] = [
+        { label: 'api', cmd: ['bun', '--watch', 'src/api/index.ts'] },
+        { label: 'worker', cmd: ['bun', '--watch', 'src/worker/index.ts'] },
+        { label: 'asr', cmd: ['bun', '--watch', 'src/worker/asr.start.ts'] },
+        { label: 'dlq', cmd: ['bun', '--watch', 'src/queue/dlq-consumer.ts'] },
+        { label: 'reaper', cmd: ['bun', '--watch', 'scripts/reaper.ts'] },
+    ];
+
+    for (const { label, cmd } of cmds) {
+        const child = Bun.spawn({
+            cmd,
+            stdout: 'inherit',
+            stderr: 'inherit',
+            stdin: 'inherit',
+        });
+        procs.push({ label, p: child });
+        console.log(`[dev-all] started ${label} (pid ${child.pid})`);
+    }
+
+    const shutdown = async (signal: string) => {
+        console.log(`\n[dev-all] received ${signal}, shutting down...`);
+        for (const { label, p } of procs) {
+            try {
+                console.log(
+                    `[dev-all] sending terminate to ${label} (pid ${p.pid})`
+                );
+                // Send default termination signal
+                p.kill();
+            } catch (err) {
+                console.error(`[dev-all] error signaling ${label}:`, err);
+            }
+        }
+        await Promise.allSettled(procs.map(({ p }) => p.exited));
+        process.exit(0);
+    };
+
+    process.on('SIGINT', () => shutdown('SIGINT'));
+    process.on('SIGTERM', () => shutdown('SIGTERM'));
+
+    // If any child exits, shut down the rest and exit non-zero.
+    await Promise.race(
+        procs.map(({ label, p }) =>
+            p.exited.then((code: number) => {
+                console.error(`[dev-all] ${label} exited with code ${code}`);
+                return { label, code } as const;
+            })
+        )
+    );
+    await shutdown('child-exit');
+}
+
+run().catch((err) => {
+    console.error('[dev-all] fatal error:', err);
+    process.exit(1);
+});
 ```
 
 ## File: src/common/env.ts
@@ -3845,6 +5627,61 @@ await startAsrWorker({ queue });
 log.info('ASR worker started');
 ```
 
+## File: .env.example
+```
+## Example .env for yt-clipper
+# Copy to .env and fill in required values. Never commit real secrets.
+
+SIGNED_URL_TTL_SEC=600
+RETENTION_HOURS=72
+MAX_CLIP_SECONDS=120
+LOG_LEVEL=info
+ADMIN_ENABLED=false
+
+# --- Database / Supabase ---
+# Fill these with your project values (do not commit secrets publicly)
+# DATABASE_URL format (example): postgres://user:password@host:5432/db?sslmode=require
+DATABASE_URL=postgresql://<user>:<password>@<host>:6543/postgres?sslmode=require
+SUPABASE_URL=https://<your_project>.supabase.co
+SUPABASE_SERVICE_ROLE_KEY=<your_supabase_service_role_key>
+SUPABASE_SOURCES_BUCKET=sources
+SUPABASE_RESULTS_BUCKET=results
+SUPABASE_STORAGE_BUCKET=sources
+
+# --- Queue (pg-boss) ---
+QUEUE_PROVIDER=pgboss
+PG_BOSS_SCHEMA=pgboss
+QUEUE_NAME=clips
+QUEUE_VISIBILITY_SEC=90
+QUEUE_MAX_ATTEMPTS=3
+QUEUE_RETRY_BACKOFF_MS_BASE=1000
+QUEUE_RETRY_BACKOFF_MS_MAX=60000
+QUEUE_CONCURRENCY=4
+GROQ_API_KEY=
+GROQ_MODEL=whisper-large-v3-turbo
+NODE_ENV=development
+DB_PASSWORD=
+
+# --- Media IO / Resolver ---
+# Local scratch directory for resolved sources (NVMe if available)
+SCRATCH_DIR=/tmp/ytc
+# Enable YouTube fetching via yt-dlp (false by default)
+ENABLE_YTDLP=false
+# Max input file size in megabytes (enforced by ffprobe / yt-dlp)
+MAX_INPUT_MB=1024
+# Max input duration in seconds (ffprobe validation)
+MAX_CLIP_INPUT_DURATION_SEC=7200
+# Optional comma-separated domain allowlist for external fetches
+ALLOWLIST_HOSTS=
+
+# Keep API clip limit for request validation (separate from input caps)
+CLIP_MAX_DURATION_SEC=120
+
+# Rate limits
+RATE_LIMIT_WINDOW_SEC=60
+RATE_LIMIT_MAX=100
+```
+
 ## File: scripts/submit-and-poll.ts
 ```typescript
 #!/usr/bin/env bun
@@ -4250,37 +6087,6 @@ export const JobRecord = z.object({
     createdAt: z.string(),
     updatedAt: z.string(),
 });
-```
-
-## File: src/data/drizzle/meta/_journal.json
-```json
-{
-  "version": "7",
-  "dialect": "postgresql",
-  "entries": [
-    {
-      "idx": 0,
-      "version": "7",
-      "when": 1754887720633,
-      "tag": "0000_tense_yellow_claw",
-      "breakpoints": true
-    },
-    {
-      "idx": 1,
-      "version": "7",
-      "when": 1754966400000,
-      "tag": "0001_asr_jobs",
-      "breakpoints": true
-    },
-    {
-      "idx": 2,
-      "version": "7",
-      "when": 1755214150964,
-      "tag": "0002_happy_nomad",
-      "breakpoints": true
-    }
-  ]
-}
 ```
 
 ## File: src/data/media-io-upload.ts
@@ -4911,6 +6717,51 @@ export function normalizeRoute(path: string) {
             })
             .join('/') || '/'
     );
+}
+```
+
+## File: src/data/drizzle/meta/_journal.json
+```json
+{
+  "version": "7",
+  "dialect": "postgresql",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "7",
+      "when": 1754887720633,
+      "tag": "0000_tense_yellow_claw",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1754966400000,
+      "tag": "0001_asr_jobs",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1755214150964,
+      "tag": "0002_happy_nomad",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1755310739049,
+      "tag": "0003_noisy_lily_hollister",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1755311630705,
+      "tag": "0004_shiny_ma_gnuci",
+      "breakpoints": true
+    }
+  ]
 }
 ```
 
@@ -5605,162 +7456,6 @@ export default defineConfig({
 });
 ```
 
-## File: src/data/db/schema.ts
-```typescript
-import {
-    pgEnum,
-    pgTable,
-    text,
-    timestamp,
-    uuid,
-    integer,
-    boolean,
-    jsonb,
-    index,
-    primaryKey,
-} from 'drizzle-orm/pg-core';
-
-// Enums
-export const jobStatus = pgEnum('job_status', [
-    'queued',
-    'processing',
-    'done',
-    'failed',
-]);
-export const sourceType = pgEnum('source_type', ['upload', 'youtube']);
-export const asrJobStatus = pgEnum('asr_job_status', [
-    'queued',
-    'processing',
-    'done',
-    'failed',
-]);
-
-// jobs table
-export const jobs = pgTable(
-    'jobs',
-    {
-        id: uuid('id').primaryKey(),
-        status: jobStatus('status').notNull().default('queued'),
-        progress: integer('progress').notNull().default(0),
-        sourceType: sourceType('source_type').notNull(),
-        sourceKey: text('source_key'),
-        sourceUrl: text('source_url'),
-        startSec: integer('start_sec').notNull(),
-        endSec: integer('end_sec').notNull(),
-        withSubtitles: boolean('with_subtitles').notNull().default(false),
-        burnSubtitles: boolean('burn_subtitles').notNull().default(false),
-        subtitleLang: text('subtitle_lang'),
-        resultVideoKey: text('result_video_key'),
-        resultVideoBurnedKey: text('result_video_burned_key'),
-        resultSrtKey: text('result_srt_key'),
-        errorCode: text('error_code'),
-        errorMessage: text('error_message'),
-        createdAt: timestamp('created_at', { withTimezone: true })
-            .notNull()
-            .defaultNow(),
-        updatedAt: timestamp('updated_at', { withTimezone: true })
-            .notNull()
-            .defaultNow(),
-        expiresAt: timestamp('expires_at', { withTimezone: true }),
-        lastHeartbeatAt: timestamp('last_heartbeat_at', { withTimezone: true }),
-        attemptCount: integer('attempt_count').notNull().default(0),
-        processingStartedAt: timestamp('processing_started_at', {
-            withTimezone: true,
-        }),
-    },
-    (t) => [
-        index('idx_jobs_status_created_at').on(t.status, t.createdAt),
-        index('idx_jobs_expires_at').on(t.expiresAt),
-        index('idx_jobs_status_last_hb').on(t.status, t.lastHeartbeatAt),
-    ]
-);
-
-// job_events table
-export const jobEvents = pgTable(
-    'job_events',
-    {
-        jobId: uuid('job_id')
-            .notNull()
-            .references(() => jobs.id, { onDelete: 'cascade' }),
-        ts: timestamp('ts', { withTimezone: true }).notNull().defaultNow(),
-        type: text('type').notNull(),
-        data: jsonb('data'),
-    },
-    (t) => [index('idx_job_events_job_id_ts').on(t.jobId, t.ts)]
-);
-
-// api_keys table (optional)
-export const apiKeys = pgTable('api_keys', {
-    id: uuid('id').primaryKey(),
-    name: text('name').notNull(),
-    keyHash: text('key_hash').notNull(),
-    revoked: boolean('revoked').notNull().default(false),
-    createdAt: timestamp('created_at', { withTimezone: true })
-        .notNull()
-        .defaultNow(),
-    lastUsedAt: timestamp('last_used_at', { withTimezone: true }),
-});
-
-// ASR tables
-export const asrJobs = pgTable(
-    'asr_jobs',
-    {
-        id: uuid('id').primaryKey(),
-        clipJobId: uuid('clip_job_id').references(() => jobs.id),
-        sourceType: text('source_type').notNull(), // upload | youtube | internal
-        sourceKey: text('source_key'),
-        mediaHash: text('media_hash').notNull(),
-        modelVersion: text('model_version').notNull(),
-        languageHint: text('language_hint'),
-        detectedLanguage: text('detected_language'),
-        durationSec: integer('duration_sec'),
-        status: asrJobStatus('status').notNull().default('queued'),
-        errorCode: text('error_code'),
-        errorMessage: text('error_message'),
-        createdAt: timestamp('created_at', { withTimezone: true })
-            .notNull()
-            .defaultNow(),
-        updatedAt: timestamp('updated_at', { withTimezone: true })
-            .notNull()
-            .defaultNow(),
-        completedAt: timestamp('completed_at', { withTimezone: true }),
-        expiresAt: timestamp('expires_at', { withTimezone: true }),
-    },
-    (t) => [
-        index('idx_asr_jobs_status_created_at').on(t.status, t.createdAt),
-        index('idx_asr_jobs_expires_at').on(t.expiresAt),
-        // Unique partial index handled via raw SQL migration (media_hash, model_version) where status='done'
-    ]
-);
-
-export const asrArtifacts = pgTable(
-    'asr_artifacts',
-    {
-        asrJobId: uuid('asr_job_id')
-            .notNull()
-            .references(() => asrJobs.id, { onDelete: 'cascade' }),
-        kind: text('kind').notNull(), // srt | text | json
-        storageKey: text('storage_key').notNull(),
-        sizeBytes: integer('size_bytes'),
-        createdAt: timestamp('created_at', { withTimezone: true })
-            .notNull()
-            .defaultNow(),
-    },
-    (t) => [primaryKey({ columns: [t.asrJobId, t.kind] })]
-);
-
-export type Job = typeof jobs.$inferSelect;
-export type NewJob = typeof jobs.$inferInsert;
-export type JobEvent = typeof jobEvents.$inferSelect;
-export type NewJobEvent = typeof jobEvents.$inferInsert;
-export type ApiKey = typeof apiKeys.$inferSelect;
-export type NewApiKey = typeof apiKeys.$inferInsert;
-export type AsrJob = typeof asrJobs.$inferSelect;
-export type NewAsrJob = typeof asrJobs.$inferInsert;
-export type AsrArtifact = typeof asrArtifacts.$inferSelect;
-export type NewAsrArtifact = typeof asrArtifacts.$inferInsert;
-```
-
 ## File: src/data/media-io-youtube.ts
 ```typescript
 // Clean YouTube resolver (yt-dlp) with SSRF protections, binary fallback & debug logging
@@ -6062,6 +7757,188 @@ export async function resolveYouTubeSource(
     });
     return { localPath, cleanup, meta };
 }
+```
+
+## File: src/data/db/schema.ts
+```typescript
+import {
+    pgEnum,
+    pgTable,
+    text,
+    timestamp,
+    uuid,
+    integer,
+    boolean,
+    jsonb,
+    index,
+    primaryKey,
+} from 'drizzle-orm/pg-core';
+
+// Enums
+export const jobStatus = pgEnum('job_status', [
+    'queued',
+    'processing',
+    'done',
+    'failed',
+]);
+export const sourceType = pgEnum('source_type', ['upload', 'youtube']);
+export const asrJobStatus = pgEnum('asr_job_status', [
+    'queued',
+    'processing',
+    'done',
+    'failed',
+]);
+
+// jobs table
+export const jobs = pgTable(
+    'jobs',
+    {
+        id: uuid('id').primaryKey(),
+        status: jobStatus('status').notNull().default('queued'),
+        progress: integer('progress').notNull().default(0),
+        sourceType: sourceType('source_type').notNull(),
+        sourceKey: text('source_key'),
+        sourceUrl: text('source_url'),
+        startSec: integer('start_sec').notNull(),
+        endSec: integer('end_sec').notNull(),
+        withSubtitles: boolean('with_subtitles').notNull().default(false),
+        burnSubtitles: boolean('burn_subtitles').notNull().default(false),
+        subtitleLang: text('subtitle_lang'),
+        resultVideoKey: text('result_video_key'),
+        resultVideoBurnedKey: text('result_video_burned_key'),
+        resultSrtKey: text('result_srt_key'),
+        errorCode: text('error_code'),
+        errorMessage: text('error_message'),
+        // Reaper/lease fields
+        lockedBy: text('locked_by'),
+        createdAt: timestamp('created_at', { withTimezone: true })
+            .notNull()
+            .defaultNow(),
+        updatedAt: timestamp('updated_at', { withTimezone: true })
+            .notNull()
+            .defaultNow(),
+        expiresAt: timestamp('expires_at', { withTimezone: true }),
+        leaseExpiresAt: timestamp('lease_expires_at', { withTimezone: true }),
+        lastHeartbeatAt: timestamp('last_heartbeat_at', { withTimezone: true }),
+        attemptCount: integer('attempt_count').notNull().default(0),
+        maxAttempts: integer('max_attempts').default(3),
+        processingStartedAt: timestamp('processing_started_at', {
+            withTimezone: true,
+        }),
+        failCode: text('fail_code'),
+        failReason: text('fail_reason'),
+        stage: text('stage'),
+        nextEarliestRunAt: timestamp('next_earliest_run_at', {
+            withTimezone: true,
+        }),
+        expectedDurationMs: integer('expected_duration_ms'),
+    },
+    (t) => [
+        index('idx_jobs_status_created_at').on(t.status, t.createdAt),
+        index('idx_jobs_expires_at').on(t.expiresAt),
+        index('idx_jobs_status_last_hb').on(t.status, t.lastHeartbeatAt),
+        index('idx_jobs_status_lease').on(t.status, t.leaseExpiresAt),
+    ]
+);
+
+// job_events table
+export const jobEvents = pgTable(
+    'job_events',
+    {
+        jobId: uuid('job_id')
+            .notNull()
+            .references(() => jobs.id, { onDelete: 'cascade' }),
+        ts: timestamp('ts', { withTimezone: true }).notNull().defaultNow(),
+        type: text('type').notNull(),
+        data: jsonb('data'),
+    },
+    (t) => [index('idx_job_events_job_id_ts').on(t.jobId, t.ts)]
+);
+
+// api_keys table (optional)
+export const apiKeys = pgTable('api_keys', {
+    id: uuid('id').primaryKey(),
+    name: text('name').notNull(),
+    keyHash: text('key_hash').notNull(),
+    revoked: boolean('revoked').notNull().default(false),
+    createdAt: timestamp('created_at', { withTimezone: true })
+        .notNull()
+        .defaultNow(),
+    lastUsedAt: timestamp('last_used_at', { withTimezone: true }),
+});
+
+// ASR tables
+export const asrJobs = pgTable(
+    'asr_jobs',
+    {
+        id: uuid('id').primaryKey(),
+        clipJobId: uuid('clip_job_id').references(() => jobs.id),
+        sourceType: text('source_type').notNull(), // upload | youtube | internal
+        sourceKey: text('source_key'),
+        mediaHash: text('media_hash').notNull(),
+        modelVersion: text('model_version').notNull(),
+        languageHint: text('language_hint'),
+        detectedLanguage: text('detected_language'),
+        durationSec: integer('duration_sec'),
+        status: asrJobStatus('status').notNull().default('queued'),
+        errorCode: text('error_code'),
+        errorMessage: text('error_message'),
+        // Reaper/lease fields (mirrored for ASR attempts and heartbeats)
+        lockedBy: text('locked_by'),
+        createdAt: timestamp('created_at', { withTimezone: true })
+            .notNull()
+            .defaultNow(),
+        updatedAt: timestamp('updated_at', { withTimezone: true })
+            .notNull()
+            .defaultNow(),
+        completedAt: timestamp('completed_at', { withTimezone: true }),
+        expiresAt: timestamp('expires_at', { withTimezone: true }),
+        leaseExpiresAt: timestamp('lease_expires_at', { withTimezone: true }),
+        lastHeartbeatAt: timestamp('last_heartbeat_at', { withTimezone: true }),
+        attemptCount: integer('attempt_count').notNull().default(0),
+        maxAttempts: integer('max_attempts').default(3),
+        failCode: text('fail_code'),
+        failReason: text('fail_reason'),
+        stage: text('stage'),
+        nextEarliestRunAt: timestamp('next_earliest_run_at', {
+            withTimezone: true,
+        }),
+        expectedDurationMs: integer('expected_duration_ms'),
+    },
+    (t) => [
+        index('idx_asr_jobs_status_created_at').on(t.status, t.createdAt),
+        index('idx_asr_jobs_expires_at').on(t.expiresAt),
+        index('idx_asr_jobs_status_lease').on(t.status, t.leaseExpiresAt),
+        // Unique partial index handled via raw SQL migration (media_hash, model_version) where status='done'
+    ]
+);
+
+export const asrArtifacts = pgTable(
+    'asr_artifacts',
+    {
+        asrJobId: uuid('asr_job_id')
+            .notNull()
+            .references(() => asrJobs.id, { onDelete: 'cascade' }),
+        kind: text('kind').notNull(), // srt | text | json
+        storageKey: text('storage_key').notNull(),
+        sizeBytes: integer('size_bytes'),
+        createdAt: timestamp('created_at', { withTimezone: true })
+            .notNull()
+            .defaultNow(),
+    },
+    (t) => [primaryKey({ columns: [t.asrJobId, t.kind] })]
+);
+
+export type Job = typeof jobs.$inferSelect;
+export type NewJob = typeof jobs.$inferInsert;
+export type JobEvent = typeof jobEvents.$inferSelect;
+export type NewJobEvent = typeof jobEvents.$inferInsert;
+export type ApiKey = typeof apiKeys.$inferSelect;
+export type NewApiKey = typeof apiKeys.$inferInsert;
+export type AsrJob = typeof asrJobs.$inferSelect;
+export type NewAsrJob = typeof asrJobs.$inferInsert;
+export type AsrArtifact = typeof asrArtifacts.$inferSelect;
+export type NewAsrArtifact = typeof asrArtifacts.$inferInsert;
 ```
 
 ## File: src/data/repo.ts
@@ -6526,53 +8403,6 @@ export class BunClipper implements Clipper {
         // Both failed
         const msg = `ffmpeg failed (copy code=${copyResult.attempt.code}, reencode code=${reResult.attempt.code})`;
         throw new ServiceError('BAD_REQUEST', msg); // using existing code enum; adjust if more codes added later
-    }
-}
-```
-
-## File: package.json
-```json
-{
-    "name": "clipper",
-    "module": "index.ts",
-    "type": "module",
-    "private": true,
-    "scripts": {
-        "test": "bunx vitest run",
-        "db:generate": "bunx drizzle-kit generate --config=drizzle.config.ts",
-        "db:migrate": "bunx drizzle-kit migrate --config=drizzle.config.ts",
-        "db:push": "bunx drizzle-kit push --config=drizzle.config.ts",
-        "dev": "bun --watch src/api/index.ts",
-        "dev:worker": "bun --watch src/worker/index.ts",
-        "dev:asr": "bun --watch src/worker/asr.start.ts",
-        "dev:dlq": "bun --watch src/queue/dlq-consumer.ts",
-        "dev:all": "bun scripts/dev-all.ts",
-        "start:api": "bun src/api/index.ts",
-        "start:worker": "bun src/worker/index.ts",
-        "start:asr": "bun src/worker/asr.start.ts",
-        "start:dlq": "bun src/queue/dlq-consumer.ts",
-        "test:vitest": "bunx vitest run --exclude \"**/*.bun.test.ts\"",
-        "test:bun": "bun test ./src/**/*.bun.test.ts",
-        "test:all": "bun run test:vitest && bun run test:bun"
-    },
-    "devDependencies": {
-        "@types/bun": "latest"
-    },
-    "peerDependencies": {
-        "typescript": "^5"
-    },
-    "dependencies": {
-        "@elysiajs/cors": "^1.3.3",
-        "@supabase/supabase-js": "^2.54.0",
-        "@types/pg": "^8.15.5",
-        "dotenv": "^17.2.1",
-        "drizzle-kit": "^0.31.4",
-        "drizzle-orm": "^0.44.4",
-        "elysia": "^1.3.8",
-        "pg": "^8.16.3",
-        "pg-boss": "^10.3.2",
-        "zod": "^4.0.17",
-        "zod-to-openapi": "^0.2.1"
     }
 }
 ```
@@ -7128,6 +8958,54 @@ export const __test = {
     escapeForSubtitlesFilter,
     burnInSubtitles,
 };
+```
+
+## File: package.json
+```json
+{
+    "name": "clipper",
+    "module": "index.ts",
+    "type": "module",
+    "private": true,
+    "scripts": {
+        "test": "bunx vitest run",
+        "db:generate": "bunx drizzle-kit generate --config=drizzle.config.ts",
+        "db:migrate": "bunx drizzle-kit migrate --config=drizzle.config.ts",
+        "db:push": "bunx drizzle-kit push --config=drizzle.config.ts",
+        "dev": "bun --watch src/api/index.ts",
+        "dev:worker": "bun --watch src/worker/index.ts",
+        "dev:asr": "bun --watch src/worker/asr.start.ts",
+        "dev:dlq": "bun --watch src/queue/dlq-consumer.ts",
+        "dev:all": "bun scripts/dev-all.ts",
+        "start:reaper": "bun scripts/reaper.ts",
+        "start:api": "bun src/api/index.ts",
+        "start:worker": "bun src/worker/index.ts",
+        "start:asr": "bun src/worker/asr.start.ts",
+        "start:dlq": "bun src/queue/dlq-consumer.ts",
+        "test:vitest": "bunx vitest run --exclude \"**/*.bun.test.ts\"",
+        "test:bun": "bun test ./src/**/*.bun.test.ts",
+        "test:all": "bun run test:vitest && bun run test:bun"
+    },
+    "devDependencies": {
+        "@types/bun": "latest"
+    },
+    "peerDependencies": {
+        "typescript": "^5"
+    },
+    "dependencies": {
+        "@elysiajs/cors": "^1.3.3",
+        "@supabase/supabase-js": "^2.54.0",
+        "@types/pg": "^8.15.5",
+        "dotenv": "^17.2.1",
+        "drizzle-kit": "^0.31.4",
+        "drizzle-orm": "^0.44.4",
+        "elysia": "^1.3.8",
+        "pg": "^8.16.3",
+        "pg-boss": "^10.3.2",
+        "zod": "^4.0.17",
+        "zod-to-openapi": "^0.2.1"
+    }
+}
 ```
 
 ## File: src/data/db/repos.ts
@@ -8277,6 +10155,15 @@ export * from './asr.ts';
 const log = createLogger((readEnv('LOG_LEVEL') as any) || 'info').with({
     mod: 'worker',
 });
+const workerId = `${os.hostname?.() || 'host'}-${process.pid}`;
+// Default lease extension per heartbeat (sec): prefer JOB_LEASE_SEC, fallback to QUEUE_VISIBILITY_SEC, else 300s
+const DEFAULT_LEASE_SEC = (() => {
+    const a = Number(readEnv('JOB_LEASE_SEC'));
+    if (Number.isFinite(a) && a > 0) return Math.floor(a);
+    const b = Number(readEnv('QUEUE_VISIBILITY_SEC'));
+    if (Number.isFinite(b) && b > 0) return Math.floor(b);
+    return 300;
+})();
 
 // Local helper for burning subtitles during inline reuse path
 function escapeForSubtitlesFilterLocal(path: string): string {
@@ -8368,9 +10255,12 @@ function startHeartbeatLoop(opts: HeartbeatLoopOpts = {}) {
     const updater =
         opts.updater ||
         (async (ids: string[], now: Date) => {
+            const nextLease = new Date(
+                now.getTime() + DEFAULT_LEASE_SEC * 1000
+            );
             await (sharedDb as any)
                 .update(jobsTable)
-                .set({ lastHeartbeatAt: now })
+                .set({ lastHeartbeatAt: now, leaseExpiresAt: nextLease })
                 .where(inArray(jobsTable.id, ids));
         });
     (async () => {
@@ -8672,7 +10562,12 @@ async function main() {
                 const r = await (sharedDb as any)
                     .select({ c: sql<number>`count(*)` })
                     .from(jobsTable)
-                    .where(eq(jobsTable.status, 'queued'));
+                    .where(
+                        and(
+                            eq(jobsTable.status, 'queued'),
+                            sql`${jobsTable.nextEarliestRunAt} IS NULL OR ${jobsTable.nextEarliestRunAt} <= NOW()`
+                        )
+                    );
                 return Number(r[0]?.c || 0);
             } catch (e) {
                 log.warn('queue depth query failed', { error: String(e) });
@@ -8708,7 +10603,12 @@ async function main() {
         let success = false;
 
         const finish = async (status: 'done' | 'failed', patch: any = {}) => {
-            await jobs.update(jobId, { status, ...patch });
+            await jobs.update(jobId, {
+                status,
+                leaseExpiresAt: null,
+                lockedBy: null,
+                ...patch,
+            });
             await events.add({
                 jobId,
                 ts: nowIso(),
@@ -8752,12 +10652,18 @@ async function main() {
                         status: sql`'processing'::job_status`,
                         processingStartedAt: new Date(),
                         lastHeartbeatAt: new Date(),
+                        leaseExpiresAt: new Date(
+                            Date.now() + DEFAULT_LEASE_SEC * 1000
+                        ),
+                        attemptCount: sql`${jobsTable.attemptCount} + 1`,
+                        lockedBy: workerId,
                         updatedAt: new Date(),
                     })
                     .where(
                         and(
                             eq(jobsTable.id, jobId),
-                            eq(jobsTable.status, 'queued')
+                            eq(jobsTable.status, 'queued'),
+                            sql`${jobsTable.nextEarliestRunAt} IS NULL OR ${jobsTable.nextEarliestRunAt} <= NOW()`
                         )
                     )
                     .returning({ id: jobsTable.id });
