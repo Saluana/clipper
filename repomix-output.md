@@ -35,6 +35,9 @@ The content is organized as follows:
 
 # Directory Structure
 ```
+scripts/
+  dev-all.ts
+  submit-and-poll.ts
 src/
   api/
     index.ts
@@ -111,6 +114,7 @@ src/
   test/
     setup.ts
   worker/
+    asr.start.ts
     asr.ts
     cleanup.ts
     index.ts
@@ -127,6 +131,201 @@ vitest.config.ts
 ```
 
 # Files
+
+## File: scripts/dev-all.ts
+```typescript
+#!/usr/bin/env bun
+/**
+ * Dev orchestrator: runs API, worker, ASR worker, and DLQ consumer in watch mode.
+ * Uses Bun.spawn to manage child processes; forwards signals for clean shutdown.
+ */
+
+type Proc = {
+    label: string;
+    p: ReturnType<typeof Bun.spawn>;
+};
+
+const procs: Proc[] = [];
+
+async function run() {
+    const cmds: { label: string; cmd: string[] }[] = [
+        { label: 'api', cmd: ['bun', '--watch', 'src/api/index.ts'] },
+        { label: 'worker', cmd: ['bun', '--watch', 'src/worker/index.ts'] },
+        { label: 'asr', cmd: ['bun', '--watch', 'src/worker/asr.start.ts'] },
+        { label: 'dlq', cmd: ['bun', '--watch', 'src/queue/dlq-consumer.ts'] },
+    ];
+
+    for (const { label, cmd } of cmds) {
+        const child = Bun.spawn({
+            cmd,
+            stdout: 'inherit',
+            stderr: 'inherit',
+            stdin: 'inherit',
+        });
+        procs.push({ label, p: child });
+        console.log(`[dev-all] started ${label} (pid ${child.pid})`);
+    }
+
+    const shutdown = async (signal: string) => {
+        console.log(`\n[dev-all] received ${signal}, shutting down...`);
+        for (const { label, p } of procs) {
+            try {
+                console.log(
+                    `[dev-all] sending terminate to ${label} (pid ${p.pid})`
+                );
+                // Send default termination signal
+                p.kill();
+            } catch (err) {
+                console.error(`[dev-all] error signaling ${label}:`, err);
+            }
+        }
+        await Promise.allSettled(procs.map(({ p }) => p.exited));
+        process.exit(0);
+    };
+
+    process.on('SIGINT', () => shutdown('SIGINT'));
+    process.on('SIGTERM', () => shutdown('SIGTERM'));
+
+    // If any child exits, shut down the rest and exit non-zero.
+    await Promise.race(
+        procs.map(({ label, p }) =>
+            p.exited.then((code: number) => {
+                console.error(`[dev-all] ${label} exited with code ${code}`);
+                return { label, code } as const;
+            })
+        )
+    );
+    await shutdown('child-exit');
+}
+
+run().catch((err) => {
+    console.error('[dev-all] fatal error:', err);
+    process.exit(1);
+});
+```
+
+## File: scripts/submit-and-poll.ts
+```typescript
+#!/usr/bin/env bun
+/**
+ * Submit a clip job to the local API and poll until result is ready.
+ * Usage:
+ *  bun scripts/submit-and-poll.ts --url <youtubeUrl> --start 00:01:00 --end 00:01:45 --lang en [--burn]
+ */
+
+function parseArgs() {
+  const args = new Map<string, string | boolean>();
+  const argv = process.argv.slice(2);
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i]!;
+    if (a.startsWith("--")) {
+      const key = a.slice(2);
+      const next = argv[i + 1];
+      if (!next || next.startsWith("--")) {
+        args.set(key, true);
+      } else {
+        args.set(key, next);
+        i++;
+      }
+    }
+  }
+  return args;
+}
+
+const args = parseArgs();
+const youtubeUrl = String(args.get("url") || args.get("youtube") || "");
+const start = String(args.get("start") || "");
+const end = String(args.get("end") || "");
+const lang = String(args.get("lang") || "en");
+const burn = Boolean(args.get("burn") || false);
+
+if (!youtubeUrl || !start || !end) {
+  console.error("Usage: bun scripts/submit-and-poll.ts --url <youtubeUrl> --start 00:MM:SS --end 00:MM:SS --lang en [--burn]");
+  process.exit(2);
+}
+
+const API = process.env.API_BASE_URL || "http://localhost:3000";
+
+async function submitJob() {
+  const payload = {
+    sourceType: "youtube",
+    youtubeUrl,
+    start,
+    end,
+    withSubtitles: true,
+    subtitleLang: lang,
+    burnSubtitles: burn,
+  };
+  const res = await fetch(`${API}/api/jobs`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    const txt = await res.text();
+    throw new Error(`Create failed ${res.status}: ${txt}`);
+  }
+  const data = await res.json();
+  const id = data?.job?.id || data?.id || data?.jobId;
+  if (!id) throw new Error(`No job id in response: ${JSON.stringify(data)}`);
+  return id as string;
+}
+
+async function getResult(id: string) {
+  const res = await fetch(`${API}/api/jobs/${id}/result`);
+  if (res.status === 404) return null; // not ready
+  if (!res.ok) throw new Error(`Result failed ${res.status}: ${await res.text()}`);
+  return await res.json();
+}
+
+async function main() {
+  console.log(`[submit] creating job for ${youtubeUrl} from ${start} to ${end} (lang=${lang}, burn=${burn})`);
+  const id = await submitJob();
+  console.log(`[submit] job id: ${id}`);
+  const startTs = Date.now();
+  const timeoutMs = 15 * 60_000; // 15 minutes
+  const pollMs = 5_000;
+  while (true) {
+    if (Date.now() - startTs > timeoutMs) throw new Error("Timed out waiting for result");
+    const res = await getResult(id);
+    if (res) {
+      const r = res.result || res;
+      console.log("\n=== Clip Ready ===");
+      console.log(`Job: ${r.id || id}`);
+      if (r.video?.url) console.log(`Video: ${r.video.url}`);
+      if (r.burnedVideo?.url) console.log(`Burned: ${r.burnedVideo.url}`);
+      if (r.srt?.url) console.log(`SRT: ${r.srt.url}`);
+      return;
+    }
+    process.stdout.write(".");
+    await new Promise((r) => setTimeout(r, pollMs));
+  }
+}
+
+main().catch((e) => {
+  console.error("\n[submit] error:", e?.message || e);
+  process.exit(1);
+});
+```
+
+## File: src/worker/asr.start.ts
+```typescript
+import { PgBossQueueAdapter } from '@clipper/queue';
+import { requireEnv, createLogger, readEnv } from '@clipper/common';
+import { startAsrWorker } from './asr';
+
+const log = createLogger((readEnv('LOG_LEVEL') as any) || 'info').with({
+    mod: 'asr.start',
+});
+
+const queue = new PgBossQueueAdapter({
+    connectionString: requireEnv('DATABASE_URL'),
+});
+
+await startAsrWorker({ queue });
+
+log.info('ASR worker started');
+```
 
 ## File: src/asr/formatter.ts
 ```typescript
@@ -2620,6 +2819,29 @@ export async function startDlqConsumer(opts?: {
         log.info('DLQ consumer stopping');
         await boss.stop();
     };
+}
+
+// If executed directly (bun src/queue/dlq-consumer.ts), start the consumer
+if (import.meta.main) {
+    const stop = await startDlqConsumer().catch((err) => {
+        log.error('Failed to start DLQ consumer', { err: String(err) });
+        process.exit(1);
+    });
+
+    const shutdown = async (signal: string) => {
+        try {
+            log.info('Shutting down DLQ consumer', { signal });
+            await stop?.();
+        } finally {
+            process.exit(0);
+        }
+    };
+
+    process.on('SIGINT', () => shutdown('SIGINT'));
+    process.on('SIGTERM', () => shutdown('SIGTERM'));
+
+    // Keep process alive
+    await new Promise(() => {});
 }
 ```
 
@@ -5337,7 +5559,14 @@ export class PgBossQueueAdapter implements QueueAdapter {
         "db:migrate": "bunx drizzle-kit migrate --config=drizzle.config.ts",
         "db:push": "bunx drizzle-kit push --config=drizzle.config.ts",
         "dev": "bun --watch src/api/index.ts",
-        "dev:worker": "bun --watch src/worker/index.ts"
+        "dev:worker": "bun --watch src/worker/index.ts",
+        "dev:asr": "bun --watch src/worker/asr.start.ts",
+        "dev:dlq": "bun --watch src/queue/dlq-consumer.ts",
+        "dev:all": "bun scripts/dev-all.ts",
+        "start:api": "bun src/api/index.ts",
+        "start:worker": "bun src/worker/index.ts",
+        "start:asr": "bun src/worker/asr.start.ts",
+        "start:dlq": "bun src/queue/dlq-consumer.ts"
     },
     "devDependencies": {
         "@types/bun": "latest"
@@ -7482,11 +7711,15 @@ export const app = addHttpInstrumentation(baseApp)
         metrics: queue.getMetrics(),
         correlationId: (store as any).correlationId,
     }))
-    .get('/metrics', () => {
+    .get('/metrics', ({ store }) => {
         const snap = metrics.snapshot();
         // merge queue metrics (Req 3.4)
         const queueMetrics = queue.getMetrics?.() || {};
-        return { ...snap, queue: queueMetrics };
+        return {
+            ...snap,
+            queue: queueMetrics,
+            correlationId: (store as any).correlationId,
+        };
     })
     .post('/api/jobs', async ({ body, set, store, request }) => {
         const correlationId = (store as any).correlationId;
@@ -7868,9 +8101,9 @@ const storage = (() => {
 })();
 const asrFacade = new AsrFacade({
     asrJobs: new DrizzleAsrJobsRepo(sharedDb, metrics),
+    queue,
 });
 
-// Active job tracking for batch heartbeat (Req 2.1)
 const activeJobs = new Set<string>();
 let shuttingDown = false;
 
@@ -8437,17 +8670,16 @@ async function main() {
                 data: { key, correlationId: cid },
             });
 
-            if (
-                job.withSubtitles &&
-                (job.subtitleLang === 'auto' || !job.subtitleLang)
-            ) {
+            if (job.withSubtitles) {
                 await withStage(metrics, 'asr', async () => {
                     try {
                         const asrRes = await asrFacade.request({
-                            localPath: clipPath,
+                            // Use the current on-disk output path after move/copy,
+                            // not the original clipPath which may have been moved.
+                            localPath: outputLocal || finalOut,
                             clipJobId: job.id,
                             sourceType: 'internal',
-                            languageHint: job.subtitleLang ?? 'auto',
+                            languageHint: job.subtitleLang || 'auto',
                         });
                         await events.add({
                             jobId,

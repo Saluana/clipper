@@ -51,3 +51,26 @@ export async function startDlqConsumer(opts?: {
         await boss.stop();
     };
 }
+
+// If executed directly (bun src/queue/dlq-consumer.ts), start the consumer
+if (import.meta.main) {
+    const stop = await startDlqConsumer().catch((err) => {
+        log.error('Failed to start DLQ consumer', { err: String(err) });
+        process.exit(1);
+    });
+
+    const shutdown = async (signal: string) => {
+        try {
+            log.info('Shutting down DLQ consumer', { signal });
+            await stop?.();
+        } finally {
+            process.exit(0);
+        }
+    };
+
+    process.on('SIGINT', () => shutdown('SIGINT'));
+    process.on('SIGTERM', () => shutdown('SIGTERM'));
+
+    // Keep process alive
+    await new Promise(() => {});
+}

@@ -58,9 +58,9 @@ const storage = (() => {
 })();
 const asrFacade = new AsrFacade({
     asrJobs: new DrizzleAsrJobsRepo(sharedDb, metrics),
+    queue,
 });
 
-// Active job tracking for batch heartbeat (Req 2.1)
 const activeJobs = new Set<string>();
 let shuttingDown = false;
 
@@ -627,18 +627,31 @@ async function main() {
                 data: { key, correlationId: cid },
             });
 
-            if (
-                job.withSubtitles &&
-                (job.subtitleLang === 'auto' || !job.subtitleLang)
-            ) {
+            // Persist the resultVideoKey before we enqueue ASR.
+            // This avoids a race where the ASR worker fetches the clip job and
+            // doesn't see the key yet, causing a NO_CLIP_RESULT error.
+            try {
+                await jobs.update(jobId, { resultVideoKey: key } as any);
+            } catch (e) {
+                log.warn('failed to persist resultVideoKey pre-ASR', {
+                    jobId,
+                    err: String(e),
+                });
+            }
+
+            let asrRequested = false;
+            if (job.withSubtitles) {
                 await withStage(metrics, 'asr', async () => {
                     try {
                         const asrRes = await asrFacade.request({
-                            localPath: clipPath,
+                            // Use the current on-disk output path after move/copy,
+                            // not the original clipPath which may have been moved.
+                            localPath: outputLocal || finalOut,
                             clipJobId: job.id,
                             sourceType: 'internal',
-                            languageHint: job.subtitleLang ?? 'auto',
+                            languageHint: job.subtitleLang || 'auto',
                         });
+                        asrRequested = true;
                         await events.add({
                             jobId,
                             ts: nowIso(),
@@ -660,7 +673,18 @@ async function main() {
                 });
             }
 
-            await finish('done', { progress: 100, resultVideoKey: key });
+            // If burn-in was requested, let the ASR worker finalize the job
+            // status to 'done' after producing subtitles/burned video. This
+            // prevents returning an unburned result when the user asked for
+            // burnSubtitles=true.
+            if (job.burnSubtitles && asrRequested) {
+                log.info('awaiting burn-in; leaving job processing', {
+                    jobId,
+                    correlationId: cid,
+                });
+            } else {
+                await finish('done', { progress: 100, resultVideoKey: key });
+            }
             metrics.observe('clip.total_ms', Date.now() - startedAt);
             const ms = Date.now() - startedAt;
             log.info('job completed', { jobId, ms, correlationId: cid });

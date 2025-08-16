@@ -257,6 +257,24 @@ export async function startAsrWorker(deps: AsrWorkerDeps) {
                             Math.max(0, Date.now() - t0)
                         );
 
+                        // After burn-in attempt, finalize the clip job if not already done
+                        try {
+                            const latest = await clipJobs.get(clipJobId);
+                            if (latest && latest.status !== 'done') {
+                                await clipJobs.update(clipJobId, {
+                                    status: 'done',
+                                    progress: 100,
+                                } as any);
+                                try {
+                                    await events.add({
+                                        jobId: clipJobId,
+                                        ts: new Date().toISOString(),
+                                        type: 'done',
+                                        data: {},
+                                    });
+                                } catch {}
+                            }
+                        } catch {}
                         if (!burnRes.ok) {
                             metrics.inc('burnin.failed');
                             log.warn('burn-in failed (non-fatal)', {
@@ -297,6 +315,28 @@ export async function startAsrWorker(deps: AsrWorkerDeps) {
                             } catch {}
                         }
                     }
+                    // Whether burn-in succeeded or failed, if the clip job
+                    // is not yet marked done, mark it as done now so the API
+                    // result endpoint becomes available. Keep original video
+                    // and optionally burned variant.
+                    try {
+                        const refreshed = await clipJobs.get(clipJobId);
+                        if (refreshed && refreshed.status !== 'done') {
+                            await clipJobs.update(clipJobId, {
+                                status: 'done',
+                                progress: 100,
+                                resultVideoKey: refreshed.resultVideoKey,
+                            } as any);
+                            try {
+                                await events.add({
+                                    jobId: clipJobId,
+                                    ts: new Date().toISOString(),
+                                    type: 'done',
+                                    data: {},
+                                });
+                            } catch {}
+                        }
+                    } catch {}
                 } catch (e) {
                     log.warn('burn-in stage error (non-fatal)', {
                         asrJobId,
